@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: smartplan-api
+    env: docker
+    plan: starter
+    autoDeploy: true
+    healthCheckPath: /
+    envVars:
+      - key: SECRET_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: ACCESS_TOKEN_EXPIRE_MINUTES
+        value: "60"
+      - key: REFRESH_TOKEN_EXPIRE_DAYS
+        value: "7"
+
