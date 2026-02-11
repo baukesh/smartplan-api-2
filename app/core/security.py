@@ -6,7 +6,11 @@ from passlib.context import CryptContext
 from app.core.config import settings
 
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+#
+# Use Argon2 for password hashing to avoid bcrypt backend issues in some
+# environments and to follow modern best practices.
+#
+pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 ALGORITHM = "HS256"
 
 

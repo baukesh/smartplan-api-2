@@ -1,3 +1,5 @@
+from datetime import date
+
 from sqlalchemy import Boolean, Date, String
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -14,8 +16,8 @@ class DPReport(Base, TimestampMixin):
     product_filter: Mapped[str | None] = mapped_column(String(255))
     branch_filter: Mapped[str | None] = mapped_column(String(255))
     view_type: Mapped[str] = mapped_column(String(32), default="cases")  # dsp/boxes/net_weight
-    date_from: Mapped[Date | None]
-    date_to: Mapped[Date | None]
+    date_from: Mapped[date | None] = mapped_column(Date)
+    date_to: Mapped[date | None] = mapped_column(Date)
     is_draft: Mapped[bool] = mapped_column(Boolean, default=True)
     is_deleted: Mapped[bool] = mapped_column(Boolean, default=False)
     created_by_id: Mapped[int | None]
