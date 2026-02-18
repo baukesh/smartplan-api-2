@@ -7,6 +7,7 @@ from app.api.v1 import (
     assortment,
     auth,
     dashboard,
+    dp_report,
     distribution,
     inventory_health,
     notifications,
@@ -48,6 +49,7 @@ app.include_router(auth.router, prefix=settings.API_V1_PREFIX)
 app.include_router(uploads.router, prefix=settings.API_V1_PREFIX)
 app.include_router(dashboard.router, prefix=settings.API_V1_PREFIX)
 app.include_router(reports.router, prefix=settings.API_V1_PREFIX)
+app.include_router(dp_report.router, prefix=settings.API_V1_PREFIX)
 app.include_router(assortment.router, prefix=settings.API_V1_PREFIX)
 app.include_router(orders.router, prefix=settings.API_V1_PREFIX)
 app.include_router(datasets.router, prefix=settings.API_V1_PREFIX)

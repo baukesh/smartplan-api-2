@@ -7,8 +7,8 @@ from sqlalchemy import select
 
 from app.api.deps import CurrentUser, DBSession
 from app.models.data_uploads import (
-    Assortment,
-    BranchStockNorm,
+    Product,
+    ProductBranch,
     HistoricalSalesMonthly,
     PlacedOrder,
     PriceList,
@@ -28,7 +28,7 @@ class AssortmentRow(BaseModel):
     master_carton_volume_cbm: float | None = None
     master_carton_gross_weight_kg: float | None = None
     master_carton_net_weight_kg: float | None = None
-    lead_time_days: float | None = None
+    lead_time: float | None = None
     source: str | None = None
     general_stock_norm_days: float | None = None
     status: str | None = None
@@ -36,7 +36,6 @@ class AssortmentRow(BaseModel):
     category: str | None = None
     sub_category: str | None = None
     sub_line: str | None = None
-    line: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -45,7 +44,7 @@ class BranchStockNormRow(BaseModel):
     branch_id: str
     sku_id: str
     current_stock: float | None = None
-    stock_norm_days: float | None = None
+    stock_norm: float | None = None
 
     model_config = {"from_attributes": True}
 
@@ -89,8 +88,8 @@ class PlacedOrderRow(BaseModel):
 async def get_assortment_dataset(
     db: DBSession,
     _user: CurrentUser,
-) -> list[Assortment]:
-    result = await db.execute(select(Assortment))
+) -> list[Product]:
+    result = await db.execute(select(Product))
     return list(result.scalars().all())
 
 
@@ -98,8 +97,8 @@ async def get_assortment_dataset(
 async def get_branch_stock_norm_dataset(
     db: DBSession,
     _user: CurrentUser,
-) -> list[BranchStockNorm]:
-    result = await db.execute(select(BranchStockNorm))
+) -> list[ProductBranch]:
+    result = await db.execute(select(ProductBranch))
     return list(result.scalars().all())
 
 

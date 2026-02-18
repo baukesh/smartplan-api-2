@@ -1,23 +1,23 @@
+from datetime import date
 from typing import List
 
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
 from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, DBSession
-from app.models.data_uploads import Assortment, BranchStockNorm, PriceList
+from app.models.data_uploads import Product, ProductBranch, PriceList
 
 router = APIRouter(prefix="/assortment", tags=["assortment"])
 
 
 class AssortmentItem(BaseModel):
     sku_id: str
-    sku_code: str | None = None
+    sku_code: str
     sku_name: str
-    status: str | None = None
-    brand: str | None = None
-    category: str | None = None
+    status: str
+    brand: str
+    category: str
 
     model_config = {"from_attributes": True}
 
@@ -25,17 +25,17 @@ class AssortmentItem(BaseModel):
 class BranchStockNormRow(BaseModel):
     branch_id: str
     sku_id: str
-    current_stock: float | None = None
-    stock_norm_days: float | None = None
+    current_stock: float
+    stock_norm: float
 
     model_config = {"from_attributes": True}
 
 
 class PriceListRow(BaseModel):
     sku_id: str
-    date: str
-    invoice_price: float | None = None
-    dsp: float | None = None
+    date: date
+    invoice_price: float
+    dsp: float
 
     model_config = {"from_attributes": True}
 
@@ -45,11 +45,11 @@ async def list_assortment(
     db: DBSession,
     _user: CurrentUser,
     status: str | None = Query(None),
-) -> list[Assortment]:
-    stmt = select(Assortment)
+) -> list[Product]:
+    stmt = select(Product)
     if status:
-        stmt = stmt.where(Assortment.status == status)
-    result = await db.execute(stmt.order_by(Assortment.sku_id))
+        stmt = stmt.where(Product.status == status)
+    result = await db.execute(stmt.order_by(Product.sku_id))
     return list(result.scalars().all())
 
 
@@ -57,8 +57,8 @@ async def list_assortment(
 async def get_branch_stock_matrix(
     db: DBSession,
     _user: CurrentUser,
-) -> list[BranchStockNorm]:
-    result = await db.execute(select(BranchStockNorm))
+) -> list[ProductBranch]:
+    result = await db.execute(select(ProductBranch))
     return list(result.scalars().all())
 
 
@@ -69,4 +69,3 @@ async def get_price_list(
 ) -> list[PriceList]:
     result = await db.execute(select(PriceList))
     return list(result.scalars().all())
-
