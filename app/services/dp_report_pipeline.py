@@ -1,12 +1,22 @@
 from __future__ import annotations
 
+import asyncio
 from collections import defaultdict
 from datetime import date, datetime
+import hashlib
+import json
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.data_uploads import HistoricalSalesMonthly, PriceList, Product, ProductBranch
+from app.core.config import settings
+from app.models.data_uploads import (
+    HistoricalSalesMonthly,
+    PlacedOrder,
+    PriceList,
+    Product,
+    ProductBranch,
+)
 from app.models.derived import (
     BranchDistribution,
     DPReportMart,
@@ -14,6 +24,7 @@ from app.models.derived import (
     ForecastSalesMonthly,
     InventoryHealth,
 )
+from app.services.gpt_forecasting import forecast_baseline_quantities_in_mc
 
 
 def _closest_price_on_or_before(
@@ -50,6 +61,13 @@ def _round2(v: float | None) -> float | None:
     return round(float(v), 2)
 
 
+def _avg_last_n(values: list[float], n: int = 6) -> float:
+    if not values:
+        return 0.0
+    tail = values[-n:] if len(values) >= n else values
+    return sum(tail) / len(tail) if tail else 0.0
+
+
 async def refresh_forecast_sales_monthly(
     db: AsyncSession, owner_user_id: int | None = None
 ) -> None:
@@ -76,6 +94,11 @@ async def refresh_forecast_sales_monthly(
     prices = (
         await db.execute(select(PriceList).where(PriceList.owner_user_id == owner_user_id))
     ).scalars().all()
+    placed_orders = (
+        await db.execute(
+            select(PlacedOrder).where(PlacedOrder.owner_user_id == owner_user_id)
+        )
+    ).scalars().all()
 
     prices_by_sku: dict[str, list[PriceList]] = defaultdict(list)
     for p in prices:
@@ -90,6 +113,13 @@ async def refresh_forecast_sales_monthly(
         hist_by_key[key].sort(key=lambda x: x.date)
 
     branch_stock = {(b.sku_id, b.branch_id): b.current_stock for b in branch_rows}
+    stock_norm_by_key = {(b.sku_id, b.branch_id): b.stock_norm for b in branch_rows}
+
+    placed_orders_by_sku: dict[str, list[PlacedOrder]] = defaultdict(list)
+    for po in placed_orders:
+        placed_orders_by_sku[po.sku_id].append(po)
+    for sku in placed_orders_by_sku:
+        placed_orders_by_sku[sku].sort(key=lambda x: x.creation_date)
 
     await db.execute(
         delete(ForecastSalesMonthly).where(
@@ -98,6 +128,8 @@ async def refresh_forecast_sales_monthly(
     )
 
     to_insert: list[ForecastSalesMonthly] = []
+
+    job_payloads: list[dict] = []
     for key, rows in hist_by_key.items():
         sku_id, branch_id = key
         product = products.get(sku_id)
@@ -107,14 +139,113 @@ async def refresh_forecast_sales_monthly(
             continue
 
         max_hist_date = rows[-1].date
-        last_6 = rows[-6:] if len(rows) >= 6 else rows
-        baseline_qty = (
-            sum(r.fact_quantity_in_mc for r in last_6) / len(last_6) if last_6 else 0.0
-        )
-        prev_stock = float(branch_stock.get((sku_id, branch_id), 0.0))
+        forecast_months: list[date] = []
         forecast_date = _next_month(max_hist_date)
-
         for _ in range(12):
+            forecast_months.append(forecast_date)
+            forecast_date = _next_month(forecast_date)
+
+        history_context = [
+            {
+                "date": r.date.isoformat(),
+                "fact_quantity_in_mc": float(r.fact_quantity_in_mc or 0.0),
+                "target_quantity_in_mc": float(r.target_quantity_in_mc or 0.0),
+                "past_available_stock": float(r.past_available_stock or 0.0),
+            }
+            for r in rows
+        ]
+        orders_context = [
+            {
+                "order_id": po.order_id,
+                "creation_date": po.creation_date.isoformat(),
+                "receival_date": po.receival_date.isoformat(),
+                "quantity_in_mc": float(po.quantity_in_mc or 0.0),
+                "status": po.status,
+            }
+            for po in placed_orders_by_sku.get(sku_id, [])
+        ]
+        job_payloads.append(
+            {
+                "sku_id": sku_id,
+                "branch_id": branch_id,
+                "product": product,
+                "rows": rows,
+                "forecast_months": forecast_months,
+                "history_context": history_context,
+                "orders_context": orders_context,
+                "current_stock": float(branch_stock.get((sku_id, branch_id), 0.0)),
+                "stock_norm_days": float(
+                    stock_norm_by_key.get((sku_id, branch_id), product.general_stock_norm_days)
+                    or 0.0
+                ),
+            }
+        )
+
+    max_concurrency = max(int(settings.OPENAI_FORECAST_MAX_CONCURRENCY or 1), 1)
+    timeout_seconds = float(settings.OPENAI_FORECAST_TIMEOUT_SECONDS or 15.0)
+    semaphore = asyncio.Semaphore(max_concurrency)
+    memo: dict[str, list[float]] = {}
+
+    async def _get_baseline_series(job: dict) -> list[float]:
+        history_values = [
+            float(x.get("fact_quantity_in_mc") or 0.0)
+            for x in job["history_context"]
+        ]
+        avg_baseline = _avg_last_n(history_values, n=6)
+        fallback_series = [avg_baseline for _ in job["forecast_months"]]
+
+        # Skip model call when history is too short; use deterministic fallback.
+        if len(history_values) < 6:
+            return fallback_series
+
+        cache_payload = {
+            "sku_id": job["sku_id"],
+            "branch_id": job["branch_id"],
+            "forecast_months": [d.isoformat() for d in job["forecast_months"]],
+            "history_context": job["history_context"][-24:],
+            "orders_context": job["orders_context"][-24:],
+            "current_stock": round(float(job["current_stock"]), 6),
+            "stock_norm_days": round(float(job["stock_norm_days"]), 6),
+            "model": settings.OPENAI_FORECAST_MODEL,
+        }
+        cache_key = hashlib.sha256(
+            json.dumps(cache_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        if cache_key in memo:
+            return memo[cache_key]
+
+        async with semaphore:
+            series = await forecast_baseline_quantities_in_mc(
+                sku_id=job["sku_id"],
+                branch_id=job["branch_id"],
+                forecast_months=job["forecast_months"],
+                history=job["history_context"],
+                current_stock=job["current_stock"],
+                stock_norm_days=job["stock_norm_days"],
+                placed_orders_history=job["orders_context"],
+                timeout_seconds=timeout_seconds,
+            )
+        memo[cache_key] = series
+        return series
+
+    baseline_series_by_key: dict[tuple[str, str], list[float]] = {}
+    if job_payloads:
+        series_results = await asyncio.gather(
+            *[_get_baseline_series(job) for job in job_payloads]
+        )
+        for idx, job in enumerate(job_payloads):
+            baseline_series_by_key[(job["sku_id"], job["branch_id"])] = series_results[idx]
+
+    for job in job_payloads:
+        sku_id = job["sku_id"]
+        branch_id = job["branch_id"]
+        product = job["product"]
+        prev_stock = float(job["current_stock"])
+        forecast_months = job["forecast_months"]
+        baseline_series = baseline_series_by_key.get((sku_id, branch_id), [])
+
+        for idx, forecast_date in enumerate(forecast_months):
+            baseline_qty = float(baseline_series[idx]) if idx < len(baseline_series) else 0.0
             closest_dsp = _closest_price_on_or_before(
                 prices_by_sku.get(sku_id, []), forecast_date
             )
@@ -146,7 +277,6 @@ async def refresh_forecast_sales_monthly(
                 )
             )
             prev_stock = future_stock
-            forecast_date = _next_month(forecast_date)
 
     db.add_all(to_insert)
     await db.commit()

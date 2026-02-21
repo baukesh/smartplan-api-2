@@ -13,7 +13,7 @@ from app.models.data_uploads import Branch, Product, ProductBranch, PriceList
 
 router = APIRouter(prefix="/assortment", tags=["assortment"])
 
-STATUS_OPTIONS = ["active", "inactive", "discontinued"]
+STATUS_OPTIONS = ["Active", "Inactive", "Discontinued", "TBD"]
 PAGE_SIZE_MAP = {"10": 10, "50": 50, "100": 100, "all": None}
 
 

@@ -365,9 +365,16 @@ async def get_category_c(
 def _top_issue_rows(metrics: list[_SkuMetrics], issue_type: str, top_n: int) -> list[TopSkuShareRow]:
     total_stock = sum(m.stock for m in metrics)
     if issue_type == "overstock":
-        chosen = sorted(metrics, key=lambda m: m.health_index, reverse=True)
+        chosen = sorted(
+            [m for m in metrics if m.health_index >= 100.0],
+            key=lambda m: m.health_index,
+            reverse=True,
+        )
     elif issue_type == "understock":
-        chosen = sorted([m for m in metrics if m.health_index > 0], key=lambda m: m.health_index)
+        chosen = sorted(
+            [m for m in metrics if 0.0 < m.health_index < 100.0],
+            key=lambda m: m.health_index,
+        )
     else:
         chosen = [m for m in metrics if abs(m.health_index) < 1e-9]
         chosen = sorted(chosen, key=lambda m: m.share_stock, reverse=True)
