@@ -1,4 +1,4 @@
-from sqlalchemy import Date, Float, String
+from sqlalchemy import Date, Float, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base, TimestampMixin
@@ -26,6 +26,7 @@ class Product(Base, TimestampMixin):
     category: Mapped[str] = mapped_column(String(128))
     sub_category: Mapped[str] = mapped_column(String(128))
     sub_line: Mapped[str] = mapped_column(String(128))
+    owner_user_id: Mapped[int] = mapped_column(index=True)
 
 
 class ProductBranch(Base, TimestampMixin):
@@ -36,6 +37,20 @@ class ProductBranch(Base, TimestampMixin):
     branch_id: Mapped[str] = mapped_column(String(64), index=True)
     current_stock: Mapped[float] = mapped_column(Float)
     stock_norm: Mapped[float] = mapped_column(Float)
+    owner_user_id: Mapped[int] = mapped_column(index=True)
+
+
+class Branch(Base, TimestampMixin):
+    __tablename__ = "branches"
+    __table_args__ = (
+        UniqueConstraint("owner_user_id", "branch_id", name="uq_branch_owner_branch_id"),
+        UniqueConstraint("owner_user_id", "branch_name", name="uq_branch_owner_branch_name"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    owner_user_id: Mapped[int] = mapped_column(index=True)
+    branch_id: Mapped[str] = mapped_column(String(64), index=True)
+    branch_name: Mapped[str] = mapped_column(String(255), index=True)
 
 
 class PriceList(Base, TimestampMixin):
@@ -46,6 +61,7 @@ class PriceList(Base, TimestampMixin):
     date: Mapped[Date] = mapped_column(Date)
     invoice_price: Mapped[float] = mapped_column(Float)
     dsp: Mapped[float] = mapped_column(Float)
+    owner_user_id: Mapped[int] = mapped_column(index=True)
 
 
 class HistoricalSalesMonthly(Base, TimestampMixin):
@@ -64,6 +80,7 @@ class HistoricalSalesMonthly(Base, TimestampMixin):
     target_volume_cbm: Mapped[float | None] = mapped_column(Float)
     target_amount_kzt: Mapped[float | None] = mapped_column(Float)
     past_available_stock: Mapped[float] = mapped_column(Float)
+    owner_user_id: Mapped[int] = mapped_column(index=True)
 
 
 class PlacedOrder(Base, TimestampMixin):
@@ -79,5 +96,7 @@ class PlacedOrder(Base, TimestampMixin):
     gross_weight_kg: Mapped[float | None] = mapped_column(Float)
     volume_cbm: Mapped[float | None] = mapped_column(Float)
     amount_kzt: Mapped[float | None] = mapped_column(Float)
+    author: Mapped[str | None] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(64))
+    owner_user_id: Mapped[int] = mapped_column(index=True)
 

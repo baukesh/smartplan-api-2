@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, DBSession
 from app.models.data_uploads import (
+    Branch,
     Product,
     ProductBranch,
     HistoricalSalesMonthly,
@@ -15,6 +16,7 @@ from app.models.data_uploads import (
     PriceList,
 )
 from app.services.dp_report_pipeline import refresh_all_materialized
+from app.services.orders_aggregation import refresh_orders_aggregated
 
 router = APIRouter(prefix="/uploads", tags=["uploads"])
 
@@ -49,7 +51,7 @@ ASSORTMENT_SPEC = UploadSpec(
 BRANCH_STOCK_NORM_SPEC = UploadSpec(
     [
         "sku_id",
-        "branch_id",
+        "branch_name",
         "current_stock",
         "stock_norm",
     ]
@@ -68,7 +70,7 @@ HISTORICAL_SALES_MONTHLY_SPEC = UploadSpec(
     [
         "sku_id",
         "date",
-        "branch_id",
+        "branch_name",
         "fact_quantity_in_mc",
         "target_quantity_in_mc",
         "past_available_stock",
@@ -83,6 +85,7 @@ PLACED_ORDERS_SPEC = UploadSpec(
         "creation_date",
         "receival_date",
         "quantity_in_mc",
+        "author",
         "status",
     ]
 )
@@ -135,53 +138,114 @@ def _to_python_date(value: object) -> date:
     return pd.to_datetime(value).date()
 
 
-async def _replace_records(db: AsyncSession, model: type, records: list[dict]) -> int:
-    await db.execute(delete(model))
+async def _replace_records(
+    db: AsyncSession,
+    model: type,
+    records: list[dict],
+    owner_user_id: int,
+) -> int:
+    await db.execute(delete(model).where(model.owner_user_id == owner_user_id))
     db.add_all([model(**r) for r in records])
     await db.commit()
     return len(records)
 
 
+async def _resolve_branch_ids(
+    db: AsyncSession,
+    owner_user_id: int,
+    branch_names: list[str],
+) -> dict[str, str]:
+    cleaned = sorted({name.strip() for name in branch_names if name and name.strip()})
+    if not cleaned:
+        return {}
+
+    existing_rows = (
+        await db.execute(select(Branch).where(Branch.owner_user_id == owner_user_id))
+    ).scalars().all()
+    by_name = {r.branch_name: r.branch_id for r in existing_rows}
+    used_ids = {r.branch_id for r in existing_rows}
+
+    next_idx = 100001
+    while str(next_idx) in used_ids:
+        next_idx += 1
+
+    new_rows: list[Branch] = []
+    for name in cleaned:
+        if name in by_name:
+            continue
+        while str(next_idx) in used_ids:
+            next_idx += 1
+        branch_id = str(next_idx)
+        next_idx += 1
+        used_ids.add(branch_id)
+        by_name[name] = branch_id
+        new_rows.append(
+            Branch(
+                owner_user_id=owner_user_id,
+                branch_id=branch_id,
+                branch_name=name,
+            )
+        )
+
+    if new_rows:
+        db.add_all(new_rows)
+        await db.commit()
+
+    return by_name
+
+
 @router.post("/assortment")
 async def upload_assortment(
     db: DBSession,
-    _user: CurrentUser,
+    user: CurrentUser,
     file: UploadFile = File(...),
 ):
     df = _load_excel(file)
     errors = _validate_columns(df, ASSORTMENT_SPEC)
     if errors:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=errors)
-    count = await _replace_records(
-        db, Product, df[ASSORTMENT_SPEC.required_columns].to_dict(orient="records")
-    )
-    await refresh_all_materialized(db)
+    records = df[ASSORTMENT_SPEC.required_columns].to_dict(orient="records")
+    for r in records:
+        r["owner_user_id"] = user.id
+    count = await _replace_records(db, Product, records, owner_user_id=user.id)
+    await refresh_all_materialized(db, owner_user_id=user.id)
     return {"rows_inserted": count}
 
 
 @router.post("/branch-stock-norm")
 async def upload_branch_stock_norm(
     db: DBSession,
-    _user: CurrentUser,
+    user: CurrentUser,
     file: UploadFile = File(...),
 ):
     df = _load_excel(file)
     errors = _validate_columns(df, BRANCH_STOCK_NORM_SPEC)
     if errors:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=errors)
+    branch_map = await _resolve_branch_ids(
+        db,
+        owner_user_id=user.id,
+        branch_names=df["branch_name"].astype(str).tolist(),
+    )
+    records = df[BRANCH_STOCK_NORM_SPEC.required_columns].to_dict(orient="records")
+    for r in records:
+        branch_name = str(r.pop("branch_name")).strip()
+        r["branch_id"] = branch_map[branch_name]
+        r["owner_user_id"] = user.id
     count = await _replace_records(
         db,
         ProductBranch,
-        df[BRANCH_STOCK_NORM_SPEC.required_columns].to_dict(orient="records"),
+        records,
+        owner_user_id=user.id,
     )
-    await refresh_all_materialized(db)
+    await refresh_all_materialized(db, owner_user_id=user.id)
     return {"rows_inserted": count}
 
 
 @router.post("/price-list")
 async def upload_price_list(
     db: DBSession,
-    _user: CurrentUser,
+    user: CurrentUser,
     file: UploadFile = File(...),
 ):
     df = _load_excel(file)
@@ -190,15 +254,20 @@ async def upload_price_list(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=errors)
     rows = df[PRICE_LIST_SPEC.required_columns].copy()
     rows["date"] = rows["date"].apply(_to_python_date)
-    count = await _replace_records(db, PriceList, rows.to_dict(orient="records"))
-    await refresh_all_materialized(db)
+    records = rows.to_dict(orient="records")
+    for r in records:
+        r["owner_user_id"] = user.id
+    count = await _replace_records(
+        db, PriceList, records, owner_user_id=user.id
+    )
+    await refresh_all_materialized(db, owner_user_id=user.id)
     return {"rows_inserted": count}
 
 
 @router.post("/historical-sales-monthly")
 async def upload_historical_sales_monthly(
     db: DBSession,
-    _user: CurrentUser,
+    user: CurrentUser,
     file: UploadFile = File(...),
 ):
     df = _load_excel(file)
@@ -207,11 +276,23 @@ async def upload_historical_sales_monthly(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=errors)
     rows = df[HISTORICAL_SALES_MONTHLY_SPEC.required_columns].copy()
     rows["date"] = rows["date"].apply(_to_python_date)
+    branch_map = await _resolve_branch_ids(
+        db,
+        owner_user_id=user.id,
+        branch_names=rows["branch_name"].astype(str).tolist(),
+    )
 
     products = {
-        p.sku_id: p for p in (await db.execute(select(Product))).scalars().all()
+        p.sku_id: p
+        for p in (
+            await db.execute(
+                select(Product).where(Product.owner_user_id == user.id)
+            )
+        ).scalars().all()
     }
-    prices = (await db.execute(select(PriceList))).scalars().all()
+    prices = (
+        await db.execute(select(PriceList).where(PriceList.owner_user_id == user.id))
+    ).scalars().all()
     prices_by_sku: dict[str, list[PriceList]] = {}
     for p in prices:
         prices_by_sku.setdefault(p.sku_id, []).append(p)
@@ -254,7 +335,7 @@ async def upload_historical_sales_monthly(
             {
                 "sku_id": sku_id,
                 "date": r_date,
-                "branch_id": str(row["branch_id"]),
+                "branch_id": branch_map[str(row["branch_name"]).strip()],
                 "fact_quantity_in_mc": fact_qty,
                 "fact_gross_weight_kg": fact_qty * product.master_carton_gross_weight_kg,
                 "fact_volume_cbm": fact_qty * product.master_carton_volume_cbm,
@@ -264,6 +345,7 @@ async def upload_historical_sales_monthly(
                 "target_volume_cbm": target_qty * product.master_carton_volume_cbm,
                 "target_amount_kzt": target_amount,
                 "past_available_stock": float(row["past_available_stock"]),
+                "owner_user_id": user.id,
             }
         )
 
@@ -273,15 +355,17 @@ async def upload_historical_sales_monthly(
             detail=row_errors,
         )
 
-    count = await _replace_records(db, HistoricalSalesMonthly, prepared)
-    await refresh_all_materialized(db)
+    count = await _replace_records(
+        db, HistoricalSalesMonthly, prepared, owner_user_id=user.id
+    )
+    await refresh_all_materialized(db, owner_user_id=user.id)
     return {"rows_inserted": count}
 
 
 @router.post("/placed-orders")
 async def upload_placed_orders(
     db: DBSession,
-    _user: CurrentUser,
+    user: CurrentUser,
     file: UploadFile = File(...),
 ):
     df = _load_excel(file)
@@ -293,9 +377,16 @@ async def upload_placed_orders(
     rows["receival_date"] = rows["receival_date"].apply(_to_python_date)
 
     products = {
-        p.sku_id: p for p in (await db.execute(select(Product))).scalars().all()
+        p.sku_id: p
+        for p in (
+            await db.execute(
+                select(Product).where(Product.owner_user_id == user.id)
+            )
+        ).scalars().all()
     }
-    prices = (await db.execute(select(PriceList))).scalars().all()
+    prices = (
+        await db.execute(select(PriceList).where(PriceList.owner_user_id == user.id))
+    ).scalars().all()
     prices_by_sku: dict[str, list[PriceList]] = {}
     for p in prices:
         prices_by_sku.setdefault(p.sku_id, []).append(p)
@@ -318,10 +409,13 @@ async def upload_placed_orders(
             )
             continue
         c_date: date = _to_python_date(row["creation_date"])
+        sorted_prices = prices_by_sku.get(sku_id, [])
         closest_price = None
-        for p in prices_by_sku.get(sku_id, []):
+        earliest_price = sorted_prices[0] if sorted_prices else None
+        for p in sorted_prices:
             if _to_python_date(p.date) <= c_date:
                 closest_price = p
+        selected_price = closest_price if closest_price is not None else earliest_price
         qty = float(row["quantity_in_mc"])
         prepared.append(
             {
@@ -334,11 +428,13 @@ async def upload_placed_orders(
                 "gross_weight_kg": qty * product.master_carton_gross_weight_kg,
                 "volume_cbm": qty * product.master_carton_volume_cbm,
                 "amount_kzt": (
-                    qty * product.pieces_in_master_carton * closest_price.invoice_price
-                    if closest_price is not None
+                    qty * product.pieces_in_master_carton * selected_price.invoice_price
+                    if selected_price is not None
                     else None
                 ),
+                "author": str(row["author"]) if not pd.isna(row["author"]) else None,
                 "status": str(row["status"]),
+                "owner_user_id": user.id,
             }
         )
 
@@ -348,6 +444,7 @@ async def upload_placed_orders(
             detail=row_errors,
         )
 
-    count = await _replace_records(db, PlacedOrder, prepared)
+    count = await _replace_records(db, PlacedOrder, prepared, owner_user_id=user.id)
+    await refresh_orders_aggregated(db, owner_user_id=user.id)
     return {"rows_inserted": count}
 

@@ -5,8 +5,9 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 from sqlalchemy import select
 
-from app.api.deps import CurrentUser, DBSession
+from app.api.deps import CurrentUser, DBSession, is_admin
 from app.models.data_uploads import (
+    Branch,
     Product,
     ProductBranch,
     HistoricalSalesMonthly,
@@ -41,7 +42,7 @@ class AssortmentRow(BaseModel):
 
 
 class BranchStockNormRow(BaseModel):
-    branch_id: str
+    branch_name: str
     sku_id: str
     current_stock: float | None = None
     stock_norm: float | None = None
@@ -60,7 +61,7 @@ class PriceListRow(BaseModel):
 
 class HistoricalSalesMonthlyRow(BaseModel):
     sku_id: str
-    branch_id: str
+    branch_name: str
     date: date
     fact_quantity_in_mc: float | None = None
     target_quantity_in_mc: float | None = None
@@ -87,44 +88,87 @@ class PlacedOrderRow(BaseModel):
 @router.get("/assortment", response_model=List[AssortmentRow])
 async def get_assortment_dataset(
     db: DBSession,
-    _user: CurrentUser,
+    user: CurrentUser,
 ) -> list[Product]:
-    result = await db.execute(select(Product))
+    stmt = select(Product)
+    if not is_admin(user):
+        stmt = stmt.where(Product.owner_user_id == user.id)
+    result = await db.execute(stmt)
     return list(result.scalars().all())
 
 
 @router.get("/branch-stock-norm", response_model=List[BranchStockNormRow])
 async def get_branch_stock_norm_dataset(
     db: DBSession,
-    _user: CurrentUser,
-) -> list[ProductBranch]:
-    result = await db.execute(select(ProductBranch))
-    return list(result.scalars().all())
+    user: CurrentUser,
+) -> list[BranchStockNormRow]:
+    stmt = select(ProductBranch)
+    if not is_admin(user):
+        stmt = stmt.where(ProductBranch.owner_user_id == user.id)
+    rows = (await db.execute(stmt)).scalars().all()
+    branch_stmt = select(Branch)
+    if not is_admin(user):
+        branch_stmt = branch_stmt.where(Branch.owner_user_id == user.id)
+    branches = (await db.execute(branch_stmt)).scalars().all()
+    branch_map = {(b.owner_user_id, b.branch_id): b.branch_name for b in branches}
+    return [
+        BranchStockNormRow(
+            branch_name=branch_map.get((r.owner_user_id, r.branch_id), r.branch_id),
+            sku_id=r.sku_id,
+            current_stock=r.current_stock,
+            stock_norm=r.stock_norm,
+        )
+        for r in rows
+    ]
 
 
 @router.get("/price-list", response_model=List[PriceListRow])
 async def get_price_list_dataset(
     db: DBSession,
-    _user: CurrentUser,
+    user: CurrentUser,
 ) -> list[PriceList]:
-    result = await db.execute(select(PriceList))
+    stmt = select(PriceList)
+    if not is_admin(user):
+        stmt = stmt.where(PriceList.owner_user_id == user.id)
+    result = await db.execute(stmt)
     return list(result.scalars().all())
 
 
 @router.get("/historical-sales-monthly", response_model=List[HistoricalSalesMonthlyRow])
 async def get_historical_sales_monthly_dataset(
     db: DBSession,
-    _user: CurrentUser,
-) -> list[HistoricalSalesMonthly]:
-    result = await db.execute(select(HistoricalSalesMonthly))
-    return list(result.scalars().all())
+    user: CurrentUser,
+) -> list[HistoricalSalesMonthlyRow]:
+    stmt = select(HistoricalSalesMonthly)
+    if not is_admin(user):
+        stmt = stmt.where(HistoricalSalesMonthly.owner_user_id == user.id)
+    rows = (await db.execute(stmt)).scalars().all()
+    branch_stmt = select(Branch)
+    if not is_admin(user):
+        branch_stmt = branch_stmt.where(Branch.owner_user_id == user.id)
+    branches = (await db.execute(branch_stmt)).scalars().all()
+    branch_map = {(b.owner_user_id, b.branch_id): b.branch_name for b in branches}
+    return [
+        HistoricalSalesMonthlyRow(
+            sku_id=r.sku_id,
+            branch_name=branch_map.get((r.owner_user_id, r.branch_id), r.branch_id),
+            date=r.date,
+            fact_quantity_in_mc=r.fact_quantity_in_mc,
+            target_quantity_in_mc=r.target_quantity_in_mc,
+            past_available_stock=r.past_available_stock,
+        )
+        for r in rows
+    ]
 
 
 @router.get("/placed-orders", response_model=List[PlacedOrderRow])
 async def get_placed_orders_dataset(
     db: DBSession,
-    _user: CurrentUser,
+    user: CurrentUser,
 ) -> list[PlacedOrder]:
-    result = await db.execute(select(PlacedOrder))
+    stmt = select(PlacedOrder)
+    if not is_admin(user):
+        stmt = stmt.where(PlacedOrder.owner_user_id == user.id)
+    result = await db.execute(stmt)
     return list(result.scalars().all())
 

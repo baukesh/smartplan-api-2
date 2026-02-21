@@ -38,3 +38,14 @@ smartplan.db
 # Logs
 *.log
 
+# Local env
+.env
+
+# Excel files
+*.xlsx
+*.xls
+*.xlsm
+
+# Local frontend handoff notes
+FRONTEND_HANDOFF_NOTES.md
+

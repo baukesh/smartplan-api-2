@@ -6,7 +6,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser, DBSession
+from app.api.deps import CurrentUser, DBSession, is_admin
 from app.models.data_uploads import HistoricalSalesMonthly, PlacedOrder
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
@@ -37,7 +37,7 @@ class DashboardResponse(BaseModel):
 @router.get("/overview", response_model=DashboardResponse)
 async def get_dashboard_overview(
     db: DBSession,
-    _user: CurrentUser,
+    user: CurrentUser,
     date_from: Annotated[date | None, Query()] = None,
     date_to: Annotated[date | None, Query()] = None,
 ) -> DashboardResponse:
@@ -49,6 +49,8 @@ async def get_dashboard_overview(
     """
     # Aggregate sales
     sales_stmt = select(func.coalesce(func.sum(HistoricalSalesMonthly.fact_quantity_in_mc), 0))
+    if not is_admin(user):
+        sales_stmt = sales_stmt.where(HistoricalSalesMonthly.owner_user_id == user.id)
     if date_from:
         sales_stmt = sales_stmt.where(HistoricalSalesMonthly.date >= date_from)
     if date_to:
@@ -57,6 +59,8 @@ async def get_dashboard_overview(
 
     # Aggregate orders
     orders_stmt = select(func.coalesce(func.sum(PlacedOrder.amount_kzt), 0))
+    if not is_admin(user):
+        orders_stmt = orders_stmt.where(PlacedOrder.owner_user_id == user.id)
     if date_from:
         orders_stmt = orders_stmt.where(PlacedOrder.creation_date >= date_from)
     if date_to:
@@ -74,6 +78,8 @@ async def get_dashboard_overview(
         .group_by("period")
         .order_by("period")
     )
+    if not is_admin(user):
+        ts_stmt = ts_stmt.where(HistoricalSalesMonthly.owner_user_id == user.id)
     if date_from:
         ts_stmt = ts_stmt.where(HistoricalSalesMonthly.date >= date_from)
     if date_to:

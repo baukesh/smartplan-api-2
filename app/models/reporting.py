@@ -1,6 +1,6 @@
 from datetime import date
 
-from sqlalchemy import Boolean, Date, String
+from sqlalchemy import Boolean, Date, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base, TimestampMixin
@@ -32,4 +32,14 @@ class Notification(Base, TimestampMixin):
     title: Mapped[str] = mapped_column(String(255))
     body: Mapped[str | None] = mapped_column(String(2000))
     is_read: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class DPReportAccess(Base, TimestampMixin):
+    __tablename__ = "dp_report_access"
+    __table_args__ = (UniqueConstraint("report_id", "user_id", name="uq_report_user_access"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    report_id: Mapped[int] = mapped_column(index=True)
+    user_id: Mapped[int] = mapped_column(index=True)
+    granted_by_id: Mapped[int | None]
 

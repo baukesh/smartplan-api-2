@@ -1,9 +1,11 @@
+from secrets import compare_digest
 from typing import Annotated
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, Header, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.core.security import decode_token
 from app.models.user import User, UserRole
@@ -17,12 +19,15 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
 async def get_current_user(
     db: DBSession,
     token: Annotated[str, Depends(oauth2_scheme)],
+    api_access_key: Annotated[str | None, Header(alias=settings.API_ACCESS_KEY_HEADER)] = None,
 ) -> User:
     unauthorized = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
         headers={"WWW-Authenticate": "Bearer"},
     )
+    if not api_access_key or not compare_digest(api_access_key, settings.API_ACCESS_KEY):
+        raise unauthorized
     try:
         payload = TokenPayload.model_validate(decode_token(token))
     except Exception:
@@ -38,6 +43,10 @@ async def get_current_user(
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
+
+
+def is_admin(user: User) -> bool:
+    return user.role == UserRole.ADMIN
 
 
 def require_roles(*roles: UserRole):
