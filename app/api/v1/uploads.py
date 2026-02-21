@@ -1,5 +1,6 @@
 from io import BytesIO
 from datetime import date, datetime
+import logging
 
 import pandas as pd
 from fastapi import APIRouter, File, HTTPException, UploadFile, status
@@ -19,6 +20,7 @@ from app.services.dp_report_pipeline import refresh_all_materialized
 from app.services.orders_aggregation import refresh_orders_aggregated
 
 router = APIRouter(prefix="/uploads", tags=["uploads"])
+logger = logging.getLogger(__name__)
 
 
 class UploadSpec:
@@ -150,6 +152,20 @@ async def _replace_records(
     return len(records)
 
 
+async def _refresh_materialized_safe(db: AsyncSession, owner_user_id: int) -> str | None:
+    try:
+        await refresh_all_materialized(db, owner_user_id=owner_user_id)
+        return None
+    except Exception as exc:
+        # Keep upload successful because base rows are already committed.
+        logger.exception(
+            "Materialized refresh failed after upload for owner_user_id=%s",
+            owner_user_id,
+        )
+        await db.rollback()
+        return str(exc)
+
+
 async def _resolve_branch_ids(
     db: AsyncSession,
     owner_user_id: int,
@@ -208,8 +224,15 @@ async def upload_assortment(
     for r in records:
         r["owner_user_id"] = user.id
     count = await _replace_records(db, Product, records, owner_user_id=user.id)
-    await refresh_all_materialized(db, owner_user_id=user.id)
-    return {"rows_inserted": count}
+    refresh_error = await _refresh_materialized_safe(db, owner_user_id=user.id)
+    response = {"rows_inserted": count}
+    if refresh_error:
+        response["warning"] = (
+            "Upload succeeded, but post-upload materialization refresh failed. "
+            "Data is saved; please retry refresh."
+        )
+        response["refresh_error"] = refresh_error
+    return response
 
 
 @router.post("/branch-stock-norm")
@@ -238,8 +261,15 @@ async def upload_branch_stock_norm(
         records,
         owner_user_id=user.id,
     )
-    await refresh_all_materialized(db, owner_user_id=user.id)
-    return {"rows_inserted": count}
+    refresh_error = await _refresh_materialized_safe(db, owner_user_id=user.id)
+    response = {"rows_inserted": count}
+    if refresh_error:
+        response["warning"] = (
+            "Upload succeeded, but post-upload materialization refresh failed. "
+            "Data is saved; please retry refresh."
+        )
+        response["refresh_error"] = refresh_error
+    return response
 
 
 @router.post("/price-list")
@@ -260,8 +290,15 @@ async def upload_price_list(
     count = await _replace_records(
         db, PriceList, records, owner_user_id=user.id
     )
-    await refresh_all_materialized(db, owner_user_id=user.id)
-    return {"rows_inserted": count}
+    refresh_error = await _refresh_materialized_safe(db, owner_user_id=user.id)
+    response = {"rows_inserted": count}
+    if refresh_error:
+        response["warning"] = (
+            "Upload succeeded, but post-upload materialization refresh failed. "
+            "Data is saved; please retry refresh."
+        )
+        response["refresh_error"] = refresh_error
+    return response
 
 
 @router.post("/historical-sales-monthly")
@@ -358,8 +395,15 @@ async def upload_historical_sales_monthly(
     count = await _replace_records(
         db, HistoricalSalesMonthly, prepared, owner_user_id=user.id
     )
-    await refresh_all_materialized(db, owner_user_id=user.id)
-    return {"rows_inserted": count}
+    refresh_error = await _refresh_materialized_safe(db, owner_user_id=user.id)
+    response = {"rows_inserted": count}
+    if refresh_error:
+        response["warning"] = (
+            "Upload succeeded, but post-upload materialization refresh failed. "
+            "Data is saved; please retry refresh."
+        )
+        response["refresh_error"] = refresh_error
+    return response
 
 
 @router.post("/placed-orders")

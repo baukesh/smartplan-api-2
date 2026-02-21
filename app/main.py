@@ -142,6 +142,9 @@ async def _ensure_owner_columns(conn) -> None:
         "branch_distribution",
         "dp_report",
         "orders_aggregated",
+        "distribution_branch_adjustments",
+        "distribution_sku_adjustments",
+        "dp_report_forecast_overrides",
     ]
     owner_id = await _default_owner_id(conn)
     for table_name in tables:
@@ -163,6 +166,131 @@ async def _ensure_placed_orders_author_column(conn) -> None:
     await conn.execute(text("ALTER TABLE placed_orders ADD COLUMN author VARCHAR(255)"))
 
 
+async def _ensure_dp_reports_columns(conn) -> None:
+    if not await _column_exists(conn, "dp_reports", "product_filter_json"):
+        await conn.execute(text("ALTER TABLE dp_reports ADD COLUMN product_filter_json VARCHAR(8000)"))
+    if not await _column_exists(conn, "dp_reports", "branch_filter_json"):
+        await conn.execute(text("ALTER TABLE dp_reports ADD COLUMN branch_filter_json VARCHAR(8000)"))
+    if not await _column_exists(conn, "dp_reports", "planning_month"):
+        await conn.execute(text("ALTER TABLE dp_reports ADD COLUMN planning_month DATE"))
+
+
+async def _sqlite_column_type(conn, table_name: str, column_name: str) -> str | None:
+    rows = (await conn.execute(text(f"PRAGMA table_info({table_name})"))).fetchall()
+    for r in rows:
+        if r[1] == column_name:
+            return str(r[2] or "").upper()
+    return None
+
+
+async def _ensure_numeric_health_index_columns_sqlite(conn) -> None:
+    # Enforce numeric-only health index columns by rebuilding legacy tables.
+    ih_type = await _sqlite_column_type(conn, "inventory_health", "health_index")
+    bd_type = await _sqlite_column_type(conn, "branch_distribution", "branch_health_index")
+    ih_is_numeric = ih_type in {"REAL", "FLOAT", "DOUBLE", "NUMERIC"}
+    bd_is_numeric = bd_type in {"REAL", "FLOAT", "DOUBLE", "NUMERIC"}
+    if ih_is_numeric and bd_is_numeric:
+        return
+
+    await conn.execute(text("DROP TABLE IF EXISTS inventory_health_new"))
+    await conn.execute(text("DROP TABLE IF EXISTS branch_distribution_new"))
+
+    await conn.execute(
+        text(
+            """
+            CREATE TABLE inventory_health_new (
+                id INTEGER PRIMARY KEY,
+                sku_id VARCHAR(64) NOT NULL,
+                branch_id VARCHAR(64) NOT NULL,
+                date DATE NOT NULL,
+                sales_quantity_in_mc FLOAT NOT NULL,
+                sales_gross_weight_kg FLOAT NOT NULL,
+                sales_volume_cbm FLOAT NOT NULL,
+                sales_amount_kzt FLOAT NOT NULL,
+                total_sales_share FLOAT NOT NULL,
+                available_stock FLOAT NOT NULL,
+                average_f3m_quantity_in_mc FLOAT NOT NULL,
+                dsp FLOAT NOT NULL,
+                available_stock_days FLOAT NOT NULL,
+                stock_norm_days FLOAT NOT NULL,
+                overstock FLOAT NOT NULL,
+                understock FLOAT NOT NULL,
+                stock_out FLOAT NOT NULL,
+                category VARCHAR(8) NOT NULL,
+                health_index FLOAT NOT NULL,
+                owner_user_id INTEGER NOT NULL,
+                created_at DATETIME,
+                updated_at DATETIME
+            )
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            """
+            CREATE TABLE branch_distribution_new (
+                id INTEGER PRIMARY KEY,
+                branch_id VARCHAR(64) NOT NULL,
+                available_quantity_in_mc FLOAT NOT NULL,
+                available_volume_cbm FLOAT NOT NULL,
+                available_gross_weight_kg FLOAT NOT NULL,
+                available_amount_kzt FLOAT NOT NULL,
+                recommended_quantity_in_mc FLOAT NOT NULL,
+                recommended_volume_cbm FLOAT NOT NULL,
+                recommended_gross_weight_kg FLOAT NOT NULL,
+                recommended_amount_kzt FLOAT NOT NULL,
+                branch_health_index FLOAT NOT NULL,
+                owner_user_id INTEGER NOT NULL,
+                created_at DATETIME,
+                updated_at DATETIME
+            )
+            """
+        )
+    )
+
+    # Drop old legacy tables and replace with strict numeric schema tables.
+    await conn.execute(text("DROP TABLE IF EXISTS inventory_health"))
+    await conn.execute(text("DROP TABLE IF EXISTS branch_distribution"))
+    await conn.execute(text("ALTER TABLE inventory_health_new RENAME TO inventory_health"))
+    await conn.execute(text("ALTER TABLE branch_distribution_new RENAME TO branch_distribution"))
+
+    # Recreate key indexes expected by the application.
+    await conn.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_inventory_health_id ON inventory_health (id)")
+    )
+    await conn.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_inventory_health_sku_id ON inventory_health (sku_id)")
+    )
+    await conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_inventory_health_branch_id ON inventory_health (branch_id)"
+        )
+    )
+    await conn.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_inventory_health_date ON inventory_health (date)")
+    )
+    await conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_inventory_health_owner_user_id ON inventory_health (owner_user_id)"
+        )
+    )
+    await conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_branch_distribution_id ON branch_distribution (id)"
+        )
+    )
+    await conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_branch_distribution_branch_id ON branch_distribution (branch_id)"
+        )
+    )
+    await conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_branch_distribution_owner_user_id ON branch_distribution (owner_user_id)"
+        )
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Create tables on startup for MVP; replace with Alembic in production
@@ -170,8 +298,10 @@ async def lifespan(app: FastAPI):
         await conn.run_sync(Base.metadata.create_all)
         await _ensure_owner_columns(conn)
         await _ensure_placed_orders_author_column(conn)
+        await _ensure_dp_reports_columns(conn)
         if conn.dialect.name == "sqlite":
             await _ensure_product_owner_unique_sqlite(conn)
+            await _ensure_numeric_health_index_columns_sqlite(conn)
     yield
 
 
