@@ -102,6 +102,24 @@ async def _resolve_period(db: DBSession, user: CurrentUser, period: str | None) 
     return date(max_hist_date.year, max_hist_date.month + 1, 1)
 
 
+async def _resolve_period_from_args(
+    db: DBSession,
+    user: CurrentUser,
+    period: str | None,
+    date_from: date | None,
+    date_to: date | None,
+) -> date:
+    if period:
+        return _period_to_date(period)
+    # Backward-compatible query style: allow date_from/date_to and
+    # derive the planning period month from either value.
+    if date_to is not None:
+        return _month_start(date_to)
+    if date_from is not None:
+        return _month_start(date_from)
+    return await _resolve_period(db, user, None)
+
+
 def _closest_dsp_for_period(prices: list[PriceList], period_date: date) -> float:
     if not prices:
         return 0.0
@@ -159,12 +177,14 @@ async def get_supply_chain_view(
     db: DBSession,
     user: CurrentUser,
     period: str | None = Query(None, description="Planning period in YYYY-MM"),
+    date_from: date | None = Query(None),
+    date_to: date | None = Query(None),
     category: str | None = Query(None),
     source: str | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: str = Query("10"),
 ) -> SupplyChainListResponse:
-    period_date = await _resolve_period(db, user, period)
+    period_date = await _resolve_period_from_args(db, user, period, date_from, date_to)
     rows, _, _ = await _load_supply_rows(db, user, period_date, category, source)
     items, total_items, total_pages = _paginate(rows, page=page, page_size=page_size)
     return SupplyChainListResponse(
@@ -181,13 +201,15 @@ async def update_adjusted_quantities(
     user: CurrentUser,
     payload: SupplyChainAdjustRequest,
     period: str | None = Query(None, description="Planning period in YYYY-MM"),
+    date_from: date | None = Query(None),
+    date_to: date | None = Query(None),
 ) -> dict:
     if not payload.updates:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="updates cannot be empty",
         )
-    period_date = await _resolve_period(db, user, period)
+    period_date = await _resolve_period_from_args(db, user, period, date_from, date_to)
 
     p_stmt = select(Product)
     if not is_admin(user):
@@ -222,10 +244,12 @@ async def download_supply_chain(
     db: DBSession,
     user: CurrentUser,
     period: str | None = Query(None, description="Planning period in YYYY-MM"),
+    date_from: date | None = Query(None),
+    date_to: date | None = Query(None),
     category: str | None = Query(None),
     source: str | None = Query(None),
 ):
-    period_date = await _resolve_period(db, user, period)
+    period_date = await _resolve_period_from_args(db, user, period, date_from, date_to)
     rows, _, _ = await _load_supply_rows(db, user, period_date, category, source)
     export_rows = [
         {
@@ -254,10 +278,12 @@ async def get_supply_chain_summary(
     db: DBSession,
     user: CurrentUser,
     period: str | None = Query(None, description="Planning period in YYYY-MM"),
+    date_from: date | None = Query(None),
+    date_to: date | None = Query(None),
     category: str | None = Query(None),
     source: str | None = Query(None),
 ) -> SupplyChainSummary:
-    period_date = await _resolve_period(db, user, period)
+    period_date = await _resolve_period_from_args(db, user, period, date_from, date_to)
     _, product_by_sku, fo_by_sku = await _load_supply_rows(db, user, period_date, category, source)
 
     if not fo_by_sku:

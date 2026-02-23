@@ -2,19 +2,19 @@ from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import exists, or_, select
 
 from app.api.deps import CurrentUser, DBSession, is_admin
-from app.api.v1.reports import ReportDetailResponse
+from app.api.v1.reports import ReportDetailDetailedResponse
 from app.models.reporting import DPReport, DPReportAccess
 from app.services.reporting_service import build_report_tables, build_reporting_context, parse_branch_filter, parse_product_filter, report_card_payload
 
 router = APIRouter(prefix="/dp-report", tags=["dp-report"])
 
 
-@router.get("/", response_model=ReportDetailResponse)
+@router.get("/", response_model=ReportDetailDetailedResponse)
 async def get_dp_report_datamart(
     db: DBSession,
     user: CurrentUser,
     report_id: int = Query(...),
-) -> ReportDetailResponse:
+) -> ReportDetailDetailedResponse:
     stmt = select(DPReport).where(DPReport.id == report_id, DPReport.is_deleted.is_(False))
     if not is_admin(user):
         shared = exists(
@@ -48,7 +48,7 @@ async def get_dp_report_datamart(
     card = report_card_payload(report)
     from app.api.v1.reports import ProductFilterPayload, ReportCard
 
-    return ReportDetailResponse(
+    return ReportDetailDetailedResponse(
         report=ReportCard(
             report_id=card["report_id"],
             report_name=card["report_name"],

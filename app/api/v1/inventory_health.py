@@ -30,11 +30,11 @@ class InventoryHealthTableResponse(BaseModel):
 
 class CategorySummaryRow(BaseModel):
     abc_category: str
+    view_type: str
     number_of_skus: int
     percent_of_skus: float
     sales_share_percent: float
-    total_sales_quantity: float
-    total_sales_dsp: float
+    total_sales_value: float
     share_of_stock: float
     category_health_index: float
 
@@ -97,6 +97,21 @@ def _month_bounds(d: date) -> tuple[date, date]:
     last_day = monthrange(d.year, d.month)[1]
     last = d.replace(day=last_day)
     return first, last
+
+
+def _merge_branch_filters(
+    branch_name: list[str] | None, branch: list[str] | None
+) -> list[str] | None:
+    # Support both query styles: branch_name (legacy) and branch (frontend-friendly).
+    merged: list[str] = []
+    for source in (branch_name, branch):
+        if not source:
+            continue
+        for value in source:
+            normalized = str(value).strip()
+            if normalized and normalized not in merged:
+                merged.append(normalized)
+    return merged or None
 
 
 async def _compute_inventory_metrics(
@@ -261,29 +276,39 @@ async def _compute_inventory_metrics(
     return [_SkuMetrics(**x) for x in interim]
 
 
-def _build_category_summary(metrics: list[_SkuMetrics], category: str) -> CategorySummaryRow:
+def _build_category_summary(
+    metrics: list[_SkuMetrics], category: str, view_type: str
+) -> CategorySummaryRow:
+    metric = _normalize_view_type(view_type)
     total_skus = len(metrics)
-    total_sales_qty = sum(m.sales_qty for m in metrics)
+    total_sales_value_all = (
+        sum(m.sales_dsp for m in metrics) if metric == "dsp" else sum(m.sales_qty for m in metrics)
+    )
     total_stock = sum(m.stock for m in metrics)
     filtered = [m for m in metrics if m.abc_category == category]
 
     number_of_skus = len(filtered)
-    category_sales_qty = sum(m.sales_qty for m in filtered)
-    category_sales_dsp = sum(m.sales_dsp for m in filtered)
+    category_sales_value = (
+        sum(m.sales_dsp for m in filtered)
+        if metric == "dsp"
+        else sum(m.sales_qty for m in filtered)
+    )
     category_stock = sum(m.stock for m in filtered)
 
     percent_of_skus = (number_of_skus / total_skus * 100.0) if total_skus > 0 else 0.0
-    sales_share_percent = (category_sales_qty / total_sales_qty * 100.0) if total_sales_qty > 0 else 0.0
+    sales_share_percent = (
+        (category_sales_value / total_sales_value_all * 100.0) if total_sales_value_all > 0 else 0.0
+    )
     share_of_stock = (category_stock / total_stock) if total_stock > 0 else 0.0
     category_health_index = sum(m.health_index * m.share_business for m in filtered)
 
     return CategorySummaryRow(
         abc_category=category,
+        view_type=metric,
         number_of_skus=number_of_skus,
         percent_of_skus=round(percent_of_skus, 1),
         sales_share_percent=round(sales_share_percent, 1),
-        total_sales_quantity=round(category_sales_qty, 2),
-        total_sales_dsp=round(category_sales_dsp, 2),
+        total_sales_value=round(category_sales_value, 2),
         share_of_stock=round(share_of_stock, 4),
         category_health_index=round(category_health_index, 2),
     )
@@ -295,6 +320,7 @@ async def get_inventory_health_table(
     user: CurrentUser,
     view_type: str = Query("DSP", description="DSP or Cases"),
     branch_name: list[str] | None = Query(None),
+    branch: list[str] | None = Query(None),
     date_from: date | None = Query(None),
     date_to: date | None = Query(None),
     page: int = Query(1, ge=1),
@@ -304,7 +330,7 @@ async def get_inventory_health_table(
         db=db,
         user=user,
         view_type=view_type,
-        branch_names=branch_name,
+        branch_names=_merge_branch_filters(branch_name, branch),
         date_from=date_from,
         date_to=date_to,
     )
@@ -329,11 +355,14 @@ async def get_category_a(
     user: CurrentUser,
     view_type: str = Query("DSP", description="DSP or Cases"),
     branch_name: list[str] | None = Query(None),
+    branch: list[str] | None = Query(None),
     date_from: date | None = Query(None),
     date_to: date | None = Query(None),
 ) -> CategorySummaryRow:
-    metrics = await _compute_inventory_metrics(db, user, view_type, branch_name, date_from, date_to)
-    return _build_category_summary(metrics, "A")
+    metrics = await _compute_inventory_metrics(
+        db, user, view_type, _merge_branch_filters(branch_name, branch), date_from, date_to
+    )
+    return _build_category_summary(metrics, "A", view_type)
 
 
 @router.get("/category-b", response_model=CategorySummaryRow)
@@ -342,11 +371,14 @@ async def get_category_b(
     user: CurrentUser,
     view_type: str = Query("DSP", description="DSP or Cases"),
     branch_name: list[str] | None = Query(None),
+    branch: list[str] | None = Query(None),
     date_from: date | None = Query(None),
     date_to: date | None = Query(None),
 ) -> CategorySummaryRow:
-    metrics = await _compute_inventory_metrics(db, user, view_type, branch_name, date_from, date_to)
-    return _build_category_summary(metrics, "B")
+    metrics = await _compute_inventory_metrics(
+        db, user, view_type, _merge_branch_filters(branch_name, branch), date_from, date_to
+    )
+    return _build_category_summary(metrics, "B", view_type)
 
 
 @router.get("/category-c", response_model=CategorySummaryRow)
@@ -355,11 +387,14 @@ async def get_category_c(
     user: CurrentUser,
     view_type: str = Query("DSP", description="DSP or Cases"),
     branch_name: list[str] | None = Query(None),
+    branch: list[str] | None = Query(None),
     date_from: date | None = Query(None),
     date_to: date | None = Query(None),
 ) -> CategorySummaryRow:
-    metrics = await _compute_inventory_metrics(db, user, view_type, branch_name, date_from, date_to)
-    return _build_category_summary(metrics, "C")
+    metrics = await _compute_inventory_metrics(
+        db, user, view_type, _merge_branch_filters(branch_name, branch), date_from, date_to
+    )
+    return _build_category_summary(metrics, "C", view_type)
 
 
 def _top_issue_rows(metrics: list[_SkuMetrics], issue_type: str, top_n: int) -> list[TopSkuShareRow]:
@@ -395,11 +430,14 @@ async def get_overstock(
     user: CurrentUser,
     view_type: str = Query("DSP", description="DSP or Cases"),
     branch_name: list[str] | None = Query(None),
+    branch: list[str] | None = Query(None),
     date_from: date | None = Query(None),
     date_to: date | None = Query(None),
     top_n: int = Query(5, ge=1),
 ) -> TopSkuShareResponse:
-    metrics = await _compute_inventory_metrics(db, user, view_type, branch_name, date_from, date_to)
+    metrics = await _compute_inventory_metrics(
+        db, user, view_type, _merge_branch_filters(branch_name, branch), date_from, date_to
+    )
     return TopSkuShareResponse(items=_top_issue_rows(metrics, "overstock", top_n))
 
 
@@ -409,11 +447,14 @@ async def get_understock(
     user: CurrentUser,
     view_type: str = Query("DSP", description="DSP or Cases"),
     branch_name: list[str] | None = Query(None),
+    branch: list[str] | None = Query(None),
     date_from: date | None = Query(None),
     date_to: date | None = Query(None),
     top_n: int = Query(5, ge=1),
 ) -> TopSkuShareResponse:
-    metrics = await _compute_inventory_metrics(db, user, view_type, branch_name, date_from, date_to)
+    metrics = await _compute_inventory_metrics(
+        db, user, view_type, _merge_branch_filters(branch_name, branch), date_from, date_to
+    )
     return TopSkuShareResponse(items=_top_issue_rows(metrics, "understock", top_n))
 
 
@@ -423,10 +464,13 @@ async def get_out_of_stock(
     user: CurrentUser,
     view_type: str = Query("DSP", description="DSP or Cases"),
     branch_name: list[str] | None = Query(None),
+    branch: list[str] | None = Query(None),
     date_from: date | None = Query(None),
     date_to: date | None = Query(None),
     top_n: int = Query(5, ge=1),
 ) -> TopSkuShareResponse:
-    metrics = await _compute_inventory_metrics(db, user, view_type, branch_name, date_from, date_to)
+    metrics = await _compute_inventory_metrics(
+        db, user, view_type, _merge_branch_filters(branch_name, branch), date_from, date_to
+    )
     return TopSkuShareResponse(items=_top_issue_rows(metrics, "out-of-stock", top_n))
 

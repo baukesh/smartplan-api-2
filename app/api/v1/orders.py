@@ -45,6 +45,7 @@ class OrderDetailsRow(BaseModel):
 class OrderDetailsResponse(BaseModel):
     order_id: str
     order_name: str | None = None
+    status: str | None = None
     creation_date: date
     receival_date: date
     author: str | None = None
@@ -129,6 +130,7 @@ async def list_orders(
 async def list_in_transit_orders(
     db: DBSession,
     user: CurrentUser,
+    status: str | None = Query(None),
     date_from: date | None = Query(None),
     date_to: date | None = Query(None),
     page: int = Query(1, ge=1),
@@ -137,7 +139,7 @@ async def list_in_transit_orders(
     return await _list_aggregated_orders(
         db=db,
         user=user,
-        status_filter="In transit",
+        status_filter=status or "In transit",
         date_from=date_from,
         date_to=date_to,
         page=page,
@@ -149,6 +151,7 @@ async def list_in_transit_orders(
 async def list_completed_orders(
     db: DBSession,
     user: CurrentUser,
+    status: str | None = Query(None),
     date_from: date | None = Query(None),
     date_to: date | None = Query(None),
     page: int = Query(1, ge=1),
@@ -157,7 +160,7 @@ async def list_completed_orders(
     return await _list_aggregated_orders(
         db=db,
         user=user,
-        status_filter="Completed",
+        status_filter=status or "Completed",
         date_from=date_from,
         date_to=date_to,
         page=page,
@@ -254,6 +257,11 @@ async def get_order_details(
         )
 
     header = sorted(order_rows, key=lambda r: (r.creation_date, r.receival_date))[0]
+    agg_stmt = select(OrdersAggregated).where(
+        OrdersAggregated.order_id == order_id,
+        OrdersAggregated.owner_user_id == owner_user_id,
+    )
+    aggregated = (await db.execute(agg_stmt)).scalars().first()
     size = _parse_page_size(page_size)
     if size is not None:
         offset = (page - 1) * size
@@ -264,6 +272,7 @@ async def get_order_details(
     return OrderDetailsResponse(
         order_id=header.order_id,
         order_name=header.order_name,
+        status=aggregated.status if aggregated is not None else header.status,
         creation_date=header.creation_date,
         receival_date=header.receival_date,
         author=header.author,

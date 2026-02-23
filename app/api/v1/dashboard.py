@@ -64,35 +64,33 @@ async def _resolve_last_year_period(
 
 
 class SalesOverviewResponse(BaseModel):
-    total_target_quantity_in_mc: float
-    total_target_amount_kzt: float
-    total_fact_quantity_in_mc: float
-    total_fact_amount_kzt: float
-    trend_dsp_percent: float
-    trend_quantity_percent: float
+    view_type: str
+    total_target_value: float
+    total_fact_value: float
+    trend_percent: float
 
 
 class InventoryIssueOverviewResponse(BaseModel):
-    total_quantity_in_mc: float
-    total_amount_kzt: float
+    view_type: str
+    total_value: float
     sales_share_percent: float
 
 
 class OverstockOverviewResponse(BaseModel):
-    total_overstock_quantity_in_mc: float
-    total_overstock_amount_kzt: float
+    view_type: str
+    total_overstock_value: float
     overstock_sales_share_percent: float
 
 
 class UnderstockOverviewResponse(BaseModel):
-    total_understock_quantity_in_mc: float
-    total_understock_amount_kzt: float
+    view_type: str
+    total_understock_value: float
     understock_sales_share_percent: float
 
 
 class OutOfStockOverviewResponse(BaseModel):
-    total_out_of_stock_quantity_in_mc: float
-    total_out_of_stock_amount_kzt: float
+    view_type: str
+    total_out_of_stock_value: float
     out_of_stock_sales_share_percent: float
 
 
@@ -107,25 +105,32 @@ class StockCoverageResponse(BaseModel):
 
 class HistoricalPlotPoint(BaseModel):
     date: date
-    total_fact_quantity_in_mc: float
-    total_fact_amount_kzt: float
-    total_target_quantity_in_mc: float
-    total_target_amount_kzt: float
+    total_fact_value: float
+    total_target_value: float
     total_past_available_stock: float
 
 
 class ForecastPlotPoint(BaseModel):
     date: date
-    total_baseline_forecast_quantity_in_mc: float
-    total_baseline_forecast_amount_kzt: float
-    total_adjusted_forecast_quantity_in_mc: float
-    total_adjusted_forecast_amount_kzt: float
+    total_baseline_forecast_value: float
+    total_adjusted_forecast_value: float
     total_future_available_stock: float
 
 
 class DashboardPlotDataResponse(BaseModel):
+    view_type: str
     aggregated_historical_sales_data: list[HistoricalPlotPoint] = Field(default_factory=list)
     aggregated_forecast_sales_data: list[ForecastPlotPoint] = Field(default_factory=list)
+
+
+def _normalize_dashboard_view_type(view_type: str) -> str:
+    normalized = (view_type or "").strip().lower()
+    if normalized not in {"dsp", "cases"}:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="view_type must be either 'DSP' or 'Cases'",
+        )
+    return normalized
 
 
 async def _inventory_issue_overview(
@@ -136,10 +141,11 @@ async def _inventory_issue_overview(
     date_from: date | None,
     date_to: date | None,
 ) -> InventoryIssueOverviewResponse:
+    normalized_view_type = _normalize_dashboard_view_type(view_type)
     resolved_from, resolved_to = await _resolve_last_year_period(db, user, date_from, date_to)
     if resolved_from is None or resolved_to is None:
         return InventoryIssueOverviewResponse(
-            total_quantity_in_mc=0.0, total_amount_kzt=0.0, sales_share_percent=0.0
+            view_type=normalized_view_type, total_value=0.0, sales_share_percent=0.0
         )
     metrics = await _compute_inventory_metrics(
         db=db,
@@ -155,13 +161,16 @@ async def _inventory_issue_overview(
         filtered = [m for m in metrics if 0.0 < m.health_index < 100.0]
     else:
         filtered = [m for m in metrics if abs(m.health_index) < 1e-9]
-    total_qty = sum(m.sales_qty for m in filtered)
-    total_amount = sum(m.sales_dsp for m in filtered)
-    all_amount = sum(m.sales_dsp for m in metrics)
-    share = (total_amount / all_amount * 100.0) if all_amount > 0 else 0.0
+    if normalized_view_type == "dsp":
+        total_value = sum(m.sales_dsp for m in filtered)
+        all_value = sum(m.sales_dsp for m in metrics)
+    else:
+        total_value = sum(m.sales_qty for m in filtered)
+        all_value = sum(m.sales_qty for m in metrics)
+    share = (total_value / all_value * 100.0) if all_value > 0 else 0.0
     return InventoryIssueOverviewResponse(
-        total_quantity_in_mc=round(total_qty, 2),
-        total_amount_kzt=round(total_amount, 2),
+        view_type=normalized_view_type,
+        total_value=round(total_value, 2),
         sales_share_percent=_round1(share),
     )
 
@@ -176,7 +185,7 @@ async def _inventory_category_summary(
 ):
     resolved_from, resolved_to = await _resolve_last_year_period(db, user, date_from, date_to)
     if resolved_from is None or resolved_to is None:
-        return _build_category_summary([], category)
+        return _build_category_summary([], category, view_type)
     metrics = await _compute_inventory_metrics(
         db=db,
         user=user,
@@ -185,25 +194,30 @@ async def _inventory_category_summary(
         date_from=resolved_from,
         date_to=resolved_to,
     )
-    return _build_category_summary(metrics, category)
+    return _build_category_summary(metrics, category, view_type)
 
 
 @router.get("/sales-overview", response_model=SalesOverviewResponse)
 async def get_sales_overview(
     db: DBSession,
     user: CurrentUser,
+    view_type: str = Query("DSP", description="DSP or Cases"),
     date_from: date | None = Query(None),
     date_to: date | None = Query(None),
 ) -> SalesOverviewResponse:
+    normalized_view_type = view_type.strip().lower()
+    if normalized_view_type not in {"dsp", "cases"}:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="view_type must be either 'DSP' or 'Cases'",
+        )
     resolved_from, resolved_to = await _resolve_last_year_period(db, user, date_from, date_to)
     if resolved_from is None or resolved_to is None:
         return SalesOverviewResponse(
-            total_target_quantity_in_mc=0.0,
-            total_target_amount_kzt=0.0,
-            total_fact_quantity_in_mc=0.0,
-            total_fact_amount_kzt=0.0,
-            trend_dsp_percent=0.0,
-            trend_quantity_percent=0.0,
+            view_type=normalized_view_type,
+            total_target_value=0.0,
+            total_fact_value=0.0,
+            trend_percent=0.0,
         )
     stmt = _scope_stmt(
         select(
@@ -223,13 +237,18 @@ async def get_sales_overview(
     target_amount = float(row[1] or 0.0)
     fact_qty = float(row[2] or 0.0)
     fact_amount = float(row[3] or 0.0)
+    if normalized_view_type == "dsp":
+        total_target_value = target_amount
+        total_fact_value = fact_amount
+    else:
+        total_target_value = target_qty
+        total_fact_value = fact_qty
+
     return SalesOverviewResponse(
-        total_target_quantity_in_mc=round(target_qty, 2),
-        total_target_amount_kzt=round(target_amount, 2),
-        total_fact_quantity_in_mc=round(fact_qty, 2),
-        total_fact_amount_kzt=round(fact_amount, 2),
-        trend_dsp_percent=_safe_percent_change(fact_amount, target_amount),
-        trend_quantity_percent=_safe_percent_change(fact_qty, target_qty),
+        view_type=normalized_view_type,
+        total_target_value=round(total_target_value, 2),
+        total_fact_value=round(total_fact_value, 2),
+        trend_percent=_safe_percent_change(total_fact_value, total_target_value),
     )
 
 
@@ -250,8 +269,8 @@ async def get_dashboard_overstock(
         date_to=date_to,
     )
     return OverstockOverviewResponse(
-        total_overstock_quantity_in_mc=overview.total_quantity_in_mc,
-        total_overstock_amount_kzt=overview.total_amount_kzt,
+        view_type=overview.view_type,
+        total_overstock_value=overview.total_value,
         overstock_sales_share_percent=overview.sales_share_percent,
     )
 
@@ -273,8 +292,8 @@ async def get_dashboard_understock(
         date_to=date_to,
     )
     return UnderstockOverviewResponse(
-        total_understock_quantity_in_mc=overview.total_quantity_in_mc,
-        total_understock_amount_kzt=overview.total_amount_kzt,
+        view_type=overview.view_type,
+        total_understock_value=overview.total_value,
         understock_sales_share_percent=overview.sales_share_percent,
     )
 
@@ -296,8 +315,8 @@ async def get_dashboard_out_of_stock(
         date_to=date_to,
     )
     return OutOfStockOverviewResponse(
-        total_out_of_stock_quantity_in_mc=overview.total_quantity_in_mc,
-        total_out_of_stock_amount_kzt=overview.total_amount_kzt,
+        view_type=overview.view_type,
+        total_out_of_stock_value=overview.total_value,
         out_of_stock_sales_share_percent=overview.sales_share_percent,
     )
 
@@ -379,12 +398,15 @@ async def get_stock_coverage(
 async def get_plot_data(
     db: DBSession,
     user: CurrentUser,
+    view_type: str = Query("DSP", description="DSP or Cases"),
     date_from: date | None = Query(None),
     date_to: date | None = Query(None),
 ) -> DashboardPlotDataResponse:
+    normalized_view_type = _normalize_dashboard_view_type(view_type)
+    # Kept for API compatibility; this response includes both quantity and amount series.
     resolved_from, resolved_to = await _resolve_last_year_period(db, user, date_from, date_to)
     if resolved_from is None or resolved_to is None:
-        return DashboardPlotDataResponse()
+        return DashboardPlotDataResponse(view_type=normalized_view_type)
 
     hist_stmt = _scope_stmt(
         select(HistoricalSalesMonthly).where(
@@ -416,10 +438,12 @@ async def get_plot_data(
     historical_data = [
         HistoricalPlotPoint(
             date=d,
-            total_fact_quantity_in_mc=round(v["fact_qty"], 2),
-            total_fact_amount_kzt=round(v["fact_amount"], 2),
-            total_target_quantity_in_mc=round(v["target_qty"], 2),
-            total_target_amount_kzt=round(v["target_amount"], 2),
+            total_fact_value=round(v["fact_amount"], 2)
+            if normalized_view_type == "dsp"
+            else round(v["fact_qty"], 2),
+            total_target_value=round(v["target_amount"], 2)
+            if normalized_view_type == "dsp"
+            else round(v["target_qty"], 2),
             total_past_available_stock=round(v["past_stock"], 2),
         )
         for d, v in sorted(hist_buckets.items(), key=lambda x: x[0])
@@ -428,6 +452,7 @@ async def get_plot_data(
     max_hist_date = await _max_historical_date(db, user)
     if max_hist_date is None:
         return DashboardPlotDataResponse(
+            view_type=normalized_view_type,
             aggregated_historical_sales_data=historical_data,
             aggregated_forecast_sales_data=[],
         )
@@ -480,16 +505,19 @@ async def get_plot_data(
         forecast_data = [
             ForecastPlotPoint(
                 date=d,
-                total_baseline_forecast_quantity_in_mc=round(v["baseline_qty"], 2),
-                total_baseline_forecast_amount_kzt=round(v["baseline_amount"], 2),
-                total_adjusted_forecast_quantity_in_mc=round(v["adjusted_qty"], 2),
-                total_adjusted_forecast_amount_kzt=round(v["adjusted_amount"], 2),
+                total_baseline_forecast_value=round(v["baseline_amount"], 2)
+                if normalized_view_type == "dsp"
+                else round(v["baseline_qty"], 2),
+                total_adjusted_forecast_value=round(v["adjusted_amount"], 2)
+                if normalized_view_type == "dsp"
+                else round(v["adjusted_qty"], 2),
                 total_future_available_stock=round(v["future_stock"], 2),
             )
             for d, v in sorted(fc_buckets.items(), key=lambda x: x[0])
         ]
 
     return DashboardPlotDataResponse(
+        view_type=normalized_view_type,
         aggregated_historical_sales_data=historical_data,
         aggregated_forecast_sales_data=forecast_data,
     )
@@ -499,9 +527,16 @@ async def get_plot_data(
 async def get_dashboard_overview_compat(
     db: DBSession,
     user: CurrentUser,
+    view_type: str = Query("DSP", description="DSP or Cases"),
     date_from: date | None = Query(None),
     date_to: date | None = Query(None),
 ) -> SalesOverviewResponse:
     # Backward-compatible alias of the new sales overview.
-    return await get_sales_overview(db=db, user=user, date_from=date_from, date_to=date_to)
+    return await get_sales_overview(
+        db=db,
+        user=user,
+        view_type=view_type,
+        date_from=date_from,
+        date_to=date_to,
+    )
 

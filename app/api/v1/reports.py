@@ -1,7 +1,7 @@
 from datetime import date
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import Select, exists, or_, select
 
@@ -55,10 +55,63 @@ class ReportCard(BaseModel):
     planning_month: date
 
 
-class ReportDetailResponse(BaseModel):
+class HistoricalProjectedRow(BaseModel):
+    period: str
+    fact_value: float
+    target_value: float
+    past_available_stock: float
+
+    model_config = {"extra": "allow"}
+
+
+class ForecastProjectedRow(BaseModel):
+    period: str
+    baseline_forecast_value: float
+    future_available_stock: float
+
+    model_config = {"extra": "allow"}
+
+
+class HistoricalDetailedRow(BaseModel):
+    period: str
+    fact_quantity_in_mc: float
+    fact_gross_weight_kg: float
+    fact_volume_cbm: float
+    fact_amount_kzt: float
+    target_quantity_in_mc: float
+    target_gross_weight_kg: float
+    target_volume_cbm: float
+    target_amount_kzt: float
+    past_available_stock: float
+
+    model_config = {"extra": "allow"}
+
+
+class ForecastDetailedRow(BaseModel):
+    period: str
+    baseline_forecast_quantity_in_mc: float
+    baseline_forecast_gross_weight_kg: float
+    baseline_forecast_volume_cbm: float
+    baseline_forecast_amount_kzt: float
+    adjusted_forecast_quantity_in_mc: float
+    adjusted_forecast_gross_weight_kg: float
+    adjusted_forecast_volume_cbm: float
+    adjusted_forecast_amount_kzt: float
+    future_available_stock: float
+
+    model_config = {"extra": "allow"}
+
+
+class ReportDetailProjectedResponse(BaseModel):
     report: ReportCard
-    historical_table: list[dict]
-    forecast_table: list[dict]
+    historical_table: list[HistoricalProjectedRow]
+    forecast_table: list[ForecastProjectedRow]
+
+
+class ReportDetailDetailedResponse(BaseModel):
+    report: ReportCard
+    historical_table: list[HistoricalDetailedRow]
+    forecast_table: list[ForecastDetailedRow]
 
 
 class ReportUpsertPayload(BaseModel):
@@ -82,6 +135,50 @@ class ReportAccessOut(BaseModel):
     granted_by_id: int | None = None
 
 
+def _view_metric_suffix(view_type: str) -> str:
+    normalized = (view_type or "").strip().lower()
+    if normalized == "dsp":
+        return "amount_kzt"
+    if normalized == "gross weight":
+        return "gross_weight_kg"
+    return "quantity_in_mc"
+
+
+def _project_tables_for_view_type(
+    *,
+    historical_table: list[dict],
+    forecast_table: list[dict],
+    view_type: str,
+) -> tuple[list[dict], list[dict]]:
+    suffix = _view_metric_suffix(view_type)
+    fact_key = f"fact_{suffix}"
+    target_key = f"target_{suffix}"
+    baseline_key = f"baseline_forecast_{suffix}"
+
+    projected_historical: list[dict] = []
+    for row in historical_table:
+        projected_historical.append(
+            {
+                "period": row.get("period"),
+                "fact_value": round(float(row.get(fact_key, 0.0) or 0.0), 2),
+                "target_value": round(float(row.get(target_key, 0.0) or 0.0), 2),
+                "past_available_stock": round(float(row.get("past_available_stock", 0.0) or 0.0), 2),
+            }
+        )
+
+    projected_forecast: list[dict] = []
+    for row in forecast_table:
+        projected_forecast.append(
+            {
+                "period": row.get("period"),
+                "baseline_forecast_value": round(float(row.get(baseline_key, 0.0) or 0.0), 2),
+                "future_available_stock": round(float(row.get("future_available_stock", 0.0) or 0.0), 2),
+            }
+        )
+
+    return projected_historical, projected_forecast
+
+
 def _visible_reports_stmt(user: User) -> Select:
     stmt = select(DPReport).where(DPReport.is_deleted.is_(False))
     if is_admin(user):
@@ -100,17 +197,85 @@ async def _get_accessible_report(db: DBSession, user: User, report_id: int) -> D
     return result.scalar_one_or_none()
 
 
-async def _build_report_detail(db: DBSession, report: DPReport) -> ReportDetailResponse:
+def _clean_list(values: list[str] | None) -> list[str]:
+    if values is None:
+        return []
+    return [str(v).strip() for v in values if str(v).strip()]
+
+
+def _effective_filters_from_overrides(
+    *,
+    saved_product_filter: dict,
+    saved_branch_filter: list[str],
+    sku_code: list[str] | None,
+    brand: list[str] | None,
+    category: list[str] | None,
+    sub_category: list[str] | None,
+    subline: list[str] | None,
+    branch_name: list[str] | None,
+) -> tuple[dict, list[str]]:
+    product_filter = {
+        "sku_codes": list(saved_product_filter.get("sku_codes", []) or []),
+        "brands": list(saved_product_filter.get("brands", []) or []),
+        "categories": list(saved_product_filter.get("categories", []) or []),
+        "sub_categories": list(saved_product_filter.get("sub_categories", []) or []),
+        "sublines": list(saved_product_filter.get("sublines", []) or []),
+    }
+    if sku_code is not None:
+        product_filter["sku_codes"] = _clean_list(sku_code)
+    if brand is not None:
+        product_filter["brands"] = _clean_list(brand)
+    if category is not None:
+        product_filter["categories"] = _clean_list(category)
+    if sub_category is not None:
+        product_filter["sub_categories"] = _clean_list(sub_category)
+    if subline is not None:
+        product_filter["sublines"] = _clean_list(subline)
+
+    if branch_name is None:
+        effective_branch_filter = list(saved_branch_filter)
+    else:
+        effective_branch_filter = _clean_list(branch_name)
+    return product_filter, effective_branch_filter
+
+
+async def _build_report_detail(
+    db: DBSession,
+    report: DPReport,
+    *,
+    view_type_override: str | None = None,
+    date_from_override: date | None = None,
+    date_to_override: date | None = None,
+    sku_code: list[str] | None = None,
+    brand: list[str] | None = None,
+    category: list[str] | None = None,
+    sub_category: list[str] | None = None,
+    subline: list[str] | None = None,
+    branch_name: list[str] | None = None,
+    project_by_view_type: bool = False,
+) -> dict:
     owner_user_id = int(report.created_by_id or 0)
+    saved_product_filter = parse_product_filter(report.product_filter_json or report.product_filter)
+    saved_branch_filter = parse_branch_filter(report.branch_filter_json or report.branch_filter)
+    effective_product_filter, effective_branch_filter = _effective_filters_from_overrides(
+        saved_product_filter=saved_product_filter,
+        saved_branch_filter=saved_branch_filter,
+        sku_code=sku_code,
+        brand=brand,
+        category=category,
+        sub_category=sub_category,
+        subline=subline,
+        branch_name=branch_name,
+    )
     ctx = await build_reporting_context(
         db=db,
         owner_user_id=owner_user_id,
-        view_type=report.view_type,
-        product_filter=report.product_filter_json or report.product_filter,
-        branch_filter=report.branch_filter_json or report.branch_filter,
+        view_type=view_type_override or report.view_type,
+        product_filter=effective_product_filter,
+        branch_filter=effective_branch_filter,
         planning_month=report.planning_month,
-        date_from=report.date_from,
-        date_to=report.date_to,
+        date_from=date_from_override or report.date_from,
+        date_to=date_to_override or report.date_to,
     )
     historical_table, forecast_table = await build_report_tables(
         db=db,
@@ -118,22 +283,28 @@ async def _build_report_detail(db: DBSession, report: DPReport) -> ReportDetailR
         ctx=ctx,
         report_id=report.id,
     )
+    if project_by_view_type:
+        historical_table, forecast_table = _project_tables_for_view_type(
+            historical_table=historical_table,
+            forecast_table=forecast_table,
+            view_type=ctx.view_type,
+        )
     card = report_card_payload(report)
-    return ReportDetailResponse(
-        report=ReportCard(
-            report_id=card["report_id"],
-            report_name=card["report_name"],
-            product_filter=ProductFilterPayload(**card["product_filter"]),
-            branch_filter=card["branch_filter"],
-            view_type=card["view_type"],
-            date_from=card["date_from"],
-            date_to=card["date_to"],
-            is_draft=card["is_draft"],
-            planning_month=card["planning_month"],
-        ),
-        historical_table=historical_table,
-        forecast_table=forecast_table,
-    )
+    return {
+        "report": {
+            "report_id": card["report_id"],
+            "report_name": card["report_name"],
+            "product_filter": ProductFilterPayload(**ctx.product_filter),
+            "branch_filter": ctx.branch_filter,
+            "view_type": ctx.view_type,
+            "date_from": ctx.date_from,
+            "date_to": ctx.date_to,
+            "is_draft": card["is_draft"],
+            "planning_month": ctx.planning_month,
+        },
+        "historical_table": historical_table,
+        "forecast_table": forecast_table,
+    }
 
 
 @router.get("/", response_model=List[ReportCard])
@@ -164,11 +335,11 @@ async def list_reports(
     return cards
 
 
-@router.get("/new", response_model=ReportDetailResponse)
+@router.get("/new", response_model=ReportDetailDetailedResponse)
 async def get_new_report_template(
     db: DBSession,
     user: CurrentUser,
-) -> ReportDetailResponse:
+) -> ReportDetailDetailedResponse:
     planning_month = await get_current_planning_month(db, user.id)
     date_from, date_to = default_period_for_planning(planning_month)
     ctx = await build_reporting_context(
@@ -187,7 +358,7 @@ async def get_new_report_template(
         ctx=ctx,
         report_id=None,
     )
-    return ReportDetailResponse(
+    return ReportDetailDetailedResponse(
         report=ReportCard(
             report_id=0,
             report_name="New Demand Planning Report",
@@ -204,12 +375,12 @@ async def get_new_report_template(
     )
 
 
-@router.post("/", response_model=ReportDetailResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/", response_model=ReportDetailDetailedResponse, status_code=status.HTTP_201_CREATED)
 async def create_report(
     db: DBSession,
     user: CurrentUser,
     payload: ReportUpsertPayload,
-) -> ReportDetailResponse:
+) -> ReportDetailDetailedResponse:
     planning_month = await get_current_planning_month(db, user.id)
     ctx = await build_reporting_context(
         db=db,
@@ -245,28 +416,134 @@ async def create_report(
     )
     await db.commit()
     await db.refresh(report)
-    return await _build_report_detail(db, report)
+    payload_out = await _build_report_detail(db, report)
+    return ReportDetailDetailedResponse(**payload_out)
 
 
-@router.get("/{report_id}", response_model=ReportDetailResponse)
+@router.post("/preview", response_model=ReportDetailDetailedResponse)
+async def preview_report(
+    db: DBSession,
+    user: CurrentUser,
+    payload: ReportUpsertPayload,
+    report_id: int | None = None,
+) -> ReportDetailDetailedResponse:
+    """
+    Preview report tables for ad-hoc filter changes without persisting updates.
+    If report_id is provided, preview uses that report's planning_month and saved defaults.
+    """
+    base_report: DPReport | None = None
+    owner_user_id = user.id
+    planning_month: date | None = None
+    report_name = payload.report_name or "Preview Demand Planning Report"
+    base_view_type = payload.view_type or "cases"
+    base_product_filter: object | None = (
+        payload.product_filter.model_dump() if payload.product_filter is not None else {}
+    )
+    base_branch_filter: object | None = payload.branch_filter or []
+    base_date_from = payload.date_from
+    base_date_to = payload.date_to
+    preview_report_id: int | None = None
+
+    if report_id is not None:
+        base_report = await _get_accessible_report(db, user, report_id)
+        if not base_report:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Report not found"
+            )
+        owner_user_id = int(base_report.created_by_id or user.id)
+        planning_month = base_report.planning_month
+        preview_report_id = base_report.id
+        report_name = payload.report_name or base_report.name
+        base_view_type = payload.view_type or base_report.view_type
+        if payload.product_filter is None:
+            base_product_filter = (
+                base_report.product_filter_json or base_report.product_filter
+            )
+        if payload.branch_filter is None:
+            base_branch_filter = parse_branch_filter(
+                base_report.branch_filter_json or base_report.branch_filter
+            )
+        base_date_from = payload.date_from or base_report.date_from
+        base_date_to = payload.date_to or base_report.date_to
+
+    ctx = await build_reporting_context(
+        db=db,
+        owner_user_id=owner_user_id,
+        view_type=base_view_type,
+        product_filter=base_product_filter,
+        branch_filter=base_branch_filter,
+        planning_month=planning_month,
+        date_from=base_date_from,
+        date_to=base_date_to,
+    )
+    historical_table, forecast_table = await build_report_tables(
+        db=db,
+        owner_user_id=owner_user_id,
+        ctx=ctx,
+        report_id=preview_report_id,
+    )
+    return ReportDetailDetailedResponse(
+        report=ReportCard(
+            report_id=preview_report_id or 0,
+            report_name=report_name,
+            product_filter=ProductFilterPayload(**ctx.product_filter),
+            branch_filter=ctx.branch_filter,
+            view_type=ctx.view_type,
+            date_from=ctx.date_from,
+            date_to=ctx.date_to,
+            is_draft=(base_report.is_draft if base_report else payload.is_draft),
+            planning_month=ctx.planning_month,
+        ),
+        historical_table=historical_table,
+        forecast_table=forecast_table,
+    )
+
+
+@router.get("/{report_id}", response_model=ReportDetailProjectedResponse)
 async def get_report(
     db: DBSession,
     user: CurrentUser,
     report_id: int,
-) -> ReportDetailResponse:
+    view_type: str | None = Query(
+        default=None,
+        description="Transient projection filter for this GET only. Values: DSP, Cases, Gross weight.",
+    ),
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
+    sku_code: list[str] | None = Query(default=None),
+    brand: list[str] | None = Query(default=None),
+    category: list[str] | None = Query(default=None),
+    sub_category: list[str] | None = Query(default=None),
+    subline: list[str] | None = Query(default=None),
+    branch_name: list[str] | None = Query(default=None),
+) -> ReportDetailProjectedResponse:
     report = await _get_accessible_report(db, user, report_id)
     if not report:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
-    return await _build_report_detail(db, report)
+    payload_out = await _build_report_detail(
+        db,
+        report,
+        view_type_override=view_type,
+        date_from_override=date_from,
+        date_to_override=date_to,
+        sku_code=sku_code,
+        brand=brand,
+        category=category,
+        sub_category=sub_category,
+        subline=subline,
+        branch_name=branch_name,
+        project_by_view_type=True,
+    )
+    return ReportDetailProjectedResponse(**payload_out)
 
 
-@router.patch("/{report_id}", response_model=ReportDetailResponse)
+@router.patch("/{report_id}", response_model=ReportDetailDetailedResponse)
 async def update_report(
     db: DBSession,
     user: CurrentUser,
     report_id: int,
     payload: ReportUpsertPayload,
-) -> ReportDetailResponse:
+) -> ReportDetailDetailedResponse:
     report = await _get_accessible_report(db, user, report_id)
     if not report:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
@@ -310,7 +587,8 @@ async def update_report(
         )
     await db.commit()
     await db.refresh(report)
-    return await _build_report_detail(db, report)
+    payload_out = await _build_report_detail(db, report)
+    return ReportDetailDetailedResponse(**payload_out)
 
 
 @router.delete("/{report_id}", status_code=status.HTTP_204_NO_CONTENT)

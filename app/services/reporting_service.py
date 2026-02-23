@@ -199,6 +199,28 @@ def _key_tuple(row: dict) -> tuple:
     )
 
 
+def _aggregate_period_totals(rows: list[dict], metric_fields: list[str]) -> list[dict]:
+    buckets: dict[str, dict[str, float | str]] = {}
+    for row in rows:
+        period = str(row["period"])
+        if period not in buckets:
+            buckets[period] = {"period": period}
+            for m in metric_fields:
+                buckets[period][m] = 0.0
+        b = buckets[period]
+        for m in metric_fields:
+            b[m] = float(b[m]) + float(row.get(m, 0.0) or 0.0)
+
+    out: list[dict] = []
+    for period, payload in buckets.items():
+        out_row: dict[str, float | str] = {"period": period}
+        for m in metric_fields:
+            out_row[m] = round(float(payload[m]), 2)
+        out.append(out_row)
+    out.sort(key=lambda x: x["period"])
+    return out
+
+
 async def build_report_tables(
     db: AsyncSession,
     owner_user_id: int,
@@ -261,11 +283,20 @@ async def build_report_tables(
         bucket["target_amount_kzt"] += float(r.target_amount_kzt or 0.0)
         bucket["past_available_stock"] += float(r.past_available_stock or 0.0)
 
-    historical_table = [
-        {**v, **{k: round(v[k], 2) for k in v.keys() if k.endswith(("_mc", "_kg", "_cbm", "_kzt")) or k == "past_available_stock"}}
-        for v in hist_buckets.values()
-    ]
-    historical_table.sort(key=lambda x: (x["period"], x["branch_name"], x["sku_name"]))
+    historical_table = _aggregate_period_totals(
+        list(hist_buckets.values()),
+        [
+            "fact_quantity_in_mc",
+            "fact_gross_weight_kg",
+            "fact_volume_cbm",
+            "fact_amount_kzt",
+            "target_quantity_in_mc",
+            "target_gross_weight_kg",
+            "target_volume_cbm",
+            "target_amount_kzt",
+            "past_available_stock",
+        ],
+    )
 
     fc_rows = (
         await db.execute(
@@ -390,11 +421,20 @@ async def build_report_tables(
         ]:
             b[metric] += float(r[metric] or 0.0)
 
-    forecast_table = [
-        {**v, **{k: round(v[k], 2) for k in v.keys() if k.endswith(("_mc", "_kg", "_cbm", "_kzt")) or k == "future_available_stock"}}
-        for v in forecast_buckets.values()
-    ]
-    forecast_table.sort(key=lambda x: (x["period"], x["branch_name"], x["sku_name"]))
+    forecast_table = _aggregate_period_totals(
+        list(forecast_buckets.values()),
+        [
+            "baseline_forecast_quantity_in_mc",
+            "baseline_forecast_gross_weight_kg",
+            "baseline_forecast_volume_cbm",
+            "baseline_forecast_amount_kzt",
+            "adjusted_forecast_quantity_in_mc",
+            "adjusted_forecast_gross_weight_kg",
+            "adjusted_forecast_volume_cbm",
+            "adjusted_forecast_amount_kzt",
+            "future_available_stock",
+        ],
+    )
     return historical_table, forecast_table
 
 
