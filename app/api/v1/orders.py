@@ -61,6 +61,7 @@ class OrderDetailsPatchRequest(BaseModel):
 
 
 STATUS_OPTIONS = {"In transit", "Completed", "Created"}
+STATUS_OPTIONS_ORDERED = ["Completed", "In transit", "Created"]
 PAGE_SIZE_MAP = {"10": 10, "50": 50, "100": 100, "all": None}
 
 
@@ -69,6 +70,12 @@ def _base_aggregated_stmt(user: CurrentUser):
     if not is_admin(user):
         stmt = stmt.where(OrdersAggregated.owner_user_id == user.id)
     return stmt
+
+
+@router.get("/status-options", response_model=List[str])
+async def get_order_status_options() -> list[str]:
+    # Stable ordering for frontend dropdown rendering.
+    return STATUS_OPTIONS_ORDERED
 
 
 def _parse_page_size(page_size: str) -> int | None:

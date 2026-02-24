@@ -48,6 +48,10 @@ class TopSkuShareResponse(BaseModel):
     items: list[TopSkuShareRow]
 
 
+class InventoryHealthFilterOptionsResponse(BaseModel):
+    branch_names: list[str]
+
+
 class _SkuMetrics(BaseModel):
     sku_id: str
     sku_code: str
@@ -112,6 +116,50 @@ def _merge_branch_filters(
             if normalized and normalized not in merged:
                 merged.append(normalized)
     return merged or None
+
+
+@router.get("/filter-options", response_model=InventoryHealthFilterOptionsResponse)
+async def get_inventory_health_filter_options(
+    db: DBSession,
+    user: CurrentUser,
+    date_from: date | None = Query(None),
+    date_to: date | None = Query(None),
+) -> InventoryHealthFilterOptionsResponse:
+    same_month = (
+        date_from is not None
+        and date_to is not None
+        and date_from.year == date_to.year
+        and date_from.month == date_to.month
+    )
+    if same_month:
+        d_from, d_to = _month_bounds(date_from)
+    else:
+        d_from, d_to = date_from, date_to
+
+    hs_stmt = select(HistoricalSalesMonthly.branch_id)
+    if not is_admin(user):
+        hs_stmt = hs_stmt.where(HistoricalSalesMonthly.owner_user_id == user.id)
+    if d_from:
+        hs_stmt = hs_stmt.where(HistoricalSalesMonthly.date >= d_from)
+    if d_to:
+        hs_stmt = hs_stmt.where(HistoricalSalesMonthly.date <= d_to)
+    branch_ids = {str(row[0]) for row in (await db.execute(hs_stmt)).all()}
+
+    if not branch_ids:
+        return InventoryHealthFilterOptionsResponse(branch_names=[])
+
+    b_stmt = select(Branch)
+    if not is_admin(user):
+        b_stmt = b_stmt.where(Branch.owner_user_id == user.id)
+    branches = (await db.execute(b_stmt)).scalars().all()
+    names = sorted(
+        {
+            str(b.branch_name).strip()
+            for b in branches
+            if b.branch_id in branch_ids and str(b.branch_name).strip()
+        }
+    )
+    return InventoryHealthFilterOptionsResponse(branch_names=names)
 
 
 async def _compute_inventory_metrics(

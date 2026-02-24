@@ -378,6 +378,13 @@ async def refresh_forecast_orders(
             select(ProductBranch).where(ProductBranch.owner_user_id == owner_user_id)
         )
     ).scalars().all()
+    hist_rows = (
+        await db.execute(
+            select(HistoricalSalesMonthly).where(
+                HistoricalSalesMonthly.owner_user_id == owner_user_id
+            )
+        )
+    ).scalars().all()
 
     pb_norm = {(r.sku_id, r.branch_id): float(r.stock_norm) for r in pb_rows}
 
@@ -386,6 +393,18 @@ async def refresh_forecast_orders(
     )
     for row in fc_rows:
         by_sku_date_branch[row.sku_id][row.date][row.branch_id] = row
+    hist_qty_total_by_sku_date: dict[tuple[str, date], float] = defaultdict(float)
+    for row in hist_rows:
+        hist_qty_total_by_sku_date[(row.sku_id, row.date)] += float(
+            row.fact_quantity_in_mc or 0.0
+        )
+    fc_qty_total_by_sku_date: dict[tuple[str, date], float] = defaultdict(float)
+    for row in fc_rows:
+        fc_qty_total_by_sku_date[(row.sku_id, row.date)] += float(
+            row.adjusted_forecast_quantity_in_mc
+            if row.adjusted_forecast_quantity_in_mc is not None
+            else row.baseline_forecast_quantity_in_mc
+        )
 
     await db.execute(
         delete(ForecastOrders).where(ForecastOrders.owner_user_id == owner_user_id)
@@ -402,14 +421,22 @@ async def refresh_forecast_orders(
                     r.future_available_stock for r in date_map[prev_d].values()
                 )
 
-            l3_slice = dates[max(0, idx - 3) : idx]
             f3_slice = dates[idx : idx + 3]
 
             l3_vals: list[float] = []
-            for dd in l3_slice:
-                l3_vals.extend(
-                    [r.baseline_forecast_quantity_in_mc for r in date_map[dd].values()]
-                )
+            # Hybrid rolling window for L3M: current planning month + previous two months.
+            # Per month, prefer historical fact; otherwise fallback to forecast.
+            l3_months = [d, _prev_month(d), _prev_month(_prev_month(d))]
+            for dd in l3_months:
+                hist_total = hist_qty_total_by_sku_date.get((sku_id, dd))
+                if hist_total is not None:
+                    l3_vals.append(float(hist_total))
+                    continue
+                fc_total = fc_qty_total_by_sku_date.get((sku_id, dd))
+                if fc_total is not None:
+                    l3_vals.append(float(fc_total))
+                    continue
+                l3_vals.append(0.0)
             f3_vals: list[float] = []
             for dd in f3_slice:
                 f3_vals.extend(

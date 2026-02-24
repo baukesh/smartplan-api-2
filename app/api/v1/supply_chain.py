@@ -49,6 +49,11 @@ class SupplyChainSummary(BaseModel):
     total_volume: float
 
 
+class SupplyChainFilterOptionsResponse(BaseModel):
+    categories: list[str]
+    sources: list[str]
+
+
 def _month_start(d: date) -> date:
     return d.replace(day=1)
 
@@ -170,6 +175,69 @@ async def _load_supply_rows(
     ]
     rows.sort(key=lambda x: x.sku_code)
     return rows, product_by_sku, fo_by_sku
+
+
+@router.get("/filter-options", response_model=SupplyChainFilterOptionsResponse)
+async def get_supply_chain_filter_options(
+    db: DBSession,
+    user: CurrentUser,
+    period: str | None = Query(None, description="Planning period in YYYY-MM"),
+    date_from: date | None = Query(None),
+    date_to: date | None = Query(None),
+) -> SupplyChainFilterOptionsResponse:
+    has_period_context = bool(period or date_from or date_to)
+    period_date: date | None = None
+    if has_period_context:
+        period_date = await _resolve_period_from_args(db, user, period, date_from, date_to)
+
+    p_stmt = select(Product)
+    if not is_admin(user):
+        p_stmt = p_stmt.where(Product.owner_user_id == user.id)
+    products = (await db.execute(p_stmt)).scalars().all()
+
+    # Global options for user-owned products.
+    categories = sorted(
+        {
+            str(p.category).strip()
+            for p in products
+            if p.category is not None and str(p.category).strip()
+        }
+    )
+    sources = sorted(
+        {
+            str(p.source).strip()
+            for p in products
+            if p.source is not None and str(p.source).strip()
+        }
+    )
+
+    # Optional context-aware narrowing by selected planning period:
+    # keep only options present in forecast rows for that month.
+    if period_date is not None:
+        fo_stmt = select(ForecastOrders).where(ForecastOrders.date == period_date)
+        if not is_admin(user):
+            fo_stmt = fo_stmt.where(ForecastOrders.owner_user_id == user.id)
+        forecast_rows = (await db.execute(fo_stmt)).scalars().all()
+        if forecast_rows:
+            sku_ids = {r.sku_id for r in forecast_rows}
+            if sku_ids:
+                period_products = [p for p in products if p.sku_id in sku_ids]
+                categories = sorted(
+                    {
+                        str(p.category).strip()
+                        for p in period_products
+                        if p.category is not None and str(p.category).strip()
+                    }
+                )
+                sources = sorted(
+                    {
+                        str(p.source).strip()
+                        for p in period_products
+                        if p.source is not None and str(p.source).strip()
+                    }
+                )
+
+    return SupplyChainFilterOptionsResponse(categories=categories, sources=sources)
 
 
 @router.get("/", response_model=SupplyChainListResponse)
