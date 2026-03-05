@@ -502,6 +502,7 @@ async def replace_report_overrides(
                 sub_category=ov.get("sub_category"),
                 subline=ov.get("subline"),
                 sku_name=ov.get("sku_name"),
+                adjustment_reason=ov.get("adjustment_reason"),
                 value=float(ov.get("value", 0.0)),
             )
         )

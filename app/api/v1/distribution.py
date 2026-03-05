@@ -74,6 +74,7 @@ class DistributionBranchAdjustRequest(BaseModel):
 class DistributionSkuAdjustRow(BaseModel):
     sku_code: str
     adjusted_quantity_in_mc: float | None = None
+    adjusted_quantity_in_mc_per_branch: float | None = None
 
 
 class DistributionSkuAdjustRequest(BaseModel):
@@ -471,6 +472,24 @@ async def patch_distribution_detail_adjustments(
 ) -> dict:
     if not payload.updates:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="updates cannot be empty")
+    wrong_field_rows = [
+        {
+            "sku_code": item.sku_code,
+            "provided_field": "adjusted_quantity_in_mc_per_branch",
+            "expected_field": "adjusted_quantity_in_mc",
+        }
+        for item in payload.updates
+        if item.adjusted_quantity_in_mc is None
+        and item.adjusted_quantity_in_mc_per_branch is not None
+    ]
+    if wrong_field_rows:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": "Invalid payload for /distribution/details. Use adjusted_quantity_in_mc, not adjusted_quantity_in_mc_per_branch.",
+                "invalid_updates": wrong_field_rows,
+            },
+        )
     planning_date, calc_rows, _, _ = await _build_distribution_calc(db, user)
     branch_rows = [r for r in calc_rows if r.branch_name == branch_name or r.branch_id == branch_name]
     if not branch_rows:

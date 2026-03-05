@@ -35,6 +35,7 @@ class ForecastAdjustmentPayload(BaseModel):
     period: date
     metric_type: str
     value: float
+    adjustment_reason: str | None = None
     branch_name: str | None = None
     brand: str | None = None
     category: str | None = None
@@ -67,6 +68,7 @@ class HistoricalProjectedRow(BaseModel):
 class ForecastProjectedRow(BaseModel):
     period: str
     baseline_forecast_value: float
+    adjusted_forecast_value: float
     future_available_stock: float
 
     model_config = {"extra": "allow"}
@@ -154,6 +156,7 @@ def _project_tables_for_view_type(
     fact_key = f"fact_{suffix}"
     target_key = f"target_{suffix}"
     baseline_key = f"baseline_forecast_{suffix}"
+    adjusted_key = f"adjusted_forecast_{suffix}"
 
     projected_historical: list[dict] = []
     for row in historical_table:
@@ -172,6 +175,9 @@ def _project_tables_for_view_type(
             {
                 "period": row.get("period"),
                 "baseline_forecast_value": round(float(row.get(baseline_key, 0.0) or 0.0), 2),
+                "adjusted_forecast_value": round(
+                    float(row.get(adjusted_key, row.get(baseline_key, 0.0)) or 0.0), 2
+                ),
                 "future_available_stock": round(float(row.get("future_available_stock", 0.0) or 0.0), 2),
             }
         )
@@ -201,6 +207,16 @@ def _clean_list(values: list[str] | None) -> list[str]:
     if values is None:
         return []
     return [str(v).strip() for v in values if str(v).strip()]
+
+
+def _resolve_report_planning_month(report: DPReport) -> date | None:
+    if report.planning_month is not None:
+        return report.planning_month
+    if report.date_to is not None:
+        return report.date_to.replace(day=1)
+    if report.date_from is not None:
+        return report.date_from.replace(day=1)
+    return None
 
 
 def _effective_filters_from_overrides(
@@ -273,7 +289,7 @@ async def _build_report_detail(
         view_type=view_type_override or report.view_type,
         product_filter=effective_product_filter,
         branch_filter=effective_branch_filter,
-        planning_month=report.planning_month,
+        planning_month=_resolve_report_planning_month(report),
         date_from=date_from_override or report.date_from,
         date_to=date_to_override or report.date_to,
     )
@@ -335,11 +351,11 @@ async def list_reports(
     return cards
 
 
-@router.get("/new", response_model=ReportDetailDetailedResponse)
+@router.get("/new", response_model=ReportDetailProjectedResponse)
 async def get_new_report_template(
     db: DBSession,
     user: CurrentUser,
-) -> ReportDetailDetailedResponse:
+) -> ReportDetailProjectedResponse:
     planning_month = await get_current_planning_month(db, user.id)
     date_from, date_to = default_period_for_planning(planning_month)
     ctx = await build_reporting_context(
@@ -358,7 +374,12 @@ async def get_new_report_template(
         ctx=ctx,
         report_id=None,
     )
-    return ReportDetailDetailedResponse(
+    projected_historical, projected_forecast = _project_tables_for_view_type(
+        historical_table=historical_table,
+        forecast_table=forecast_table,
+        view_type=ctx.view_type,
+    )
+    return ReportDetailProjectedResponse(
         report=ReportCard(
             report_id=0,
             report_name="New Demand Planning Report",
@@ -370,17 +391,17 @@ async def get_new_report_template(
             is_draft=True,
             planning_month=planning_month,
         ),
-        historical_table=historical_table,
-        forecast_table=forecast_table,
+        historical_table=projected_historical,
+        forecast_table=projected_forecast,
     )
 
 
-@router.post("/", response_model=ReportDetailDetailedResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/", response_model=ReportDetailProjectedResponse, status_code=status.HTTP_201_CREATED)
 async def create_report(
     db: DBSession,
     user: CurrentUser,
     payload: ReportUpsertPayload,
-) -> ReportDetailDetailedResponse:
+) -> ReportDetailProjectedResponse:
     planning_month = await get_current_planning_month(db, user.id)
     ctx = await build_reporting_context(
         db=db,
@@ -416,17 +437,17 @@ async def create_report(
     )
     await db.commit()
     await db.refresh(report)
-    payload_out = await _build_report_detail(db, report)
-    return ReportDetailDetailedResponse(**payload_out)
+    payload_out = await _build_report_detail(db, report, project_by_view_type=True)
+    return ReportDetailProjectedResponse(**payload_out)
 
 
-@router.post("/preview", response_model=ReportDetailDetailedResponse)
+@router.post("/preview", response_model=ReportDetailProjectedResponse)
 async def preview_report(
     db: DBSession,
     user: CurrentUser,
     payload: ReportUpsertPayload,
     report_id: int | None = None,
-) -> ReportDetailDetailedResponse:
+) -> ReportDetailProjectedResponse:
     """
     Preview report tables for ad-hoc filter changes without persisting updates.
     If report_id is provided, preview uses that report's planning_month and saved defaults.
@@ -482,7 +503,12 @@ async def preview_report(
         ctx=ctx,
         report_id=preview_report_id,
     )
-    return ReportDetailDetailedResponse(
+    projected_historical, projected_forecast = _project_tables_for_view_type(
+        historical_table=historical_table,
+        forecast_table=forecast_table,
+        view_type=ctx.view_type,
+    )
+    return ReportDetailProjectedResponse(
         report=ReportCard(
             report_id=preview_report_id or 0,
             report_name=report_name,
@@ -494,8 +520,8 @@ async def preview_report(
             is_draft=(base_report.is_draft if base_report else payload.is_draft),
             planning_month=ctx.planning_month,
         ),
-        historical_table=historical_table,
-        forecast_table=forecast_table,
+        historical_table=projected_historical,
+        forecast_table=projected_forecast,
     )
 
 
@@ -537,13 +563,13 @@ async def get_report(
     return ReportDetailProjectedResponse(**payload_out)
 
 
-@router.patch("/{report_id}", response_model=ReportDetailDetailedResponse)
+@router.patch("/{report_id}", response_model=ReportDetailProjectedResponse)
 async def update_report(
     db: DBSession,
     user: CurrentUser,
     report_id: int,
     payload: ReportUpsertPayload,
-) -> ReportDetailDetailedResponse:
+) -> ReportDetailProjectedResponse:
     report = await _get_accessible_report(db, user, report_id)
     if not report:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
@@ -564,7 +590,7 @@ async def update_report(
             if payload.branch_filter is not None
             else parse_branch_filter(report.branch_filter_json or report.branch_filter)
         ),
-        planning_month=report.planning_month,
+        planning_month=_resolve_report_planning_month(report),
         date_from=payload.date_from or report.date_from,
         date_to=payload.date_to or report.date_to,
     )
@@ -587,8 +613,8 @@ async def update_report(
         )
     await db.commit()
     await db.refresh(report)
-    payload_out = await _build_report_detail(db, report)
-    return ReportDetailDetailedResponse(**payload_out)
+    payload_out = await _build_report_detail(db, report, project_by_view_type=True)
+    return ReportDetailProjectedResponse(**payload_out)
 
 
 @router.delete("/{report_id}", status_code=status.HTTP_204_NO_CONTENT)

@@ -173,6 +173,23 @@ async def _ensure_dp_reports_columns(conn) -> None:
         await conn.execute(text("ALTER TABLE dp_reports ADD COLUMN branch_filter_json VARCHAR(8000)"))
     if not await _column_exists(conn, "dp_reports", "planning_month"):
         await conn.execute(text("ALTER TABLE dp_reports ADD COLUMN planning_month DATE"))
+    if not await _column_exists(conn, "dp_report_forecast_overrides", "adjustment_reason"):
+        await conn.execute(
+            text("ALTER TABLE dp_report_forecast_overrides ADD COLUMN adjustment_reason VARCHAR(2000)")
+        )
+    # Backfill legacy reports where planning_month is null to avoid period validation errors.
+    await conn.execute(
+        text(
+            """
+            UPDATE dp_reports
+            SET planning_month = COALESCE(
+                date(date_to, 'start of month'),
+                date(date_from, 'start of month')
+            )
+            WHERE planning_month IS NULL
+            """
+        )
+    )
 
 
 async def _sqlite_column_type(conn, table_name: str, column_name: str) -> str | None:

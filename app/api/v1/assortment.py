@@ -240,6 +240,8 @@ async def download_assortment_items(
 async def get_branch_stock_matrix(
     db: DBSession,
     user: CurrentUser,
+    sku_code: str | None = Query(None),
+    branch_name: str | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: str = Query("10"),
 ) -> BranchStockNormPage:
@@ -267,6 +269,12 @@ async def get_branch_stock_matrix(
         for r in rows
         if (r.owner_user_id, r.sku_id) in product_map
     ]
+    if sku_code:
+        sku_norm = sku_code.strip()
+        rows_out = [x for x in rows_out if x.sku_code == sku_norm]
+    if branch_name:
+        branch_norm = branch_name.strip().lower()
+        rows_out = [x for x in rows_out if x.branch_name.strip().lower() == branch_norm]
     items, total_items, total_pages = _paginate_list(rows_out, page=page, page_size=page_size)
     return BranchStockNormPage(items=items, total_items=total_items, total_pages=total_pages)
 
@@ -292,20 +300,25 @@ async def update_branch_matrix_stock_norm(
     branches = (await db.execute(branch_stmt)).scalars().all()
 
     product_ids_by_key: dict[tuple[int, str], str] = {
-        (p.owner_user_id, p.sku_code): p.sku_id for p in products
+        (p.owner_user_id, str(p.sku_code).strip()): p.sku_id for p in products
     }
     branch_ids_by_key: dict[tuple[int, str], str] = {
-        (b.owner_user_id, b.branch_name): b.branch_id for b in branches
+        (b.owner_user_id, str(b.branch_name).strip().lower()): b.branch_id for b in branches
     }
     owners = sorted({owner_id for owner_id, _ in product_ids_by_key.keys()})
 
     updated = 0
+    unresolved: list[dict[str, str]] = []
     for item in payload.updates:
+        normalized_sku = str(item.sku_code).strip()
+        normalized_branch = str(item.branch_name).strip().lower()
+        matched_any = False
         for owner_id in owners:
-            sku_id = product_ids_by_key.get((owner_id, item.sku_code))
-            branch_id = branch_ids_by_key.get((owner_id, item.branch_name))
+            sku_id = product_ids_by_key.get((owner_id, normalized_sku))
+            branch_id = branch_ids_by_key.get((owner_id, normalized_branch))
             if not sku_id or not branch_id:
                 continue
+            matched_any = True
             stmt = (
                 update(ProductBranch)
                 .where(
@@ -317,6 +330,23 @@ async def update_branch_matrix_stock_norm(
             )
             result = await db.execute(stmt)
             updated += int(result.rowcount or 0)
+        if not matched_any:
+            unresolved.append(
+                {
+                    "sku_code": normalized_sku,
+                    "branch_name": str(item.branch_name).strip(),
+                }
+            )
+
+    if unresolved:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "message": "Some updates could not be resolved by sku_code/branch_name",
+                "unresolved": unresolved,
+            },
+        )
 
     await db.commit()
     return {"rows_updated": updated}

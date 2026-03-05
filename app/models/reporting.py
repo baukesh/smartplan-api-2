@@ -61,5 +61,6 @@ class DPReportForecastOverride(Base, TimestampMixin):
     sub_category: Mapped[str | None] = mapped_column(String(255))
     subline: Mapped[str | None] = mapped_column(String(255))
     sku_name: Mapped[str | None] = mapped_column(String(255))
+    adjustment_reason: Mapped[str | None] = mapped_column(String(2000))
     value: Mapped[float] = mapped_column(Float)
 
