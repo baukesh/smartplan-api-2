@@ -21,6 +21,11 @@ VALID_OVERRIDE_METRICS = {
     "adjusted_forecast_volume_cbm": "baseline_forecast_volume_cbm",
     "adjusted_forecast_amount_kzt": "baseline_forecast_amount_kzt",
 }
+VIEW_TYPE_TO_OVERRIDE_METRIC = {
+    "cases": "adjusted_forecast_quantity_in_mc",
+    "gross weight": "adjusted_forecast_gross_weight_kg",
+    "dsp": "adjusted_forecast_amount_kzt",
+}
 
 
 @dataclass
@@ -146,6 +151,16 @@ def validate_view_type(view_type: str) -> str:
             detail="view_type must be one of: DSP, Cases, Gross weight",
         )
     return normalized
+
+
+def normalize_override_metric(metric_type: str) -> str | None:
+    normalized = str(metric_type or "").strip().lower()
+    if normalized in VIEW_TYPE_TO_OVERRIDE_METRIC:
+        return VIEW_TYPE_TO_OVERRIDE_METRIC[normalized]
+    # Backward-compatible support for already-internal metric ids.
+    if normalized in VALID_OVERRIDE_METRICS:
+        return normalized
+    return None
 
 
 def _matches_filters(
@@ -478,11 +493,14 @@ async def replace_report_overrides(
     )
     inserts: list[DPReportForecastOverride] = []
     for ov in overrides:
-        metric = str(ov.get("metric_type", "")).strip()
-        if metric not in VALID_OVERRIDE_METRICS:
+        metric_input = str(ov.get("metric_type", "")).strip()
+        metric = normalize_override_metric(metric_input)
+        if metric is None:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"Unsupported metric_type: {metric}",
+                detail=(
+                    "Unsupported metric_type. Allowed values: DSP, Cases, Gross Weight"
+                ),
             )
         period_value = ov.get("period")
         if not isinstance(period_value, date):

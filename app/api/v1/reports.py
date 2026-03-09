@@ -13,6 +13,7 @@ from app.services.reporting_service import (
     build_reporting_context,
     default_period_for_planning,
     get_current_planning_month,
+    normalize_override_metric,
     parse_branch_filter,
     parse_product_filter,
     replace_report_overrides,
@@ -125,6 +126,22 @@ class ReportUpsertPayload(BaseModel):
     date_to: date | None = None
     is_draft: bool = True
     forecast_adjustments: list[ForecastAdjustmentPayload] | None = None
+
+
+class ForecastAdjustmentPatchPayload(BaseModel):
+    period: date
+    value: float
+    adjustment_reason: str | None = None
+
+    model_config = {"extra": "forbid"}
+
+
+class ReportPatchPayload(BaseModel):
+    report_name: str | None = None
+    is_draft: bool | None = None
+    forecast_adjustments: list[ForecastAdjustmentPatchPayload] | None = None
+
+    model_config = {"extra": "forbid"}
 
 
 class ReportAccessGrant(BaseModel):
@@ -401,17 +418,52 @@ async def create_report(
     db: DBSession,
     user: CurrentUser,
     payload: ReportUpsertPayload,
+    view_type: str | None = Query(default=None),
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
+    sku_code: list[str] | None = Query(default=None),
+    brand: list[str] | None = Query(default=None),
+    category: list[str] | None = Query(default=None),
+    sub_category: list[str] | None = Query(default=None),
+    subline: list[str] | None = Query(default=None),
+    branch_name: list[str] | None = Query(default=None),
 ) -> ReportDetailProjectedResponse:
+    if (
+        payload.product_filter is not None
+        or payload.branch_filter is not None
+        or payload.view_type is not None
+        or payload.date_from is not None
+        or payload.date_to is not None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "For POST /reports, filters must be provided via URL query parameters "
+                "(view_type, date_from, date_to, sku_code, brand, category, sub_category, subline, branch_name)."
+            ),
+        )
+
+    effective_product_filter, effective_branch_filter = _effective_filters_from_overrides(
+        saved_product_filter={},
+        saved_branch_filter=[],
+        sku_code=sku_code,
+        brand=brand,
+        category=category,
+        sub_category=sub_category,
+        subline=subline,
+        branch_name=branch_name,
+    )
+
     planning_month = await get_current_planning_month(db, user.id)
     ctx = await build_reporting_context(
         db=db,
         owner_user_id=user.id,
-        view_type=payload.view_type or "cases",
-        product_filter=(payload.product_filter.model_dump() if payload.product_filter else {}),
-        branch_filter=(payload.branch_filter or []),
+        view_type=view_type or "cases",
+        product_filter=effective_product_filter,
+        branch_filter=effective_branch_filter,
         planning_month=planning_month,
-        date_from=payload.date_from,
-        date_to=payload.date_to,
+        date_from=date_from,
+        date_to=date_to,
     )
     report = DPReport(
         name=payload.report_name or "New Demand Planning Report",
@@ -568,31 +620,44 @@ async def update_report(
     db: DBSession,
     user: CurrentUser,
     report_id: int,
-    payload: ReportUpsertPayload,
+    payload: ReportPatchPayload,
+    view_type: str | None = Query(default=None),
+    date_from: date | None = Query(default=None),
+    date_to: date | None = Query(default=None),
+    sku_code: list[str] | None = Query(default=None),
+    brand: list[str] | None = Query(default=None),
+    category: list[str] | None = Query(default=None),
+    sub_category: list[str] | None = Query(default=None),
+    subline: list[str] | None = Query(default=None),
+    branch_name: list[str] | None = Query(default=None),
 ) -> ReportDetailProjectedResponse:
     report = await _get_accessible_report(db, user, report_id)
     if not report:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
     if not is_admin(user) and report.created_by_id != user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not enough permissions")
+    saved_product_filter = parse_product_filter(report.product_filter_json or report.product_filter)
+    saved_branch_filter = parse_branch_filter(report.branch_filter_json or report.branch_filter)
+    effective_product_filter, effective_branch_filter = _effective_filters_from_overrides(
+        saved_product_filter=saved_product_filter,
+        saved_branch_filter=saved_branch_filter,
+        sku_code=sku_code,
+        brand=brand,
+        category=category,
+        sub_category=sub_category,
+        subline=subline,
+        branch_name=branch_name,
+    )
 
     ctx = await build_reporting_context(
         db=db,
         owner_user_id=int(report.created_by_id or user.id),
-        view_type=payload.view_type or report.view_type,
-        product_filter=(
-            payload.product_filter.model_dump()
-            if payload.product_filter is not None
-            else (report.product_filter_json or report.product_filter)
-        ),
-        branch_filter=(
-            payload.branch_filter
-            if payload.branch_filter is not None
-            else parse_branch_filter(report.branch_filter_json or report.branch_filter)
-        ),
+        view_type=view_type or report.view_type,
+        product_filter=effective_product_filter,
+        branch_filter=effective_branch_filter,
         planning_month=_resolve_report_planning_month(report),
-        date_from=payload.date_from or report.date_from,
-        date_to=payload.date_to or report.date_to,
+        date_from=date_from or report.date_from,
+        date_to=date_to or report.date_to,
     )
 
     report.name = payload.report_name or report.name
@@ -601,15 +666,36 @@ async def update_report(
     report.view_type = ctx.view_type
     report.date_from = ctx.date_from
     report.date_to = ctx.date_to
-    report.is_draft = payload.is_draft
+    if payload.is_draft is not None:
+        report.is_draft = payload.is_draft
     report.updated_by_id = user.id
 
     if payload.forecast_adjustments is not None:
+        effective_metric_type = view_type or report.view_type
+        normalized_metric = normalize_override_metric(effective_metric_type or "")
+        if normalized_metric is None or str(effective_metric_type or "").strip().lower() not in {
+            "dsp",
+            "cases",
+            "gross weight",
+        }:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="view_type must be provided as query param (DSP, Cases, Gross Weight) or be valid on report",
+            )
+        overrides = [
+            {
+                "period": adj.period,
+                "metric_type": normalized_metric,
+                "value": adj.value,
+                "adjustment_reason": adj.adjustment_reason,
+            }
+            for adj in payload.forecast_adjustments
+        ]
         await replace_report_overrides(
             db=db,
             report_id=report.id,
             owner_user_id=int(report.created_by_id or user.id),
-            overrides=[x.model_dump() for x in (payload.forecast_adjustments or [])],
+            overrides=overrides,
         )
     await db.commit()
     await db.refresh(report)

@@ -13,6 +13,7 @@ from app.api.v1 import (
     inventory_health,
     notifications,
     orders,
+    product_filter_options,
     reports,
     supply_chain,
     datasets,
@@ -350,6 +351,7 @@ app.include_router(supply_chain.router, prefix=settings.API_V1_PREFIX)
 app.include_router(distribution.router, prefix=settings.API_V1_PREFIX)
 app.include_router(inventory_health.router, prefix=settings.API_V1_PREFIX)
 app.include_router(notifications.router, prefix=settings.API_V1_PREFIX)
+app.include_router(product_filter_options.router, prefix=settings.API_V1_PREFIX)
 
 
 @app.get("/")

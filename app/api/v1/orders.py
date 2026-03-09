@@ -24,6 +24,12 @@ class OrderRow(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class OrdersPage(BaseModel):
+    items: list[OrderRow]
+    total_items: int
+    total_pages: int
+
+
 class OrderStatusUpdateRow(BaseModel):
     order_id: str
     status: str
@@ -52,6 +58,8 @@ class OrderDetailsResponse(BaseModel):
     total_skus: int
     total_amount_kzt: float
     items: list[OrderDetailsRow]
+    total_items: int
+    total_pages: int
 
 
 class OrderDetailsPatchRequest(BaseModel):
@@ -96,7 +104,7 @@ async def _list_aggregated_orders(
     date_to: date | None = None,
     page: int = 1,
     page_size: str = "10",
-) -> list[OrderRow]:
+) -> OrdersPage:
     stmt = _base_aggregated_stmt(user)
     if status_filter:
         stmt = stmt.where(OrdersAggregated.status == status_filter)
@@ -106,13 +114,20 @@ async def _list_aggregated_orders(
         stmt = stmt.where(OrdersAggregated.creation_date <= date_to)
     size = _parse_page_size(page_size)
     stmt = stmt.order_by(OrdersAggregated.creation_date.desc())
-    if size is not None:
-        stmt = stmt.limit(size).offset((page - 1) * size)
-    result = await db.execute(stmt)
-    return list(result.scalars().all())
+    rows = list((await db.execute(stmt)).scalars().all())
+    total_items = len(rows)
+    if size is None:
+        return OrdersPage(items=rows, total_items=total_items, total_pages=1 if total_items > 0 else 0)
+    total_pages = (total_items + size - 1) // size if total_items > 0 else 0
+    offset = (page - 1) * size
+    return OrdersPage(
+        items=rows[offset : offset + size],
+        total_items=total_items,
+        total_pages=total_pages,
+    )
 
 
-@router.get("/", response_model=List[OrderRow])
+@router.get("/", response_model=OrdersPage)
 async def list_orders(
     db: DBSession,
     user: CurrentUser,
@@ -121,7 +136,7 @@ async def list_orders(
     date_to: date | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: str = Query("10"),
-) -> list[OrderRow]:
+) -> OrdersPage:
     return await _list_aggregated_orders(
         db=db,
         user=user,
@@ -133,7 +148,7 @@ async def list_orders(
     )
 
 
-@router.get("/in-transit", response_model=List[OrderRow])
+@router.get("/in-transit", response_model=OrdersPage)
 async def list_in_transit_orders(
     db: DBSession,
     user: CurrentUser,
@@ -142,7 +157,7 @@ async def list_in_transit_orders(
     date_to: date | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: str = Query("10"),
-) -> list[OrderRow]:
+) -> OrdersPage:
     return await _list_aggregated_orders(
         db=db,
         user=user,
@@ -154,7 +169,7 @@ async def list_in_transit_orders(
     )
 
 
-@router.get("/completed", response_model=List[OrderRow])
+@router.get("/completed", response_model=OrdersPage)
 async def list_completed_orders(
     db: DBSession,
     user: CurrentUser,
@@ -163,7 +178,7 @@ async def list_completed_orders(
     date_to: date | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: str = Query("10"),
-) -> list[OrderRow]:
+) -> OrdersPage:
     return await _list_aggregated_orders(
         db=db,
         user=user,
@@ -270,11 +285,14 @@ async def get_order_details(
     )
     aggregated = (await db.execute(agg_stmt)).scalars().first()
     size = _parse_page_size(page_size)
+    total_items = len(items)
     if size is not None:
         offset = (page - 1) * size
         paged_items = items[offset : offset + size]
+        total_pages = (total_items + size - 1) // size if total_items > 0 else 0
     else:
         paged_items = items
+        total_pages = 1 if total_items > 0 else 0
 
     return OrderDetailsResponse(
         order_id=header.order_id,
@@ -286,6 +304,8 @@ async def get_order_details(
         total_skus=len(items),
         total_amount_kzt=round(total_amount, 2),
         items=paged_items,
+        total_items=total_items,
+        total_pages=total_pages,
     )
 
 

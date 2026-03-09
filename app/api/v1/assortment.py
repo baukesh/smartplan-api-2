@@ -70,16 +70,10 @@ class PriceListRow(BaseModel):
     dsp: float
 
 
-class PriceListUpdateRow(BaseModel):
-    sku_code: str
-    original_date: date
-    date: date
+class PriceListPatchPayload(BaseModel):
+    new_date: date
     invoice_price: float
     dsp: float
-
-
-class PriceListUpdateRequest(BaseModel):
-    updates: list[PriceListUpdateRow]
 
 
 class AssortmentItemsPage(BaseModel):
@@ -90,6 +84,7 @@ class AssortmentItemsPage(BaseModel):
 
 class BranchStockNormPage(BaseModel):
     items: list[BranchStockNormRow]
+    page_size: int | None
     total_items: int
     total_pages: int
 
@@ -197,12 +192,24 @@ async def download_assortment_items(
     db: DBSession,
     user: CurrentUser,
     status: str | None = Query(None),
+    sku_code: str | None = Query(None),
+    brand: str | None = Query(None),
+    category: str | None = Query(None),
+    source: str | None = Query(None),
 ):
     stmt = select(Product)
     if not is_admin(user):
         stmt = stmt.where(Product.owner_user_id == user.id)
     if status:
         stmt = stmt.where(Product.status == status)
+    if sku_code:
+        stmt = stmt.where(Product.sku_code == sku_code.strip())
+    if brand:
+        stmt = stmt.where(Product.brand == brand.strip())
+    if category:
+        stmt = stmt.where(Product.category == category.strip())
+    if source:
+        stmt = stmt.where(Product.source == source.strip())
     rows = (await db.execute(stmt.order_by(Product.sku_code))).scalars().all()
 
     export_rows = [
@@ -275,8 +282,25 @@ async def get_branch_stock_matrix(
     if branch_name:
         branch_norm = branch_name.strip().lower()
         rows_out = [x for x in rows_out if x.branch_name.strip().lower() == branch_norm]
-    items, total_items, total_pages = _paginate_list(rows_out, page=page, page_size=page_size)
-    return BranchStockNormPage(items=items, total_items=total_items, total_pages=total_pages)
+    unique_skus = sorted({x.sku_code for x in rows_out})
+    size = _parse_page_size(page_size)
+    total_items = len(unique_skus)
+    if size is None:
+        paged_skus = set(unique_skus)
+        total_pages = 1 if total_items > 0 else 0
+        page_size_out: int | None = None
+    else:
+        offset = (page - 1) * size
+        paged_skus = set(unique_skus[offset : offset + size])
+        total_pages = (total_items + size - 1) // size if total_items > 0 else 0
+        page_size_out = size
+    items = [x for x in rows_out if x.sku_code in paged_skus]
+    return BranchStockNormPage(
+        items=items,
+        page_size=page_size_out,
+        total_items=total_items,
+        total_pages=total_pages,
+    )
 
 
 @router.patch("/branch-matrix/stock-norm")
@@ -356,8 +380,17 @@ async def update_branch_matrix_stock_norm(
 async def download_branch_matrix(
     db: DBSession,
     user: CurrentUser,
+    sku_code: str | None = Query(None),
+    branch_name: str | None = Query(None),
 ):
-    rows_page = await get_branch_stock_matrix(db=db, user=user, page=1, page_size="all")
+    rows_page = await get_branch_stock_matrix(
+        db=db,
+        user=user,
+        sku_code=sku_code,
+        branch_name=branch_name,
+        page=1,
+        page_size="all",
+    )
     export_rows = [
         {
             "sku_code": r.sku_code,
@@ -412,44 +445,48 @@ async def get_price_list(
 async def update_price_list_rows(
     db: DBSession,
     user: CurrentUser,
-    payload: PriceListUpdateRequest,
+    sku_code: str = Query(...),
+    date: date = Query(...),
+    payload: PriceListPatchPayload = ...,
 ) -> dict:
-    if not payload.updates:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="No price-list updates provided",
-        )
-
     product_stmt = select(Product)
     if not is_admin(user):
         product_stmt = product_stmt.where(Product.owner_user_id == user.id)
     products = (await db.execute(product_stmt)).scalars().all()
     sku_by_owner_and_code: dict[tuple[int, str], str] = {
-        (p.owner_user_id, p.sku_code): p.sku_id for p in products
+        (p.owner_user_id, str(p.sku_code).strip()): p.sku_id for p in products
     }
     owners = sorted({owner_id for owner_id, _ in sku_by_owner_and_code.keys()})
 
+    normalized_sku = sku_code.strip()
     updated = 0
-    for item in payload.updates:
-        for owner_id in owners:
-            sku_id = sku_by_owner_and_code.get((owner_id, item.sku_code))
-            if not sku_id:
-                continue
-            stmt = (
-                update(PriceList)
-                .where(
-                    PriceList.owner_user_id == owner_id,
-                    PriceList.sku_id == sku_id,
-                    PriceList.date == item.original_date,
-                )
-                .values(
-                    date=item.date,
-                    invoice_price=item.invoice_price,
-                    dsp=item.dsp,
-                )
+    for owner_id in owners:
+        sku_id = sku_by_owner_and_code.get((owner_id, normalized_sku))
+        if not sku_id:
+            continue
+        stmt = (
+            update(PriceList)
+            .where(
+                PriceList.owner_user_id == owner_id,
+                PriceList.sku_id == sku_id,
+                PriceList.date == date,
             )
-            result = await db.execute(stmt)
-            updated += int(result.rowcount or 0)
+            .values(
+                date=payload.new_date,
+                invoice_price=payload.invoice_price,
+                dsp=payload.dsp,
+            )
+        )
+        result = await db.execute(stmt)
+        updated += int(result.rowcount or 0)
+    if updated == 0:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(
+                "Price-list row not found for provided sku_code/date under current access scope"
+            ),
+        )
     await db.commit()
     return {"rows_updated": updated}
 
@@ -458,8 +495,19 @@ async def update_price_list_rows(
 async def download_price_list(
     db: DBSession,
     user: CurrentUser,
+    sku_code: str | None = Query(None),
+    date_from: date | None = Query(None),
+    date_to: date | None = Query(None),
 ):
     rows_page = await get_price_list(db=db, user=user, page=1, page_size="all")
+    filtered_rows = rows_page.items
+    if sku_code:
+        sku_norm = sku_code.strip()
+        filtered_rows = [r for r in filtered_rows if r.sku_code == sku_norm]
+    if date_from:
+        filtered_rows = [r for r in filtered_rows if r.date >= date_from]
+    if date_to:
+        filtered_rows = [r for r in filtered_rows if r.date <= date_to]
     export_rows = [
         {
             "sku_code": r.sku_code,
@@ -468,7 +516,7 @@ async def download_price_list(
             "invoice_price": r.invoice_price,
             "dsp": r.dsp,
         }
-        for r in rows_page.items
+        for r in filtered_rows
     ]
     output = BytesIO()
     pd.DataFrame(export_rows).to_excel(output, index=False, sheet_name="price_list")

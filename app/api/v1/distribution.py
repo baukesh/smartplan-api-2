@@ -528,9 +528,14 @@ async def patch_distribution_detail_adjustments(
 async def download_distribution(
     db: DBSession,
     user: CurrentUser,
+    branch_name: str | None = Query(None),
 ):
     response = await get_distribution_aggregated(db=db, user=user, page=1, page_size="all")
-    export_rows = [r.model_dump() for r in response.items]
+    rows = response.items
+    if branch_name:
+        branch_norm = branch_name.strip().lower()
+        rows = [r for r in rows if r.branch_name.strip().lower() == branch_norm]
+    export_rows = [r.model_dump() for r in rows]
     output = BytesIO()
     pd.DataFrame(export_rows).to_excel(output, index=False, sheet_name="distribution")
     output.seek(0)
@@ -546,6 +551,7 @@ async def download_distribution_details(
     db: DBSession,
     user: CurrentUser,
     branch_name: str = Query(...),
+    sku_code: str | None = Query(None),
 ):
     response = await get_distribution_details(
         db=db,
@@ -554,7 +560,11 @@ async def download_distribution_details(
         page=1,
         page_size="all",
     )
-    export_rows = [r.model_dump() for r in response.items]
+    rows = response.items
+    if sku_code:
+        sku_norm = sku_code.strip()
+        rows = [r for r in rows if r.sku_code == sku_norm]
+    export_rows = [r.model_dump() for r in rows]
     output = BytesIO()
     pd.DataFrame(export_rows).to_excel(output, index=False, sheet_name="distribution_details")
     output.seek(0)
