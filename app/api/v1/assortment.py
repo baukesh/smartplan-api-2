@@ -1,5 +1,6 @@
 from datetime import date
 from io import BytesIO
+import re
 from typing import List
 
 import pandas as pd
@@ -8,12 +9,15 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select, update
 
+from app.api.date_params import parse_query_date
 from app.api.deps import CurrentUser, DBSession, is_admin
+from app.core.branch_localization import normalize_branch_lookup
+from app.core.product_status import PRODUCT_STATUS_OPTIONS, normalize_product_status
 from app.models.data_uploads import Branch, Product, ProductBranch, PriceList
 
 router = APIRouter(prefix="/assortment", tags=["assortment"])
 
-STATUS_OPTIONS = ["Active", "Inactive", "Discontinued", "TBD"]
+STATUS_OPTIONS = PRODUCT_STATUS_OPTIONS
 PAGE_SIZE_MAP = {"10": 10, "50": 50, "100": 100, "all": None}
 
 
@@ -42,6 +46,15 @@ class AssortmentStatusUpdate(BaseModel):
 
 class AssortmentStatusUpdateRequest(BaseModel):
     updates: list[AssortmentStatusUpdate]
+
+
+class AssortmentStockNormDaysUpdate(BaseModel):
+    sku_code: str
+    stock_norm_days: float
+
+
+class AssortmentStockNormDaysUpdateRequest(BaseModel):
+    updates: list[AssortmentStockNormDaysUpdate]
 
 
 class BranchStockNormRow(BaseModel):
@@ -169,7 +182,7 @@ async def update_assortment_item_statuses(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="No status updates provided",
         )
-    invalid = [u.status for u in payload.updates if u.status not in STATUS_OPTIONS]
+    invalid = [u.status for u in payload.updates if normalize_product_status(u.status) is None]
     if invalid:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -178,11 +191,83 @@ async def update_assortment_item_statuses(
 
     updated = 0
     for item in payload.updates:
+        normalized_status = normalize_product_status(item.status)
+        if normalized_status is None:
+            continue
         stmt = update(Product).where(Product.sku_code == item.sku_code)
         if not is_admin(user):
             stmt = stmt.where(Product.owner_user_id == user.id)
-        result = await db.execute(stmt.values(status=item.status))
+        result = await db.execute(stmt.values(status=normalized_status))
         updated += int(result.rowcount or 0)
+    await db.commit()
+    return {"rows_updated": updated}
+
+
+@router.patch("/items")
+async def update_assortment_items_stock_norm_days(
+    db: DBSession,
+    user: CurrentUser,
+    payload: AssortmentStockNormDaysUpdateRequest,
+    status_filter: str | None = Query(None, alias="status"),
+    sku_code: str | None = Query(None),
+    brand: str | None = Query(None),
+    category: str | None = Query(None),
+    source: str | None = Query(None),
+) -> dict:
+    if not payload.updates:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="No stock_norm_days updates provided",
+        )
+
+    scope_stmt = select(Product)
+    if not is_admin(user):
+        scope_stmt = scope_stmt.where(Product.owner_user_id == user.id)
+    if status_filter:
+        scope_stmt = scope_stmt.where(Product.status == status_filter.strip())
+    if sku_code:
+        scope_stmt = scope_stmt.where(Product.sku_code == sku_code.strip())
+    if brand:
+        scope_stmt = scope_stmt.where(Product.brand == brand.strip())
+    if category:
+        scope_stmt = scope_stmt.where(Product.category == category.strip())
+    if source:
+        scope_stmt = scope_stmt.where(Product.source == source.strip())
+
+    scoped_products = (await db.execute(scope_stmt)).scalars().all()
+    scoped_map: dict[str, list[Product]] = {}
+    for p in scoped_products:
+        scoped_map.setdefault(str(p.sku_code).strip(), []).append(p)
+
+    unresolved: list[str] = []
+    updated = 0
+    for item in payload.updates:
+        normalized_sku = str(item.sku_code).strip()
+        matches = scoped_map.get(normalized_sku, [])
+        if not matches:
+            unresolved.append(normalized_sku)
+            continue
+
+        for p in matches:
+            result = await db.execute(
+                update(Product)
+                .where(Product.owner_user_id == p.owner_user_id, Product.sku_id == p.sku_id)
+                .values(general_stock_norm_days=float(item.stock_norm_days))
+            )
+            updated += int(result.rowcount or 0)
+
+    if unresolved:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "message": (
+                    "Some sku_code values were not found under current access/query filter scope"
+                ),
+                "unresolved": unresolved,
+            },
+        )
+
     await db.commit()
     return {"rows_updated": updated}
 
@@ -280,8 +365,8 @@ async def get_branch_stock_matrix(
         sku_norm = sku_code.strip()
         rows_out = [x for x in rows_out if x.sku_code == sku_norm]
     if branch_name:
-        branch_norm = branch_name.strip().lower()
-        rows_out = [x for x in rows_out if x.branch_name.strip().lower() == branch_norm]
+        branch_norm = normalize_branch_lookup(branch_name)
+        rows_out = [x for x in rows_out if normalize_branch_lookup(x.branch_name) == branch_norm]
     unique_skus = sorted({x.sku_code for x in rows_out})
     size = _parse_page_size(page_size)
     total_items = len(unique_skus)
@@ -327,7 +412,7 @@ async def update_branch_matrix_stock_norm(
         (p.owner_user_id, str(p.sku_code).strip()): p.sku_id for p in products
     }
     branch_ids_by_key: dict[tuple[int, str], str] = {
-        (b.owner_user_id, str(b.branch_name).strip().lower()): b.branch_id for b in branches
+        (b.owner_user_id, normalize_branch_lookup(b.branch_name)): b.branch_id for b in branches
     }
     owners = sorted({owner_id for owner_id, _ in product_ids_by_key.keys()})
 
@@ -335,7 +420,7 @@ async def update_branch_matrix_stock_norm(
     unresolved: list[dict[str, str]] = []
     for item in payload.updates:
         normalized_sku = str(item.sku_code).strip()
-        normalized_branch = str(item.branch_name).strip().lower()
+        normalized_branch = normalize_branch_lookup(item.branch_name)
         matched_any = False
         for owner_id in owners:
             sku_id = product_ids_by_key.get((owner_id, normalized_sku))
@@ -449,21 +534,42 @@ async def update_price_list_rows(
     date: date = Query(...),
     payload: PriceListPatchPayload = ...,
 ) -> dict:
+    def _normalize_sku_lookup(value: str) -> str:
+        # Query strings may decode '+' as space; normalize both to avoid false 404s.
+        return re.sub(r"\s+", " ", str(value or "").replace("+", " ")).strip().lower()
+
     product_stmt = select(Product)
     if not is_admin(user):
         product_stmt = product_stmt.where(Product.owner_user_id == user.id)
     products = (await db.execute(product_stmt)).scalars().all()
-    sku_by_owner_and_code: dict[tuple[int, str], str] = {
-        (p.owner_user_id, str(p.sku_code).strip()): p.sku_id for p in products
-    }
+    sku_by_owner_and_code: dict[tuple[int, str], str] = {}
+    for p in products:
+        normalized = _normalize_sku_lookup(p.sku_code)
+        sku_by_owner_and_code[(p.owner_user_id, normalized)] = p.sku_id
     owners = sorted({owner_id for owner_id, _ in sku_by_owner_and_code.keys()})
 
-    normalized_sku = sku_code.strip()
+    normalized_sku = _normalize_sku_lookup(sku_code)
     updated = 0
+    conflicts: list[dict[str, str]] = []
     for owner_id in owners:
         sku_id = sku_by_owner_and_code.get((owner_id, normalized_sku))
         if not sku_id:
             continue
+        if payload.new_date != date:
+            existing_stmt = select(PriceList.id).where(
+                PriceList.owner_user_id == owner_id,
+                PriceList.sku_id == sku_id,
+                PriceList.date == payload.new_date,
+            )
+            existing_row = (await db.execute(existing_stmt)).first()
+            if existing_row is not None:
+                conflicts.append(
+                    {
+                        "sku_code": sku_code.strip(),
+                        "existing_date": payload.new_date.isoformat(),
+                    }
+                )
+                continue
         stmt = (
             update(PriceList)
             .where(
@@ -479,6 +585,17 @@ async def update_price_list_rows(
         )
         result = await db.execute(stmt)
         updated += int(result.rowcount or 0)
+    if conflicts:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": (
+                    "Cannot update date: target date already exists for the same sku_code"
+                ),
+                "conflicts": conflicts,
+            },
+        )
     if updated == 0:
         await db.rollback()
         raise HTTPException(
@@ -496,18 +613,20 @@ async def download_price_list(
     db: DBSession,
     user: CurrentUser,
     sku_code: str | None = Query(None),
-    date_from: date | None = Query(None),
-    date_to: date | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
 ):
+    parsed_date_from = parse_query_date(date_from, field_name="date_from")
+    parsed_date_to = parse_query_date(date_to, field_name="date_to", end_of_month=True)
     rows_page = await get_price_list(db=db, user=user, page=1, page_size="all")
     filtered_rows = rows_page.items
     if sku_code:
         sku_norm = sku_code.strip()
         filtered_rows = [r for r in filtered_rows if r.sku_code == sku_norm]
-    if date_from:
-        filtered_rows = [r for r in filtered_rows if r.date >= date_from]
-    if date_to:
-        filtered_rows = [r for r in filtered_rows if r.date <= date_to]
+    if parsed_date_from:
+        filtered_rows = [r for r in filtered_rows if r.date >= parsed_date_from]
+    if parsed_date_to:
+        filtered_rows = [r for r in filtered_rows if r.date <= parsed_date_to]
     export_rows = [
         {
             "sku_code": r.sku_code,

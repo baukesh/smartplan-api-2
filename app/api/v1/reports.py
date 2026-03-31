@@ -5,7 +5,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import Select, exists, or_, select
 
+from app.api.date_params import parse_query_date
 from app.api.deps import CurrentUser, DBSession, is_admin, require_roles
+from app.core.branch_localization import localize_branch_name
 from app.models.reporting import DPReport, DPReportAccess
 from app.models.user import User, UserRole
 from app.services.reporting_service import (
@@ -128,6 +130,34 @@ class ReportUpsertPayload(BaseModel):
     forecast_adjustments: list[ForecastAdjustmentPayload] | None = None
 
 
+class HistoricalTableCreateRow(BaseModel):
+    period: str
+    fact_value: float
+    target_value: float
+    past_available_stock: float
+
+    model_config = {"extra": "allow"}
+
+
+class ForecastTableCreateRow(BaseModel):
+    period: str
+    baseline_forecast_value: float
+    adjusted_forecast_value: float
+    future_available_stock: float
+    adjustment_reason: str | None = None
+
+    model_config = {"extra": "allow"}
+
+
+class ReportCreatePayload(BaseModel):
+    report_name: str | None = None
+    is_draft: bool = True
+    historical_table: list[HistoricalTableCreateRow] = Field(default_factory=list)
+    forecast_table: list[ForecastTableCreateRow] = Field(default_factory=list)
+
+    model_config = {"extra": "forbid"}
+
+
 class ForecastAdjustmentPatchPayload(BaseModel):
     period: date
     value: float
@@ -226,6 +256,50 @@ def _clean_list(values: list[str] | None) -> list[str]:
     return [str(v).strip() for v in values if str(v).strip()]
 
 
+def _parse_period_text(period: str) -> date:
+    raw = str(period or "").strip()
+    if not raw:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="forecast_table.period must be a non-empty string",
+        )
+    for fmt_value in ("%Y-%m-%d", "%Y-%m"):
+        try:
+            parsed = date.fromisoformat(raw) if fmt_value == "%Y-%m-%d" else None
+            if parsed is None:
+                y, m = raw.split("-")
+                parsed = date(int(y), int(m), 1)
+            return parsed.replace(day=1)
+        except Exception:
+            continue
+    raise HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail="forecast_table.period must be in YYYY-MM or YYYY-MM-DD format",
+    )
+
+
+def _forecast_table_to_overrides(
+    *,
+    forecast_table: list[ForecastTableCreateRow],
+    view_type: str,
+) -> list[dict]:
+    overrides: list[dict] = []
+    for row in forecast_table:
+        baseline = float(row.baseline_forecast_value or 0.0)
+        adjusted = float(row.adjusted_forecast_value or 0.0)
+        if round(adjusted, 6) == round(baseline, 6):
+            continue
+        overrides.append(
+            {
+                "period": _parse_period_text(row.period),
+                "metric_type": view_type,
+                "value": adjusted,
+                "adjustment_reason": row.adjustment_reason,
+            }
+        )
+    return overrides
+
+
 def _resolve_report_planning_month(report: DPReport) -> date | None:
     if report.planning_month is not None:
         return report.planning_month
@@ -266,9 +340,13 @@ def _effective_filters_from_overrides(
         product_filter["sublines"] = _clean_list(subline)
 
     if branch_name is None:
-        effective_branch_filter = list(saved_branch_filter)
+        effective_branch_filter = [
+            str(localize_branch_name(v) or v) for v in list(saved_branch_filter)
+        ]
     else:
-        effective_branch_filter = _clean_list(branch_name)
+        effective_branch_filter = [
+            str(localize_branch_name(v) or v) for v in _clean_list(branch_name)
+        ]
     return product_filter, effective_branch_filter
 
 
@@ -340,6 +418,7 @@ async def _build_report_detail(
     }
 
 
+@router.get("", response_model=List[ReportCard], include_in_schema=False)
 @router.get("/", response_model=List[ReportCard])
 @router.get("/list", response_model=List[ReportCard])
 async def list_reports(
@@ -413,14 +492,15 @@ async def get_new_report_template(
     )
 
 
+@router.post("", response_model=ReportDetailProjectedResponse, status_code=status.HTTP_201_CREATED, include_in_schema=False)
 @router.post("/", response_model=ReportDetailProjectedResponse, status_code=status.HTTP_201_CREATED)
 async def create_report(
     db: DBSession,
     user: CurrentUser,
-    payload: ReportUpsertPayload,
+    payload: ReportCreatePayload,
     view_type: str | None = Query(default=None),
-    date_from: date | None = Query(default=None),
-    date_to: date | None = Query(default=None),
+    date_from: str | None = Query(default=None),
+    date_to: str | None = Query(default=None),
     sku_code: list[str] | None = Query(default=None),
     brand: list[str] | None = Query(default=None),
     category: list[str] | None = Query(default=None),
@@ -428,21 +508,8 @@ async def create_report(
     subline: list[str] | None = Query(default=None),
     branch_name: list[str] | None = Query(default=None),
 ) -> ReportDetailProjectedResponse:
-    if (
-        payload.product_filter is not None
-        or payload.branch_filter is not None
-        or payload.view_type is not None
-        or payload.date_from is not None
-        or payload.date_to is not None
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=(
-                "For POST /reports, filters must be provided via URL query parameters "
-                "(view_type, date_from, date_to, sku_code, brand, category, sub_category, subline, branch_name)."
-            ),
-        )
-
+    parsed_date_from = parse_query_date(date_from, field_name="date_from")
+    parsed_date_to = parse_query_date(date_to, field_name="date_to", end_of_month=True)
     effective_product_filter, effective_branch_filter = _effective_filters_from_overrides(
         saved_product_filter={},
         saved_branch_filter=[],
@@ -462,8 +529,8 @@ async def create_report(
         product_filter=effective_product_filter,
         branch_filter=effective_branch_filter,
         planning_month=planning_month,
-        date_from=date_from,
-        date_to=date_to,
+        date_from=parsed_date_from,
+        date_to=parsed_date_to,
     )
     report = DPReport(
         name=payload.report_name or "New Demand Planning Report",
@@ -485,7 +552,10 @@ async def create_report(
         db=db,
         report_id=report.id,
         owner_user_id=user.id,
-        overrides=[x.model_dump() for x in (payload.forecast_adjustments or [])],
+        overrides=_forecast_table_to_overrides(
+            forecast_table=payload.forecast_table,
+            view_type=ctx.view_type,
+        ),
     )
     await db.commit()
     await db.refresh(report)
@@ -586,8 +656,8 @@ async def get_report(
         default=None,
         description="Transient projection filter for this GET only. Values: DSP, Cases, Gross weight.",
     ),
-    date_from: date | None = Query(default=None),
-    date_to: date | None = Query(default=None),
+    date_from: str | None = Query(default=None),
+    date_to: str | None = Query(default=None),
     sku_code: list[str] | None = Query(default=None),
     brand: list[str] | None = Query(default=None),
     category: list[str] | None = Query(default=None),
@@ -595,6 +665,8 @@ async def get_report(
     subline: list[str] | None = Query(default=None),
     branch_name: list[str] | None = Query(default=None),
 ) -> ReportDetailProjectedResponse:
+    parsed_date_from = parse_query_date(date_from, field_name="date_from")
+    parsed_date_to = parse_query_date(date_to, field_name="date_to", end_of_month=True)
     report = await _get_accessible_report(db, user, report_id)
     if not report:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
@@ -602,8 +674,8 @@ async def get_report(
         db,
         report,
         view_type_override=view_type,
-        date_from_override=date_from,
-        date_to_override=date_to,
+        date_from_override=parsed_date_from,
+        date_to_override=parsed_date_to,
         sku_code=sku_code,
         brand=brand,
         category=category,
@@ -622,8 +694,8 @@ async def update_report(
     report_id: int,
     payload: ReportPatchPayload,
     view_type: str | None = Query(default=None),
-    date_from: date | None = Query(default=None),
-    date_to: date | None = Query(default=None),
+    date_from: str | None = Query(default=None),
+    date_to: str | None = Query(default=None),
     sku_code: list[str] | None = Query(default=None),
     brand: list[str] | None = Query(default=None),
     category: list[str] | None = Query(default=None),
@@ -631,6 +703,8 @@ async def update_report(
     subline: list[str] | None = Query(default=None),
     branch_name: list[str] | None = Query(default=None),
 ) -> ReportDetailProjectedResponse:
+    parsed_date_from = parse_query_date(date_from, field_name="date_from")
+    parsed_date_to = parse_query_date(date_to, field_name="date_to", end_of_month=True)
     report = await _get_accessible_report(db, user, report_id)
     if not report:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
@@ -656,8 +730,8 @@ async def update_report(
         product_filter=effective_product_filter,
         branch_filter=effective_branch_filter,
         planning_month=_resolve_report_planning_month(report),
-        date_from=date_from or report.date_from,
-        date_to=date_to or report.date_to,
+        date_from=parsed_date_from or report.date_from,
+        date_to=parsed_date_to or report.date_to,
     )
 
     report.name = payload.report_name or report.name

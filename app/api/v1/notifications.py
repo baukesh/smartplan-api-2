@@ -19,6 +19,7 @@ class NotificationOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+@router.get("", response_model=List[NotificationOut], include_in_schema=False)
 @router.get("/", response_model=List[NotificationOut])
 async def list_notifications(
     db: DBSession,

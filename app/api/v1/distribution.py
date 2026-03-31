@@ -7,6 +7,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import delete, func, select
 
+from app.core.branch_localization import normalize_branch_lookup
 from app.api.deps import CurrentUser, DBSession, is_admin
 from app.models.data_uploads import Branch, HistoricalSalesMonthly, PriceList, Product, ProductBranch
 from app.models.derived import DistributionBranchAdjustment, DistributionSkuAdjustment, ForecastSalesMonthly
@@ -132,6 +133,10 @@ def _add_months(d: date, months: int) -> date:
     return date(year, month, 1)
 
 
+def _branch_name_matches(query_value: str, branch_name: str, branch_id: str) -> bool:
+    return normalize_branch_lookup(query_value) == normalize_branch_lookup(branch_name) or str(query_value).strip() == str(branch_id).strip()
+
+
 async def _resolve_planning_date(db: DBSession, user: CurrentUser) -> date:
     stmt = select(func.max(HistoricalSalesMonthly.date))
     if not is_admin(user):
@@ -191,7 +196,7 @@ async def _build_distribution_calc(
     branch_name_map = {(b.owner_user_id, b.branch_id): b.branch_name for b in branch_rows}
     branch_id_by_name: dict[tuple[int, str], str] = {}
     for b in branch_rows:
-        branch_id_by_name[(b.owner_user_id, b.branch_name)] = b.branch_id
+        branch_id_by_name[(b.owner_user_id, normalize_branch_lookup(b.branch_name))] = b.branch_id
 
     product_map = {(p.owner_user_id, p.sku_id): p for p in product_rows}
     prices_by_key: dict[tuple[int, str], list[PriceList]] = {}
@@ -286,6 +291,7 @@ async def _build_distribution_calc(
     return planning_date, calc_rows, branch_id_by_name, total_available_by_sku
 
 
+@router.get("", response_model=DistributionAggregateResponse, include_in_schema=False)
 @router.get("/", response_model=DistributionAggregateResponse)
 async def get_distribution_aggregated(
     db: DBSession,
@@ -359,6 +365,7 @@ async def get_distribution_aggregated(
     )
 
 
+@router.get("/summary/", response_model=DistributionSummaryResponse, include_in_schema=False)
 @router.get("/summary", response_model=DistributionSummaryResponse)
 async def get_distribution_summary(
     db: DBSession,
@@ -383,7 +390,7 @@ async def get_distribution_details(
     page_size: str = Query("10"),
 ) -> DistributionDetailsResponse:
     planning_date, calc_rows, _, total_available_by_sku = await _build_distribution_calc(db, user)
-    selected = [r for r in calc_rows if r.branch_name == branch_name or r.branch_id == branch_name]
+    selected = [r for r in calc_rows if _branch_name_matches(branch_name, r.branch_name, r.branch_id)]
     if not selected:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Branch not found")
 
@@ -411,6 +418,7 @@ async def get_distribution_details(
     )
 
 
+@router.patch("", include_in_schema=False)
 @router.patch("/")
 async def patch_distribution_branch_adjustments(
     db: DBSession,
@@ -425,8 +433,9 @@ async def patch_distribution_branch_adjustments(
     updated = 0
     for row in payload.updates:
         matched = False
-        for (owner_id, bname), branch_id in branch_id_by_name.items():
-            if bname != row.branch_name:
+        row_branch_norm = normalize_branch_lookup(row.branch_name)
+        for (owner_id, bname_norm), branch_id in branch_id_by_name.items():
+            if bname_norm != row_branch_norm:
                 continue
             if owner_user_id is not None and owner_id != owner_user_id:
                 continue
@@ -491,7 +500,7 @@ async def patch_distribution_detail_adjustments(
             },
         )
     planning_date, calc_rows, _, _ = await _build_distribution_calc(db, user)
-    branch_rows = [r for r in calc_rows if r.branch_name == branch_name or r.branch_id == branch_name]
+    branch_rows = [r for r in calc_rows if _branch_name_matches(branch_name, r.branch_name, r.branch_id)]
     if not branch_rows:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Branch not found")
 
@@ -533,8 +542,8 @@ async def download_distribution(
     response = await get_distribution_aggregated(db=db, user=user, page=1, page_size="all")
     rows = response.items
     if branch_name:
-        branch_norm = branch_name.strip().lower()
-        rows = [r for r in rows if r.branch_name.strip().lower() == branch_norm]
+        branch_norm = normalize_branch_lookup(branch_name)
+        rows = [r for r in rows if normalize_branch_lookup(r.branch_name) == branch_norm]
     export_rows = [r.model_dump() for r in rows]
     output = BytesIO()
     pd.DataFrame(export_rows).to_excel(output, index=False, sheet_name="distribution")

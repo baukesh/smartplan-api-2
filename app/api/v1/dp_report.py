@@ -9,6 +9,7 @@ from app.services.reporting_service import build_report_tables, build_reporting_
 router = APIRouter(prefix="/dp-report", tags=["dp-report"])
 
 
+@router.get("", response_model=ReportDetailDetailedResponse, include_in_schema=False)
 @router.get("/", response_model=ReportDetailDetailedResponse)
 async def get_dp_report_datamart(
     db: DBSession,

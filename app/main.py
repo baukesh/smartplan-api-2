@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import json
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,6 +20,9 @@ from app.api.v1 import (
     datasets,
     uploads,
 )
+from app.core.branch_localization import localize_branch_name
+from app.core.order_status import normalize_order_status
+from app.core.product_status import normalize_product_status
 from app.core.config import settings
 from app.core.database import engine
 from app.models.base import Base
@@ -309,6 +313,82 @@ async def _ensure_numeric_health_index_columns_sqlite(conn) -> None:
     )
 
 
+async def _ensure_product_status_russian(conn) -> None:
+    rows = (await conn.execute(text("SELECT id, status FROM product"))).fetchall()
+    for row_id, raw_status in rows:
+        normalized = normalize_product_status(raw_status)
+        if normalized is None:
+            normalized = "новый"
+        if str(raw_status or "") == normalized:
+            continue
+        await conn.execute(
+            text("UPDATE product SET status = :status WHERE id = :id"),
+            {"status": normalized, "id": row_id},
+        )
+
+
+async def _ensure_order_status_russian(conn) -> None:
+    order_tables = ["placed_orders", "orders_aggregated"]
+    for table_name in order_tables:
+        rows = (await conn.execute(text(f"SELECT id, status FROM {table_name}"))).fetchall()
+        for row_id, raw_status in rows:
+            normalized = normalize_order_status(raw_status)
+            if normalized is None:
+                normalized = "создан"
+            if str(raw_status or "") == normalized:
+                continue
+            await conn.execute(
+                text(f"UPDATE {table_name} SET status = :status WHERE id = :id"),
+                {"status": normalized, "id": row_id},
+            )
+
+
+async def _ensure_branch_names_russian(conn) -> None:
+    branch_rows = (await conn.execute(text("SELECT id, branch_name FROM branches"))).fetchall()
+    for row_id, branch_name in branch_rows:
+        localized = localize_branch_name(branch_name)
+        if localized is None or str(branch_name or "") == localized:
+            continue
+        await conn.execute(
+            text("UPDATE branches SET branch_name = :branch_name WHERE id = :id"),
+            {"branch_name": localized, "id": row_id},
+        )
+
+    override_rows = (
+        await conn.execute(text("SELECT id, branch_name FROM dp_report_forecast_overrides"))
+    ).fetchall()
+    for row_id, branch_name in override_rows:
+        localized = localize_branch_name(branch_name)
+        if localized is None or str(branch_name or "") == localized:
+            continue
+        await conn.execute(
+            text(
+                "UPDATE dp_report_forecast_overrides SET branch_name = :branch_name WHERE id = :id"
+            ),
+            {"branch_name": localized, "id": row_id},
+        )
+
+    report_rows = (
+        await conn.execute(text("SELECT id, branch_filter_json FROM dp_reports"))
+    ).fetchall()
+    for row_id, branch_filter_json in report_rows:
+        if not branch_filter_json:
+            continue
+        try:
+            parsed = json.loads(str(branch_filter_json))
+        except Exception:
+            continue
+        if not isinstance(parsed, list):
+            continue
+        localized_list = [str(localize_branch_name(v) or str(v).strip()) for v in parsed]
+        if localized_list == parsed:
+            continue
+        await conn.execute(
+            text("UPDATE dp_reports SET branch_filter_json = :branch_filter_json WHERE id = :id"),
+            {"branch_filter_json": json.dumps(localized_list, ensure_ascii=False), "id": row_id},
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Create tables on startup for MVP; replace with Alembic in production
@@ -317,6 +397,9 @@ async def lifespan(app: FastAPI):
         await _ensure_owner_columns(conn)
         await _ensure_placed_orders_author_column(conn)
         await _ensure_dp_reports_columns(conn)
+        await _ensure_product_status_russian(conn)
+        await _ensure_order_status_russian(conn)
+        await _ensure_branch_names_russian(conn)
         if conn.dialect.name == "sqlite":
             await _ensure_product_owner_unique_sqlite(conn)
             await _ensure_numeric_health_index_columns_sqlite(conn)

@@ -4,20 +4,22 @@ from datetime import date
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.order_status import normalize_order_status
 from app.models.data_uploads import PlacedOrder
 from app.models.derived import OrdersAggregated
 
 STATUS_PRIORITY = {
-    "Created": 1,
-    "In transit": 2,
-    "Completed": 3,
+    "создан": 1,
+    "в пути": 2,
+    "завершен": 3,
 }
 
 
 def _status_max(values: list[str]) -> str:
     if not values:
-        return "Created"
-    return max(values, key=lambda v: STATUS_PRIORITY.get(v, -1))
+        return "создан"
+    normalized_values = [normalize_order_status(v) or "создан" for v in values]
+    return max(normalized_values, key=lambda v: STATUS_PRIORITY.get(v, -1))
 
 
 async def refresh_orders_aggregated(db: AsyncSession, owner_user_id: int) -> None:

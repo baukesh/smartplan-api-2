@@ -7,6 +7,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import func, select, update
 
+from app.api.date_params import parse_query_date
 from app.api.deps import CurrentUser, DBSession, is_admin
 from app.models.data_uploads import HistoricalSalesMonthly, PriceList, Product
 from app.models.derived import ForecastOrders
@@ -29,6 +30,10 @@ class SupplyChainRow(BaseModel):
 class SupplyChainListResponse(BaseModel):
     period: str
     items: list[SupplyChainRow]
+    total_sum: float
+    total_quantity_in_mc: float
+    total_gross_weight: float
+    total_volume: float
     total_items: int
     total_pages: int
 
@@ -111,17 +116,19 @@ async def _resolve_period_from_args(
     db: DBSession,
     user: CurrentUser,
     period: str | None,
-    date_from: date | None,
-    date_to: date | None,
+    date_from: str | date | None,
+    date_to: str | date | None,
 ) -> date:
+    parsed_date_from = parse_query_date(date_from, field_name="date_from")
+    parsed_date_to = parse_query_date(date_to, field_name="date_to", end_of_month=True)
     if period:
         return _period_to_date(period)
     # Backward-compatible query style: allow date_from/date_to and
     # derive the planning period month from either value.
-    if date_to is not None:
-        return _month_start(date_to)
-    if date_from is not None:
-        return _month_start(date_from)
+    if parsed_date_to is not None:
+        return _month_start(parsed_date_to)
+    if parsed_date_from is not None:
+        return _month_start(parsed_date_from)
     return await _resolve_period(db, user, None)
 
 
@@ -177,13 +184,58 @@ async def _load_supply_rows(
     return rows, product_by_sku, fo_by_sku
 
 
+async def _compute_supply_totals(
+    db: DBSession,
+    user: CurrentUser,
+    period_date: date,
+    product_by_sku: dict[str, Product],
+    fo_by_sku: dict[str, ForecastOrders],
+) -> tuple[float, float, float, float]:
+    if not fo_by_sku:
+        return 0.0, 0.0, 0.0, 0.0
+
+    price_stmt = select(PriceList)
+    if not is_admin(user):
+        price_stmt = price_stmt.where(PriceList.owner_user_id == user.id)
+    prices = (await db.execute(price_stmt)).scalars().all()
+    prices_by_sku: dict[str, list[PriceList]] = {}
+    for p in prices:
+        prices_by_sku.setdefault(p.sku_id, []).append(p)
+
+    total_sum = 0.0
+    total_quantity = 0.0
+    total_gross_weight = 0.0
+    total_volume = 0.0
+    for sku_id, fo in fo_by_sku.items():
+        product = product_by_sku.get(sku_id)
+        if not product:
+            continue
+        quantity = (
+            float(fo.adjusted_quantity_in_mc)
+            if fo.adjusted_quantity_in_mc is not None
+            else float(fo.recommended_quantity_in_mc)
+        )
+        dsp = _closest_dsp_for_period(prices_by_sku.get(sku_id, []), period_date)
+        total_quantity += quantity
+        total_sum += quantity * float(product.pieces_in_master_carton) * dsp
+        total_gross_weight += quantity * float(product.master_carton_gross_weight_kg)
+        total_volume += quantity * float(product.master_carton_volume_cbm)
+
+    return (
+        round(total_sum, 2),
+        round(total_quantity, 2),
+        round(total_gross_weight, 2),
+        round(total_volume, 2),
+    )
+
+
 @router.get("/filter-options", response_model=SupplyChainFilterOptionsResponse)
 async def get_supply_chain_filter_options(
     db: DBSession,
     user: CurrentUser,
     period: str | None = Query(None, description="Planning period in YYYY-MM"),
-    date_from: date | None = Query(None),
-    date_to: date | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
 ) -> SupplyChainFilterOptionsResponse:
     has_period_context = bool(period or date_from or date_to)
     period_date: date | None = None
@@ -240,37 +292,50 @@ async def get_supply_chain_filter_options(
     return SupplyChainFilterOptionsResponse(categories=categories, sources=sources)
 
 
+@router.get("", response_model=SupplyChainListResponse, include_in_schema=False)
 @router.get("/", response_model=SupplyChainListResponse)
 async def get_supply_chain_view(
     db: DBSession,
     user: CurrentUser,
     period: str | None = Query(None, description="Planning period in YYYY-MM"),
-    date_from: date | None = Query(None),
-    date_to: date | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
     category: str | None = Query(None),
     source: str | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: str = Query("10"),
 ) -> SupplyChainListResponse:
     period_date = await _resolve_period_from_args(db, user, period, date_from, date_to)
-    rows, _, _ = await _load_supply_rows(db, user, period_date, category, source)
+    rows, product_by_sku, fo_by_sku = await _load_supply_rows(db, user, period_date, category, source)
+    total_sum, total_quantity, total_gross_weight, total_volume = await _compute_supply_totals(
+        db=db,
+        user=user,
+        period_date=period_date,
+        product_by_sku=product_by_sku,
+        fo_by_sku=fo_by_sku,
+    )
     items, total_items, total_pages = _paginate(rows, page=page, page_size=page_size)
     return SupplyChainListResponse(
         period=period_date.strftime("%Y-%m"),
         items=items,
+        total_sum=total_sum,
+        total_quantity_in_mc=total_quantity,
+        total_gross_weight=total_gross_weight,
+        total_volume=total_volume,
         total_items=total_items,
         total_pages=total_pages,
     )
 
 
+@router.patch("", include_in_schema=False)
 @router.patch("/")
 async def update_adjusted_quantities(
     db: DBSession,
     user: CurrentUser,
     payload: SupplyChainAdjustRequest,
     period: str | None = Query(None, description="Planning period in YYYY-MM"),
-    date_from: date | None = Query(None),
-    date_to: date | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
 ) -> dict:
     if not payload.updates:
         raise HTTPException(
@@ -312,8 +377,8 @@ async def download_supply_chain(
     db: DBSession,
     user: CurrentUser,
     period: str | None = Query(None, description="Planning period in YYYY-MM"),
-    date_from: date | None = Query(None),
-    date_to: date | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
     category: str | None = Query(None),
     source: str | None = Query(None),
 ):
@@ -346,51 +411,25 @@ async def get_supply_chain_summary(
     db: DBSession,
     user: CurrentUser,
     period: str | None = Query(None, description="Planning period in YYYY-MM"),
-    date_from: date | None = Query(None),
-    date_to: date | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
     category: str | None = Query(None),
     source: str | None = Query(None),
 ) -> SupplyChainSummary:
     period_date = await _resolve_period_from_args(db, user, period, date_from, date_to)
     _, product_by_sku, fo_by_sku = await _load_supply_rows(db, user, period_date, category, source)
-
-    if not fo_by_sku:
-        return SupplyChainSummary(
-            period=period_date.strftime("%Y-%m"),
-            total_sum=0.0,
-            total_gross_weight=0.0,
-            total_volume=0.0,
-        )
-
-    price_stmt = select(PriceList)
-    if not is_admin(user):
-        price_stmt = price_stmt.where(PriceList.owner_user_id == user.id)
-    prices = (await db.execute(price_stmt)).scalars().all()
-    prices_by_sku: dict[str, list[PriceList]] = {}
-    for p in prices:
-        prices_by_sku.setdefault(p.sku_id, []).append(p)
-
-    total_sum = 0.0
-    total_gross_weight = 0.0
-    total_volume = 0.0
-    for sku_id, fo in fo_by_sku.items():
-        product = product_by_sku.get(sku_id)
-        if not product:
-            continue
-        quantity = (
-            float(fo.adjusted_quantity_in_mc)
-            if fo.adjusted_quantity_in_mc is not None
-            else float(fo.recommended_quantity_in_mc)
-        )
-        dsp = _closest_dsp_for_period(prices_by_sku.get(sku_id, []), period_date)
-        total_sum += quantity * float(product.pieces_in_master_carton) * dsp
-        total_gross_weight += quantity * float(product.master_carton_gross_weight_kg)
-        total_volume += quantity * float(product.master_carton_volume_cbm)
+    total_sum, _, total_gross_weight, total_volume = await _compute_supply_totals(
+        db=db,
+        user=user,
+        period_date=period_date,
+        product_by_sku=product_by_sku,
+        fo_by_sku=fo_by_sku,
+    )
 
     return SupplyChainSummary(
         period=period_date.strftime("%Y-%m"),
-        total_sum=round(total_sum, 2),
-        total_gross_weight=round(total_gross_weight, 2),
-        total_volume=round(total_volume, 2),
+        total_sum=total_sum,
+        total_gross_weight=total_gross_weight,
+        total_volume=total_volume,
     )
 

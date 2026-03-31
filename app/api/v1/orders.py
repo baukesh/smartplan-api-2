@@ -5,7 +5,15 @@ from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import and_, select, update
 
+from app.api.date_params import parse_query_date
 from app.api.deps import CurrentUser, DBSession, is_admin
+from app.core.order_status import (
+    ORDER_STATUS_OPTIONS,
+    ORDER_STATUS_OPTIONS_ORDERED,
+    ORDER_STATUS_OPTIONS_ORDERED_DISPLAY,
+    display_order_status,
+    normalize_order_status,
+)
 from app.models.data_uploads import PlacedOrder, Product
 from app.models.derived import OrdersAggregated
 from app.services.orders_aggregation import refresh_orders_aggregated
@@ -68,8 +76,6 @@ class OrderDetailsPatchRequest(BaseModel):
     receival_date: date | None = None
 
 
-STATUS_OPTIONS = {"In transit", "Completed", "Created"}
-STATUS_OPTIONS_ORDERED = ["Completed", "In transit", "Created"]
 PAGE_SIZE_MAP = {"10": 10, "50": 50, "100": 100, "all": None}
 
 
@@ -83,7 +89,7 @@ def _base_aggregated_stmt(user: CurrentUser):
 @router.get("/status-options", response_model=List[str])
 async def get_order_status_options() -> list[str]:
     # Stable ordering for frontend dropdown rendering.
-    return STATUS_OPTIONS_ORDERED
+    return ORDER_STATUS_OPTIONS_ORDERED_DISPLAY
 
 
 def _parse_page_size(page_size: str) -> int | None:
@@ -100,21 +106,40 @@ async def _list_aggregated_orders(
     db: DBSession,
     user: CurrentUser,
     status_filter: str | None = None,
-    date_from: date | None = None,
-    date_to: date | None = None,
+    date_from: str | date | None = None,
+    date_to: str | date | None = None,
     page: int = 1,
     page_size: str = "10",
 ) -> OrdersPage:
+    parsed_date_from = parse_query_date(date_from, field_name="date_from")
+    parsed_date_to = parse_query_date(date_to, field_name="date_to", end_of_month=True)
     stmt = _base_aggregated_stmt(user)
-    if status_filter:
-        stmt = stmt.where(OrdersAggregated.status == status_filter)
-    if date_from:
-        stmt = stmt.where(OrdersAggregated.creation_date >= date_from)
-    if date_to:
-        stmt = stmt.where(OrdersAggregated.creation_date <= date_to)
+    normalized_status_filter = normalize_order_status(status_filter) if status_filter else None
+    if status_filter and normalized_status_filter is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Unsupported status value: {status_filter}",
+        )
+    if normalized_status_filter:
+        stmt = stmt.where(OrdersAggregated.status == normalized_status_filter)
+    if parsed_date_from:
+        stmt = stmt.where(OrdersAggregated.creation_date >= parsed_date_from)
+    if parsed_date_to:
+        stmt = stmt.where(OrdersAggregated.creation_date <= parsed_date_to)
     size = _parse_page_size(page_size)
     stmt = stmt.order_by(OrdersAggregated.creation_date.desc())
-    rows = list((await db.execute(stmt)).scalars().all())
+    raw_rows = list((await db.execute(stmt)).scalars().all())
+    rows = [
+        OrderRow(
+            order_id=row.order_id,
+            creation_date=row.creation_date,
+            receival_date=row.receival_date,
+            total_quantity_in_mc=row.total_quantity_in_mc,
+            total_amount_kzt=row.total_amount_kzt,
+            status=display_order_status(row.status),
+        )
+        for row in raw_rows
+    ]
     total_items = len(rows)
     if size is None:
         return OrdersPage(items=rows, total_items=total_items, total_pages=1 if total_items > 0 else 0)
@@ -127,13 +152,14 @@ async def _list_aggregated_orders(
     )
 
 
+@router.get("", response_model=OrdersPage, include_in_schema=False)
 @router.get("/", response_model=OrdersPage)
 async def list_orders(
     db: DBSession,
     user: CurrentUser,
     status: str | None = Query(None),
-    date_from: date | None = Query(None),
-    date_to: date | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: str = Query("10"),
 ) -> OrdersPage:
@@ -153,15 +179,15 @@ async def list_in_transit_orders(
     db: DBSession,
     user: CurrentUser,
     status: str | None = Query(None),
-    date_from: date | None = Query(None),
-    date_to: date | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: str = Query("10"),
 ) -> OrdersPage:
     return await _list_aggregated_orders(
         db=db,
         user=user,
-        status_filter=status or "In transit",
+        status_filter=status or "в пути",
         date_from=date_from,
         date_to=date_to,
         page=page,
@@ -174,15 +200,15 @@ async def list_completed_orders(
     db: DBSession,
     user: CurrentUser,
     status: str | None = Query(None),
-    date_from: date | None = Query(None),
-    date_to: date | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: str = Query("10"),
 ) -> OrdersPage:
     return await _list_aggregated_orders(
         db=db,
         user=user,
-        status_filter=status or "Completed",
+        status_filter=status or "завершен",
         date_from=date_from,
         date_to=date_to,
         page=page,
@@ -201,7 +227,7 @@ async def update_order_statuses(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="updates cannot be empty",
         )
-    invalid = [u.status for u in payload.updates if u.status not in STATUS_OPTIONS]
+    invalid = [u.status for u in payload.updates if normalize_order_status(u.status) is None]
     if invalid:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -210,10 +236,13 @@ async def update_order_statuses(
 
     updated = 0
     for change in payload.updates:
+        normalized_status = normalize_order_status(change.status)
+        if normalized_status is None:
+            continue
         stmt = update(PlacedOrder).where(PlacedOrder.order_id == change.order_id)
         if not is_admin(user):
             stmt = stmt.where(PlacedOrder.owner_user_id == user.id)
-        result = await db.execute(stmt.values(status=change.status))
+        result = await db.execute(stmt.values(status=normalized_status))
         updated += int(result.rowcount or 0)
     await db.commit()
 
@@ -297,7 +326,7 @@ async def get_order_details(
     return OrderDetailsResponse(
         order_id=header.order_id,
         order_name=header.order_name,
-        status=aggregated.status if aggregated is not None else header.status,
+        status=display_order_status(aggregated.status if aggregated is not None else header.status),
         creation_date=header.creation_date,
         receival_date=header.receival_date,
         author=header.author,

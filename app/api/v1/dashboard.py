@@ -4,9 +4,10 @@ from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
+from app.api.date_params import parse_query_date
 from app.api.deps import CurrentUser, DBSession, is_admin
 from app.api.v1.inventory_health import _build_category_summary, _compute_inventory_metrics
-from app.models.data_uploads import HistoricalSalesMonthly
+from app.models.data_uploads import HistoricalSalesMonthly, PriceList, Product
 from app.models.derived import ForecastSalesMonthly
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
@@ -52,14 +53,22 @@ async def _max_historical_date(db: DBSession, user: CurrentUser) -> date | None:
 
 
 async def _resolve_last_year_period(
-    db: DBSession, user: CurrentUser, date_from: date | None, date_to: date | None
+    db: DBSession, user: CurrentUser, date_from: str | date | None, date_to: str | date | None
 ) -> tuple[date | None, date | None]:
-    _validate_range(date_from, date_to)
+    parsed_date_from = parse_query_date(date_from, field_name="date_from")
+    parsed_date_to = parse_query_date(date_to, field_name="date_to", end_of_month=True)
+    _validate_range(parsed_date_from, parsed_date_to)
     max_date = await _max_historical_date(db, user)
     if max_date is None:
         return None, None
-    resolved_to = _month_start(date_to or max_date)
-    resolved_from = _month_start(date_from or _add_months(resolved_to, -12))
+    max_month = _month_start(max_date)
+    requested_to = _month_start(parsed_date_to or max_date)
+    # Dashboard should remain informative even when frontend requests a future month.
+    # Clamp upper bound to the latest available historical month.
+    resolved_to = min(requested_to, max_month)
+    resolved_from = _month_start(parsed_date_from or _add_months(resolved_to, -12))
+    if resolved_from > resolved_to:
+        resolved_from = _add_months(resolved_to, -12)
     return resolved_from, resolved_to
 
 
@@ -147,11 +156,10 @@ async def _inventory_issue_overview(
         return InventoryIssueOverviewResponse(
             view_type=normalized_view_type, total_value=0.0, sales_share_percent=0.0
         )
-    metrics = await _compute_inventory_metrics(
+    metrics = await _compute_inventory_metrics_safe_for_dashboard(
         db=db,
         user=user,
         view_type=view_type,
-        branch_names=None,
         date_from=resolved_from,
         date_to=resolved_to,
     )
@@ -183,18 +191,69 @@ async def _inventory_category_summary(
     date_from: date | None,
     date_to: date | None,
 ):
+    normalized_view_type = _normalize_dashboard_view_type(view_type)
     resolved_from, resolved_to = await _resolve_last_year_period(db, user, date_from, date_to)
     if resolved_from is None or resolved_to is None:
-        return _build_category_summary([], category, view_type)
-    metrics = await _compute_inventory_metrics(
+        return _build_category_summary(
+            [],
+            category,
+            normalized_view_type,
+            stock_share_metrics=[],
+        )
+    metrics = await _compute_inventory_metrics_safe_for_dashboard(
         db=db,
         user=user,
-        view_type=view_type,
-        branch_names=None,
+        view_type=normalized_view_type,
         date_from=resolved_from,
         date_to=resolved_to,
     )
-    return _build_category_summary(metrics, category, view_type)
+    if normalized_view_type == "cases":
+        return _build_category_summary(
+            metrics,
+            category,
+            normalized_view_type,
+            stock_share_metrics=metrics,
+        )
+
+    # For dashboard category cards, share_of_stock must always remain cases-based
+    # regardless of selected view type.
+    cases_metrics = await _compute_inventory_metrics_safe_for_dashboard(
+        db=db,
+        user=user,
+        view_type="cases",
+        date_from=resolved_from,
+        date_to=resolved_to,
+    )
+    return _build_category_summary(
+        metrics,
+        category,
+        normalized_view_type,
+        stock_share_metrics=cases_metrics,
+    )
+
+
+async def _compute_inventory_metrics_safe_for_dashboard(
+    db: DBSession,
+    user: CurrentUser,
+    view_type: str,
+    date_from: date | None,
+    date_to: date | None,
+):
+    try:
+        return await _compute_inventory_metrics(
+            db=db,
+            user=user,
+            view_type=view_type,
+            branch_names=None,
+            date_from=date_from,
+            date_to=date_to,
+        )
+    except HTTPException as exc:
+        if exc.status_code == status.HTTP_422_UNPROCESSABLE_ENTITY and str(exc.detail) == (
+            "Please select only past dates available in historical_sales_monthly"
+        ):
+            return []
+        raise
 
 
 @router.get("/sales-overview", response_model=SalesOverviewResponse)
@@ -202,8 +261,8 @@ async def get_sales_overview(
     db: DBSession,
     user: CurrentUser,
     view_type: str = Query("DSP", description="DSP or Cases"),
-    date_from: date | None = Query(None),
-    date_to: date | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
 ) -> SalesOverviewResponse:
     normalized_view_type = view_type.strip().lower()
     if normalized_view_type not in {"dsp", "cases"}:
@@ -237,6 +296,61 @@ async def get_sales_overview(
     target_amount = float(row[1] or 0.0)
     fact_qty = float(row[2] or 0.0)
     fact_amount = float(row[3] or 0.0)
+
+    # Keep DSP cards consistent with plot-data:
+    # if historical amount columns are absent/zero, backfill from quantity * pieces * DSP.
+    if normalized_view_type == "dsp" and (abs(target_amount) < 1e-9 or abs(fact_amount) < 1e-9):
+        hist_stmt = _scope_stmt(
+            select(HistoricalSalesMonthly).where(
+                HistoricalSalesMonthly.date >= resolved_from,
+                HistoricalSalesMonthly.date <= resolved_to,
+            ),
+            HistoricalSalesMonthly,
+            user,
+        )
+        hist_rows = (await db.execute(hist_stmt)).scalars().all()
+
+        product_stmt = _scope_stmt(select(Product), Product, user)
+        products = (await db.execute(product_stmt)).scalars().all()
+        product_pieces_by_key = {
+            (int(p.owner_user_id), str(p.sku_id)): float(p.pieces_in_master_carton or 0.0)
+            for p in products
+        }
+
+        price_stmt = _scope_stmt(select(PriceList), PriceList, user)
+        prices = (await db.execute(price_stmt)).scalars().all()
+        prices_by_key: dict[tuple[int, str], list[PriceList]] = {}
+        for p in prices:
+            key = (int(p.owner_user_id), str(p.sku_id))
+            prices_by_key.setdefault(key, []).append(p)
+        for key in prices_by_key:
+            prices_by_key[key].sort(key=lambda x: x.date)
+
+        def _dsp_for_key_on_or_before(key: tuple[int, str], point_date: date) -> float:
+            series = prices_by_key.get(key, [])
+            if not series:
+                return 0.0
+            selected = None
+            for p in series:
+                if p.date <= point_date:
+                    selected = p
+            if selected is None:
+                selected = series[-1]
+            return float(selected.dsp or 0.0)
+
+        fallback_fact_amount = 0.0
+        fallback_target_amount = 0.0
+        for h in hist_rows:
+            tuple_key = (int(h.owner_user_id), str(h.sku_id))
+            pieces = product_pieces_by_key.get(tuple_key, 0.0)
+            dsp = _dsp_for_key_on_or_before(tuple_key, h.date)
+            fallback_fact_amount += float(h.fact_quantity_in_mc or 0.0) * pieces * dsp
+            fallback_target_amount += float(h.target_quantity_in_mc or 0.0) * pieces * dsp
+
+        if abs(fact_amount) < 1e-9:
+            fact_amount = fallback_fact_amount
+        if abs(target_amount) < 1e-9:
+            target_amount = fallback_target_amount
     if normalized_view_type == "dsp":
         total_target_value = target_amount
         total_fact_value = fact_amount
@@ -257,8 +371,8 @@ async def get_dashboard_overstock(
     db: DBSession,
     user: CurrentUser,
     view_type: str = Query("DSP", description="DSP or Cases"),
-    date_from: date | None = Query(None),
-    date_to: date | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
 ) -> OverstockOverviewResponse:
     overview = await _inventory_issue_overview(
         db=db,
@@ -280,8 +394,8 @@ async def get_dashboard_understock(
     db: DBSession,
     user: CurrentUser,
     view_type: str = Query("DSP", description="DSP or Cases"),
-    date_from: date | None = Query(None),
-    date_to: date | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
 ) -> UnderstockOverviewResponse:
     overview = await _inventory_issue_overview(
         db=db,
@@ -303,8 +417,8 @@ async def get_dashboard_out_of_stock(
     db: DBSession,
     user: CurrentUser,
     view_type: str = Query("DSP", description="DSP or Cases"),
-    date_from: date | None = Query(None),
-    date_to: date | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
 ) -> OutOfStockOverviewResponse:
     overview = await _inventory_issue_overview(
         db=db,
@@ -326,8 +440,8 @@ async def get_dashboard_category_a(
     db: DBSession,
     user: CurrentUser,
     view_type: str = Query("DSP", description="DSP or Cases"),
-    date_from: date | None = Query(None),
-    date_to: date | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
 ):
     return await _inventory_category_summary(db, user, "A", view_type, date_from, date_to)
 
@@ -337,8 +451,8 @@ async def get_dashboard_category_b(
     db: DBSession,
     user: CurrentUser,
     view_type: str = Query("DSP", description="DSP or Cases"),
-    date_from: date | None = Query(None),
-    date_to: date | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
 ):
     return await _inventory_category_summary(db, user, "B", view_type, date_from, date_to)
 
@@ -348,8 +462,8 @@ async def get_dashboard_category_c(
     db: DBSession,
     user: CurrentUser,
     view_type: str = Query("DSP", description="DSP or Cases"),
-    date_from: date | None = Query(None),
-    date_to: date | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
 ):
     return await _inventory_category_summary(db, user, "C", view_type, date_from, date_to)
 
@@ -359,17 +473,16 @@ async def get_stock_coverage(
     db: DBSession,
     user: CurrentUser,
     view_type: str = Query("DSP", description="DSP or Cases"),
-    date_from: date | None = Query(None),
-    date_to: date | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
 ) -> StockCoverageResponse:
     resolved_from, resolved_to = await _resolve_last_year_period(db, user, date_from, date_to)
     if resolved_from is None or resolved_to is None:
         return StockCoverageResponse(items=[])
-    metrics = await _compute_inventory_metrics(
+    metrics = await _compute_inventory_metrics_safe_for_dashboard(
         db=db,
         user=user,
         view_type=view_type,
-        branch_names=None,
         date_from=resolved_from,
         date_to=resolved_to,
     )
@@ -399,14 +512,45 @@ async def get_plot_data(
     db: DBSession,
     user: CurrentUser,
     view_type: str = Query("DSP", description="DSP or Cases"),
-    date_from: date | None = Query(None),
-    date_to: date | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
 ) -> DashboardPlotDataResponse:
     normalized_view_type = _normalize_dashboard_view_type(view_type)
+    parsed_date_to = parse_query_date(date_to, field_name="date_to", end_of_month=True)
     # Kept for API compatibility; this response includes both quantity and amount series.
     resolved_from, resolved_to = await _resolve_last_year_period(db, user, date_from, date_to)
     if resolved_from is None or resolved_to is None:
         return DashboardPlotDataResponse(view_type=normalized_view_type)
+
+    product_pieces_by_key: dict[tuple[int, str], float] = {}
+    prices_by_key: dict[tuple[int, str], list[PriceList]] = {}
+    if normalized_view_type == "dsp":
+        product_stmt = _scope_stmt(select(Product), Product, user)
+        products = (await db.execute(product_stmt)).scalars().all()
+        product_pieces_by_key = {
+            (int(p.owner_user_id), str(p.sku_id)): float(p.pieces_in_master_carton or 0.0)
+            for p in products
+        }
+
+        price_stmt = _scope_stmt(select(PriceList), PriceList, user)
+        prices = (await db.execute(price_stmt)).scalars().all()
+        for p in prices:
+            key = (int(p.owner_user_id), str(p.sku_id))
+            prices_by_key.setdefault(key, []).append(p)
+        for key in prices_by_key:
+            prices_by_key[key].sort(key=lambda x: x.date)
+
+    def _dsp_for_key_on_or_before(key: tuple[int, str], point_date: date) -> float:
+        series = prices_by_key.get(key, [])
+        if not series:
+            return 0.0
+        selected = None
+        for p in series:
+            if p.date <= point_date:
+                selected = p
+        if selected is None:
+            selected = series[-1]
+        return float(selected.dsp or 0.0)
 
     hist_stmt = _scope_stmt(
         select(HistoricalSalesMonthly).where(
@@ -434,7 +578,17 @@ async def get_plot_data(
         b["fact_amount"] += float(row.fact_amount_kzt or 0.0)
         b["target_qty"] += float(row.target_quantity_in_mc or 0.0)
         b["target_amount"] += float(row.target_amount_kzt or 0.0)
-        b["past_stock"] += float(row.past_available_stock or 0.0)
+        if normalized_view_type == "dsp":
+            tuple_key = (int(row.owner_user_id), str(row.sku_id))
+            pieces = product_pieces_by_key.get(tuple_key, 0.0)
+            dsp = _dsp_for_key_on_or_before(tuple_key, row.date)
+            b["past_stock"] += float(row.past_available_stock or 0.0) * pieces * dsp
+            if abs(float(row.fact_amount_kzt or 0.0)) < 1e-9 and pieces > 0 and dsp > 0:
+                b["fact_amount"] += float(row.fact_quantity_in_mc or 0.0) * pieces * dsp
+            if abs(float(row.target_amount_kzt or 0.0)) < 1e-9 and pieces > 0 and dsp > 0:
+                b["target_amount"] += float(row.target_quantity_in_mc or 0.0) * pieces * dsp
+        else:
+            b["past_stock"] += float(row.past_available_stock or 0.0)
     historical_data = [
         HistoricalPlotPoint(
             date=d,
@@ -458,7 +612,7 @@ async def get_plot_data(
         )
     planning_month = _add_months(_month_start(max_hist_date), 1)
     max_forecast_to = _add_months(planning_month, 11)
-    requested_forecast_to = _month_start(date_to) if date_to else _add_months(planning_month, 5)
+    requested_forecast_to = _month_start(parsed_date_to) if parsed_date_to else _add_months(planning_month, 5)
     forecast_to = min(requested_forecast_to, max_forecast_to)
 
     forecast_data: list[ForecastPlotPoint] = []
@@ -501,7 +655,17 @@ async def get_plot_data(
             b["baseline_amount"] += baseline_amount
             b["adjusted_qty"] += adjusted_qty
             b["adjusted_amount"] += adjusted_amount
-            b["future_stock"] += float(row.future_available_stock or 0.0)
+            if normalized_view_type == "dsp":
+                tuple_key = (int(row.owner_user_id), str(row.sku_id))
+                pieces = product_pieces_by_key.get(tuple_key, 0.0)
+                dsp = _dsp_for_key_on_or_before(tuple_key, row.date)
+                b["future_stock"] += float(row.future_available_stock or 0.0) * pieces * dsp
+                if abs(baseline_amount) < 1e-9 and pieces > 0 and dsp > 0:
+                    b["baseline_amount"] += baseline_qty * pieces * dsp
+                if abs(adjusted_amount) < 1e-9 and pieces > 0 and dsp > 0:
+                    b["adjusted_amount"] += adjusted_qty * pieces * dsp
+            else:
+                b["future_stock"] += float(row.future_available_stock or 0.0)
         forecast_data = [
             ForecastPlotPoint(
                 date=d,
@@ -528,8 +692,8 @@ async def get_dashboard_overview_compat(
     db: DBSession,
     user: CurrentUser,
     view_type: str = Query("DSP", description="DSP or Cases"),
-    date_from: date | None = Query(None),
-    date_to: date | None = Query(None),
+    date_from: str | None = Query(None),
+    date_to: str | None = Query(None),
 ) -> SalesOverviewResponse:
     # Backward-compatible alias of the new sales overview.
     return await get_sales_overview(

@@ -9,6 +9,7 @@ from fastapi import HTTPException, status
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.branch_localization import normalize_branch_lookup
 from app.models.data_uploads import Branch, HistoricalSalesMonthly, Product
 from app.models.derived import ForecastSalesMonthly
 from app.models.reporting import DPReport, DPReportForecastOverride
@@ -169,8 +170,10 @@ def _matches_filters(
     product_filter: dict,
     branch_filter: list[str],
 ) -> bool:
-    if branch_filter and branch_name not in branch_filter:
-        return False
+    if branch_filter:
+        normalized_filter = {normalize_branch_lookup(x) for x in branch_filter if str(x).strip()}
+        if normalize_branch_lookup(branch_name) not in normalized_filter:
+            return False
     sku_codes = {v for v in product_filter.get("sku_codes", []) if v}
     brands = {v for v in product_filter.get("brands", []) if v}
     categories = {v for v in product_filter.get("categories", []) if v}

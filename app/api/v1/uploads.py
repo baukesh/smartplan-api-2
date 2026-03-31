@@ -1,13 +1,19 @@
 from io import BytesIO
 from datetime import date, datetime
 import logging
+import asyncio
 
 import pandas as pd
 from fastapi import APIRouter, File, HTTPException, UploadFile, status
-from sqlalchemy import delete, select
+from sqlalchemy import delete, inspect as sqla_inspect, select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, DBSession
+from app.core.branch_localization import localize_branch_name, normalize_branch_lookup
+from app.core.database import AsyncSessionLocal
+from app.core.order_status import normalize_order_status
+from app.core.product_status import normalize_product_status
 from app.models.data_uploads import (
     Branch,
     Product,
@@ -21,11 +27,36 @@ from app.services.orders_aggregation import refresh_orders_aggregated
 
 router = APIRouter(prefix="/uploads", tags=["uploads"])
 logger = logging.getLogger(__name__)
+UPLOAD_WRITE_LOCK = asyncio.Lock()
+REFRESH_DEBOUNCE_SECONDS = 2
+_pending_refresh_tasks: dict[int, asyncio.Task] = {}
 
 
 class UploadSpec:
     def __init__(self, required_columns: list[str]):
         self.required_columns = required_columns
+
+
+def _row_error(row: int, field: str, message: str, error_type: str = "validation_error") -> dict:
+    return {
+        "type": error_type,
+        "row": int(row),
+        "field": field,
+        "message": message,
+    }
+
+
+def _owner_user_id(user: CurrentUser) -> int:
+    try:
+        return int(user.id)
+    except Exception:
+        identity = sqla_inspect(user).identity
+        if identity and identity[0] is not None:
+            return int(identity[0])
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unable to resolve user id for upload operation",
+        )
 
 
 ASSORTMENT_SPEC = UploadSpec(
@@ -126,7 +157,7 @@ async def _save_records(db: AsyncSession, df: pd.DataFrame, model: type) -> int:
     return len(objs)
 
 
-def _to_python_date(value: object) -> date:
+def _parse_upload_date(value: object, *, allow_month_only: bool = True) -> date:
     if isinstance(value, pd.Timestamp):
         return value.date()
     if isinstance(value, datetime):
@@ -135,9 +166,77 @@ def _to_python_date(value: object) -> date:
         return value
     if pd.isna(value):
         raise ValueError("Date value is empty")
+
     if isinstance(value, (int, float)):
-        return pd.to_datetime(value, unit="D", origin="1899-12-30").date()
-    return pd.to_datetime(value).date()
+        # Excel serial date format (origin 1899-12-30)
+        return pd.to_datetime(float(value), unit="D", origin="1899-12-30").date()
+
+    raw = str(value).strip()
+    if not raw:
+        raise ValueError("Date value is empty")
+
+    # ISO full date.
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        pass
+
+    # ISO month format YYYY-MM
+    if allow_month_only:
+        try:
+            yyyy, mm = raw.split("-")
+            if len(yyyy) == 4 and len(mm) == 2:
+                return date(int(yyyy), int(mm), 1)
+        except Exception:
+            pass
+
+    # DD/MM/YYYY
+    try:
+        return datetime.strptime(raw, "%d/%m/%Y").date()
+    except ValueError:
+        pass
+
+    # MM/YYYY -> month start
+    if allow_month_only:
+        try:
+            mm, yyyy = raw.split("/")
+            if len(mm) == 2 and len(yyyy) == 4:
+                return date(int(yyyy), int(mm), 1)
+        except Exception:
+            pass
+
+    # Excel serial passed as string.
+    try:
+        serial = float(raw)
+        return pd.to_datetime(serial, unit="D", origin="1899-12-30").date()
+    except Exception:
+        pass
+
+    raise ValueError(
+        "Unsupported date format. Use Excel date, YYYY-MM-DD, YYYY-MM, DD/MM/YYYY, or MM/YYYY"
+    )
+
+
+def _to_python_date(value: object) -> date:
+    return _parse_upload_date(value)
+
+
+def _looks_like_month_year_encoded_as_january_days(values: list[date]) -> bool:
+    # Some Excel files store month/year inputs like "2/2024" as 2024-01-02.
+    # For historical monthly uploads, detect this pattern and remap day->month.
+    if len(values) < 12:
+        return False
+    if not all(v.month == 1 and 1 <= v.day <= 12 for v in values):
+        return False
+    unique_days = {v.day for v in values}
+    return len(unique_days) >= 6
+
+
+def _normalize_historical_monthly_date(parsed: date, *, day_as_month_mode: bool) -> date:
+    if day_as_month_mode and parsed.month == 1 and 1 <= parsed.day <= 12:
+        return date(parsed.year, parsed.day, 1)
+    # Canonical month bucket for historical monthly mart.
+    return parsed.replace(day=1)
 
 
 async def _replace_records(
@@ -146,10 +245,31 @@ async def _replace_records(
     records: list[dict],
     owner_user_id: int,
 ) -> int:
-    await db.execute(delete(model).where(model.owner_user_id == owner_user_id))
-    db.add_all([model(**r) for r in records])
-    await db.commit()
-    return len(records)
+    async with UPLOAD_WRITE_LOCK:
+        max_attempts = 5
+        last_exc: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                await db.execute(delete(model).where(model.owner_user_id == owner_user_id))
+                db.add_all([model(**r) for r in records])
+                await db.commit()
+                return len(records)
+            except OperationalError as exc:
+                await db.rollback()
+                last_exc = exc
+                if "database is locked" in str(exc).lower() and attempt < max_attempts:
+                    await asyncio.sleep(0.3 * attempt)
+                    continue
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="Database is temporarily busy. Please retry upload.",
+                ) from exc
+        if last_exc is not None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Database is temporarily busy. Please retry upload.",
+            ) from last_exc
+    return 0
 
 
 async def _refresh_materialized_safe(db: AsyncSession, owner_user_id: int) -> str | None:
@@ -166,12 +286,48 @@ async def _refresh_materialized_safe(db: AsyncSession, owner_user_id: int) -> st
         return str(exc)
 
 
+async def _refresh_materialized_background(owner_user_id: int) -> None:
+    async with AsyncSessionLocal() as session:
+        error = await _refresh_materialized_safe(session, owner_user_id=owner_user_id)
+        if error:
+            logger.warning(
+                "Background materialized refresh failed for owner_user_id=%s: %s",
+                owner_user_id,
+                error,
+            )
+
+
+async def _debounced_materialized_refresh(owner_user_id: int) -> None:
+    try:
+        await asyncio.sleep(REFRESH_DEBOUNCE_SECONDS)
+        await _refresh_materialized_background(owner_user_id)
+    finally:
+        current = _pending_refresh_tasks.get(owner_user_id)
+        if current is asyncio.current_task():
+            _pending_refresh_tasks.pop(owner_user_id, None)
+
+
+def _schedule_materialized_refresh(owner_user_id: int) -> None:
+    existing = _pending_refresh_tasks.get(owner_user_id)
+    if existing and not existing.done():
+        existing.cancel()
+    _pending_refresh_tasks[owner_user_id] = asyncio.create_task(
+        _debounced_materialized_refresh(owner_user_id)
+    )
+
+
 async def _resolve_branch_ids(
     db: AsyncSession,
     owner_user_id: int,
     branch_names: list[str],
 ) -> dict[str, str]:
-    cleaned = sorted({name.strip() for name in branch_names if name and name.strip()})
+    cleaned = sorted(
+        {
+            str(localize_branch_name(name) or str(name).strip())
+            for name in branch_names
+            if name and str(name).strip()
+        }
+    )
     if not cleaned:
         return {}
 
@@ -179,6 +335,7 @@ async def _resolve_branch_ids(
         await db.execute(select(Branch).where(Branch.owner_user_id == owner_user_id))
     ).scalars().all()
     by_name = {r.branch_name: r.branch_id for r in existing_rows}
+    by_name_lookup = {normalize_branch_lookup(r.branch_name): r.branch_id for r in existing_rows}
     used_ids = {r.branch_id for r in existing_rows}
 
     next_idx = 100001
@@ -187,7 +344,8 @@ async def _resolve_branch_ids(
 
     new_rows: list[Branch] = []
     for name in cleaned:
-        if name in by_name:
+        if normalize_branch_lookup(name) in by_name_lookup:
+            by_name[name] = by_name_lookup[normalize_branch_lookup(name)]
             continue
         while str(next_idx) in used_ids:
             next_idx += 1
@@ -195,6 +353,7 @@ async def _resolve_branch_ids(
         next_idx += 1
         used_ids.add(branch_id)
         by_name[name] = branch_id
+        by_name_lookup[normalize_branch_lookup(name)] = branch_id
         new_rows.append(
             Branch(
                 owner_user_id=owner_user_id,
@@ -210,29 +369,96 @@ async def _resolve_branch_ids(
     return by_name
 
 
+def _validate_historical_sales_columns(df: pd.DataFrame) -> list[dict]:
+    errors: list[dict] = []
+    required_metric_columns = [
+        "date",
+        "fact_quantity_in_mc",
+        "target_quantity_in_mc",
+        "past_available_stock",
+    ]
+    missing = [c for c in required_metric_columns if c not in df.columns]
+    if missing:
+        errors.append(
+            {
+                "type": "missing_columns",
+                "message": "One or more required columns are missing",
+                "columns": missing,
+            }
+        )
+    if "sku_id" not in df.columns and "sku_code" not in df.columns:
+        errors.append(
+            {
+                "type": "missing_columns",
+                "message": "One of sku_id or sku_code must be provided",
+                "columns": ["sku_id|sku_code"],
+            }
+        )
+    if "branch_name" not in df.columns and "branch_id" not in df.columns:
+        errors.append(
+            {
+                "type": "missing_columns",
+                "message": "One of branch_name or branch_id must be provided",
+                "columns": ["branch_name|branch_id"],
+            }
+        )
+    return errors
+
+
+def _validate_placed_orders_columns(df: pd.DataFrame) -> list[dict]:
+    errors: list[dict] = []
+    required_columns = [
+        "order_id",
+        "order_name",
+        "creation_date",
+        "receival_date",
+        "quantity_in_mc",
+        "author",
+        "status",
+    ]
+    missing = [c for c in required_columns if c not in df.columns]
+    if missing:
+        errors.append(
+            {
+                "type": "missing_columns",
+                "message": "One or more required columns are missing",
+                "columns": missing,
+            }
+        )
+    if "sku_id" not in df.columns and "sku_code" not in df.columns:
+        errors.append(
+            {
+                "type": "missing_columns",
+                "message": "One of sku_id or sku_code must be provided",
+                "columns": ["sku_id|sku_code"],
+            }
+        )
+    return errors
+
+
 @router.post("/assortment")
 async def upload_assortment(
     db: DBSession,
     user: CurrentUser,
     file: UploadFile = File(...),
 ):
+    owner_user_id = _owner_user_id(user)
     df = _load_excel(file)
     errors = _validate_columns(df, ASSORTMENT_SPEC)
     if errors:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=errors)
     records = df[ASSORTMENT_SPEC.required_columns].to_dict(orient="records")
     for r in records:
-        r["owner_user_id"] = user.id
-    count = await _replace_records(db, Product, records, owner_user_id=user.id)
-    refresh_error = await _refresh_materialized_safe(db, owner_user_id=user.id)
-    response = {"rows_inserted": count}
-    if refresh_error:
-        response["warning"] = (
-            "Upload succeeded, but post-upload materialization refresh failed. "
-            "Data is saved; please retry refresh."
-        )
-        response["refresh_error"] = refresh_error
-    return response
+        normalized_status = normalize_product_status(str(r.get("status", "")))
+        if normalized_status is None:
+            normalized_status = "новый"
+        r["status"] = normalized_status
+        r["owner_user_id"] = owner_user_id
+    count = await _replace_records(db, Product, records, owner_user_id=owner_user_id)
+    return {
+        "rows_inserted": count,
+        "refresh_status": "deferred_until_orders_upload",
+    }
 
 
 @router.post("/branch-stock-norm")
@@ -241,35 +467,79 @@ async def upload_branch_stock_norm(
     user: CurrentUser,
     file: UploadFile = File(...),
 ):
+    owner_user_id = _owner_user_id(user)
     df = _load_excel(file)
     errors = _validate_columns(df, BRANCH_STOCK_NORM_SPEC)
     if errors:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=errors)
+    row_errors: list[dict] = []
+    for idx, row in df.iterrows():
+        current_stock = row.get("current_stock")
+        stock_norm = row.get("stock_norm")
+        if pd.isna(current_stock) or str(current_stock).strip() == "":
+            row_errors.append(
+                _row_error(
+                    int(idx),
+                    "current_stock",
+                    "current_stock cannot be empty",
+                    error_type="required_field",
+                )
+            )
+        else:
+            try:
+                float(current_stock)
+            except Exception:
+                row_errors.append(
+                    _row_error(
+                        int(idx),
+                        "current_stock",
+                        "current_stock must be a numeric value",
+                    )
+                )
+        if pd.isna(stock_norm) or str(stock_norm).strip() == "":
+            row_errors.append(
+                _row_error(
+                    int(idx),
+                    "stock_norm",
+                    "stock_norm cannot be empty",
+                    error_type="required_field",
+                )
+            )
+        else:
+            try:
+                float(stock_norm)
+            except Exception:
+                row_errors.append(
+                    _row_error(
+                        int(idx),
+                        "stock_norm",
+                        "stock_norm must be a numeric value",
+                    )
+                )
+    if row_errors:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=row_errors)
     branch_map = await _resolve_branch_ids(
         db,
-        owner_user_id=user.id,
+        owner_user_id=owner_user_id,
         branch_names=df["branch_name"].astype(str).tolist(),
     )
     records = df[BRANCH_STOCK_NORM_SPEC.required_columns].to_dict(orient="records")
     for r in records:
-        branch_name = str(r.pop("branch_name")).strip()
+        branch_name = str(localize_branch_name(str(r.pop("branch_name")).strip()) or "").strip()
         r["branch_id"] = branch_map[branch_name]
-        r["owner_user_id"] = user.id
+        r["current_stock"] = float(r["current_stock"])
+        r["stock_norm"] = float(r["stock_norm"])
+        r["owner_user_id"] = owner_user_id
     count = await _replace_records(
         db,
         ProductBranch,
         records,
-        owner_user_id=user.id,
+        owner_user_id=owner_user_id,
     )
-    refresh_error = await _refresh_materialized_safe(db, owner_user_id=user.id)
-    response = {"rows_inserted": count}
-    if refresh_error:
-        response["warning"] = (
-            "Upload succeeded, but post-upload materialization refresh failed. "
-            "Data is saved; please retry refresh."
-        )
-        response["refresh_error"] = refresh_error
-    return response
+    return {
+        "rows_inserted": count,
+        "refresh_status": "deferred_until_orders_upload",
+    }
 
 
 @router.post("/price-list")
@@ -278,27 +548,54 @@ async def upload_price_list(
     user: CurrentUser,
     file: UploadFile = File(...),
 ):
+    owner_user_id = _owner_user_id(user)
     df = _load_excel(file)
     errors = _validate_columns(df, PRICE_LIST_SPEC)
     if errors:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=errors)
     rows = df[PRICE_LIST_SPEC.required_columns].copy()
-    rows["date"] = rows["date"].apply(_to_python_date)
-    records = rows.to_dict(orient="records")
-    for r in records:
-        r["owner_user_id"] = user.id
-    count = await _replace_records(
-        db, PriceList, records, owner_user_id=user.id
-    )
-    refresh_error = await _refresh_materialized_safe(db, owner_user_id=user.id)
-    response = {"rows_inserted": count}
-    if refresh_error:
-        response["warning"] = (
-            "Upload succeeded, but post-upload materialization refresh failed. "
-            "Data is saved; please retry refresh."
+    row_errors: list[dict] = []
+    records: list[dict] = []
+    for idx, row in rows.iterrows():
+        try:
+            parsed_date = _parse_upload_date(row["date"])
+        except Exception as exc:
+            row_errors.append(_row_error(int(idx), "date", str(exc)))
+            continue
+        sku_id = str(row["sku_id"]).strip()
+        if not sku_id:
+            row_errors.append(
+                _row_error(int(idx), "sku_id", "sku_id cannot be empty", error_type="required_field")
+            )
+            continue
+        try:
+            invoice_price = float(row["invoice_price"])
+        except Exception:
+            row_errors.append(_row_error(int(idx), "invoice_price", "Must be numeric"))
+            continue
+        try:
+            dsp = float(row["dsp"])
+        except Exception:
+            row_errors.append(_row_error(int(idx), "dsp", "Must be numeric"))
+            continue
+        records.append(
+            {
+                "sku_id": sku_id,
+                "date": parsed_date,
+                "invoice_price": invoice_price,
+                "dsp": dsp,
+                "owner_user_id": owner_user_id,
+            }
         )
-        response["refresh_error"] = refresh_error
-    return response
+    if row_errors:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=row_errors)
+    count = await _replace_records(
+        db, PriceList, records, owner_user_id=owner_user_id
+    )
+    return {
+        "rows_inserted": count,
+        "refresh_status": "deferred_until_orders_upload",
+    }
 
 
 @router.post("/historical-sales-monthly")
@@ -307,28 +604,52 @@ async def upload_historical_sales_monthly(
     user: CurrentUser,
     file: UploadFile = File(...),
 ):
+    owner_user_id = _owner_user_id(user)
     df = _load_excel(file)
-    errors = _validate_columns(df, HISTORICAL_SALES_MONTHLY_SPEC)
+    errors = _validate_historical_sales_columns(df)
     if errors:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=errors)
-    rows = df[HISTORICAL_SALES_MONTHLY_SPEC.required_columns].copy()
-    rows["date"] = rows["date"].apply(_to_python_date)
-    branch_map = await _resolve_branch_ids(
-        db,
-        owner_user_id=user.id,
-        branch_names=rows["branch_name"].astype(str).tolist(),
-    )
+    rows = df.copy()
 
     products = {
         p.sku_id: p
         for p in (
             await db.execute(
-                select(Product).where(Product.owner_user_id == user.id)
+                select(Product).where(Product.owner_user_id == owner_user_id)
             )
         ).scalars().all()
     }
+    products_by_code = {str(p.sku_code).strip(): p for p in products.values()}
+
+    existing_branches = (
+        await db.execute(select(Branch).where(Branch.owner_user_id == owner_user_id))
+    ).scalars().all()
+    branch_id_to_name = {
+        str(b.branch_id).strip(): str(b.branch_name).strip() for b in existing_branches
+    }
+
+    branch_names_to_resolve: list[str] = []
+    if "branch_name" in rows.columns:
+        for _, row in rows.iterrows():
+            raw_branch_name = row.get("branch_name")
+            if pd.isna(raw_branch_name) or str(raw_branch_name).strip() == "":
+                continue
+            branch_names_to_resolve.append(
+                str(localize_branch_name(str(raw_branch_name).strip()) or "").strip()
+            )
+    branch_map = await _resolve_branch_ids(
+        db,
+        owner_user_id=owner_user_id,
+        branch_names=branch_names_to_resolve,
+    )
+    existing_branches = (
+        await db.execute(select(Branch).where(Branch.owner_user_id == owner_user_id))
+    ).scalars().all()
+    branch_id_to_name = {
+        str(b.branch_id).strip(): str(b.branch_name).strip() for b in existing_branches
+    }
     prices = (
-        await db.execute(select(PriceList).where(PriceList.owner_user_id == user.id))
+        await db.execute(select(PriceList).where(PriceList.owner_user_id == owner_user_id))
     ).scalars().all()
     prices_by_sku: dict[str, list[PriceList]] = {}
     for p in prices:
@@ -338,26 +659,151 @@ async def upload_historical_sales_monthly(
 
     prepared: list[dict] = []
     row_errors: list[dict] = []
+    parsed_dates_by_idx: dict[int, date] = {}
+    parsed_dates: list[date] = []
     for idx, row in rows.iterrows():
-        sku_id = str(row["sku_id"])
-        product = products.get(sku_id)
-        if not product:
+        try:
+            parsed = _parse_upload_date(row["date"])
+            parsed_dates_by_idx[int(idx)] = parsed
+            parsed_dates.append(parsed)
+        except Exception as exc:
+            row_errors.append(_row_error(int(idx), "date", str(exc)))
+    day_as_month_mode = _looks_like_month_year_encoded_as_january_days(parsed_dates)
+
+    for idx, row in rows.iterrows():
+        raw_sku_id = row.get("sku_id") if "sku_id" in rows.columns else None
+        raw_sku_code = row.get("sku_code") if "sku_code" in rows.columns else None
+        sku_id_value = None if pd.isna(raw_sku_id) else str(raw_sku_id).strip()
+        sku_code_value = None if pd.isna(raw_sku_code) else str(raw_sku_code).strip()
+
+        resolved_from_id = products.get(sku_id_value) if sku_id_value else None
+        resolved_from_code = products_by_code.get(sku_code_value) if sku_code_value else None
+
+        if not sku_id_value and not sku_code_value:
             row_errors.append(
-                {
-                    "type": "foreign_key_missing",
-                    "row": int(idx),
-                    "field": "sku_id",
-                    "message": f"Product '{sku_id}' not found in product table",
-                }
+                _row_error(
+                    int(idx),
+                    "sku_id|sku_code",
+                    "Either sku_id or sku_code must be provided",
+                    error_type="required_field",
+                )
             )
             continue
-        r_date: date = _to_python_date(row["date"])
+
+        if sku_id_value and sku_code_value:
+            if (
+                resolved_from_id is None
+                or resolved_from_code is None
+                or resolved_from_id.sku_id != resolved_from_code.sku_id
+            ):
+                row_errors.append(
+                    _row_error(
+                        int(idx),
+                        "sku_id|sku_code",
+                        "Conflicting sku_id and sku_code values in the same row",
+                        error_type="conflict",
+                    )
+                )
+                continue
+
+        product = resolved_from_id or resolved_from_code
+        if not product:
+            row_errors.append(
+                _row_error(
+                    int(idx),
+                    "sku_id|sku_code",
+                    (
+                        f"Product not found for sku_id='{sku_id_value}' and "
+                        f"sku_code='{sku_code_value}'"
+                    ),
+                    error_type="foreign_key_missing",
+                )
+            )
+            continue
+        sku_id = product.sku_id
+
+        raw_branch_name = row.get("branch_name") if "branch_name" in rows.columns else None
+        raw_branch_id = row.get("branch_id") if "branch_id" in rows.columns else None
+        branch_name_value = None if pd.isna(raw_branch_name) else str(raw_branch_name).strip()
+        branch_id_value = None if pd.isna(raw_branch_id) else str(raw_branch_id).strip()
+
+        resolved_branch_id_from_name = None
+        if branch_name_value:
+            localized_name = str(
+                localize_branch_name(branch_name_value) or branch_name_value
+            ).strip()
+            resolved_branch_id_from_name = branch_map.get(localized_name)
+        resolved_branch_id_from_id = (
+            branch_id_value if branch_id_value and branch_id_value in branch_id_to_name else None
+        )
+
+        if not branch_name_value and not branch_id_value:
+            row_errors.append(
+                _row_error(
+                    int(idx),
+                    "branch_name|branch_id",
+                    "Either branch_name or branch_id must be provided",
+                    error_type="required_field",
+                )
+            )
+            continue
+
+        if branch_name_value and branch_id_value:
+            if (
+                resolved_branch_id_from_name is not None
+                and resolved_branch_id_from_id is not None
+                and resolved_branch_id_from_name != resolved_branch_id_from_id
+            ):
+                row_errors.append(
+                    _row_error(
+                        int(idx),
+                        "branch_name|branch_id",
+                        "Conflicting branch_name and branch_id values in the same row",
+                        error_type="conflict",
+                    )
+                )
+                continue
+
+        branch_id = resolved_branch_id_from_name or resolved_branch_id_from_id
+        if branch_id is None:
+            row_errors.append(
+                _row_error(
+                    int(idx),
+                    "branch_name|branch_id",
+                    "Branch not found for provided branch_name/branch_id",
+                    error_type="foreign_key_missing",
+                )
+            )
+            continue
+
+        parsed_date = parsed_dates_by_idx.get(int(idx))
+        if parsed_date is None:
+            continue
+        r_date = _normalize_historical_monthly_date(
+            parsed_date,
+            day_as_month_mode=day_as_month_mode,
+        )
+
         closest_price = None
         for p in prices_by_sku.get(sku_id, []):
             if _to_python_date(p.date) <= r_date:
                 closest_price = p
-        fact_qty = float(row["fact_quantity_in_mc"])
-        target_qty = float(row["target_quantity_in_mc"])
+        try:
+            fact_qty = float(row["fact_quantity_in_mc"])
+        except Exception:
+            row_errors.append(_row_error(int(idx), "fact_quantity_in_mc", "Must be numeric"))
+            continue
+        try:
+            target_qty = float(row["target_quantity_in_mc"])
+        except Exception:
+            row_errors.append(_row_error(int(idx), "target_quantity_in_mc", "Must be numeric"))
+            continue
+        try:
+            past_available_stock = float(row["past_available_stock"])
+        except Exception:
+            row_errors.append(_row_error(int(idx), "past_available_stock", "Must be numeric"))
+            continue
+
         fact_amount = (
             fact_qty * product.pieces_in_master_carton * closest_price.dsp
             if closest_price is not None
@@ -372,7 +818,7 @@ async def upload_historical_sales_monthly(
             {
                 "sku_id": sku_id,
                 "date": r_date,
-                "branch_id": branch_map[str(row["branch_name"]).strip()],
+                "branch_id": branch_id,
                 "fact_quantity_in_mc": fact_qty,
                 "fact_gross_weight_kg": fact_qty * product.master_carton_gross_weight_kg,
                 "fact_volume_cbm": fact_qty * product.master_carton_volume_cbm,
@@ -381,8 +827,8 @@ async def upload_historical_sales_monthly(
                 "target_gross_weight_kg": target_qty * product.master_carton_gross_weight_kg,
                 "target_volume_cbm": target_qty * product.master_carton_volume_cbm,
                 "target_amount_kzt": target_amount,
-                "past_available_stock": float(row["past_available_stock"]),
-                "owner_user_id": user.id,
+                "past_available_stock": past_available_stock,
+                "owner_user_id": owner_user_id,
             }
         )
 
@@ -393,17 +839,12 @@ async def upload_historical_sales_monthly(
         )
 
     count = await _replace_records(
-        db, HistoricalSalesMonthly, prepared, owner_user_id=user.id
+        db, HistoricalSalesMonthly, prepared, owner_user_id=owner_user_id
     )
-    refresh_error = await _refresh_materialized_safe(db, owner_user_id=user.id)
-    response = {"rows_inserted": count}
-    if refresh_error:
-        response["warning"] = (
-            "Upload succeeded, but post-upload materialization refresh failed. "
-            "Data is saved; please retry refresh."
-        )
-        response["refresh_error"] = refresh_error
-    return response
+    return {
+        "rows_inserted": count,
+        "refresh_status": "deferred_until_orders_upload",
+    }
 
 
 @router.post("/placed-orders")
@@ -412,24 +853,24 @@ async def upload_placed_orders(
     user: CurrentUser,
     file: UploadFile = File(...),
 ):
+    owner_user_id = _owner_user_id(user)
     df = _load_excel(file)
-    errors = _validate_columns(df, PLACED_ORDERS_SPEC)
+    errors = _validate_placed_orders_columns(df)
     if errors:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=errors)
-    rows = df[PLACED_ORDERS_SPEC.required_columns].copy()
-    rows["creation_date"] = rows["creation_date"].apply(_to_python_date)
-    rows["receival_date"] = rows["receival_date"].apply(_to_python_date)
+    rows = df.copy()
 
     products = {
         p.sku_id: p
         for p in (
             await db.execute(
-                select(Product).where(Product.owner_user_id == user.id)
+                select(Product).where(Product.owner_user_id == owner_user_id)
             )
         ).scalars().all()
     }
+    products_by_code = {str(p.sku_code).strip(): p for p in products.values()}
     prices = (
-        await db.execute(select(PriceList).where(PriceList.owner_user_id == user.id))
+        await db.execute(select(PriceList).where(PriceList.owner_user_id == owner_user_id))
     ).scalars().all()
     prices_by_sku: dict[str, list[PriceList]] = {}
     for p in prices:
@@ -440,19 +881,65 @@ async def upload_placed_orders(
     prepared: list[dict] = []
     row_errors: list[dict] = []
     for idx, row in rows.iterrows():
-        sku_id = str(row["sku_id"])
-        product = products.get(sku_id)
-        if not product:
+        raw_sku_id = row.get("sku_id") if "sku_id" in rows.columns else None
+        raw_sku_code = row.get("sku_code") if "sku_code" in rows.columns else None
+        sku_id_value = None if pd.isna(raw_sku_id) else str(raw_sku_id).strip()
+        sku_code_value = None if pd.isna(raw_sku_code) else str(raw_sku_code).strip()
+
+        resolved_from_id = products.get(sku_id_value) if sku_id_value else None
+        resolved_from_code = products_by_code.get(sku_code_value) if sku_code_value else None
+
+        if not sku_id_value and not sku_code_value:
             row_errors.append(
-                {
-                    "type": "foreign_key_missing",
-                    "row": int(idx),
-                    "field": "sku_id",
-                    "message": f"Product '{sku_id}' not found in product table",
-                }
+                _row_error(
+                    int(idx),
+                    "sku_id|sku_code",
+                    "Either sku_id or sku_code must be provided",
+                    error_type="required_field",
+                )
             )
             continue
-        c_date: date = _to_python_date(row["creation_date"])
+        if sku_id_value and sku_code_value:
+            if (
+                resolved_from_id is None
+                or resolved_from_code is None
+                or resolved_from_id.sku_id != resolved_from_code.sku_id
+            ):
+                row_errors.append(
+                    _row_error(
+                        int(idx),
+                        "sku_id|sku_code",
+                        "Conflicting sku_id and sku_code values in the same row",
+                        error_type="conflict",
+                    )
+                )
+                continue
+
+        product = resolved_from_id or resolved_from_code
+        if not product:
+            row_errors.append(
+                _row_error(
+                    int(idx),
+                    "sku_id|sku_code",
+                    (
+                        f"Product not found for sku_id='{sku_id_value}' and "
+                        f"sku_code='{sku_code_value}'"
+                    ),
+                    error_type="foreign_key_missing",
+                )
+            )
+            continue
+        sku_id = product.sku_id
+        try:
+            c_date: date = _parse_upload_date(row["creation_date"])
+        except Exception as exc:
+            row_errors.append(_row_error(int(idx), "creation_date", str(exc)))
+            continue
+        try:
+            receival_date: date = _parse_upload_date(row["receival_date"])
+        except Exception as exc:
+            row_errors.append(_row_error(int(idx), "receival_date", str(exc)))
+            continue
         sorted_prices = prices_by_sku.get(sku_id, [])
         closest_price = None
         earliest_price = sorted_prices[0] if sorted_prices else None
@@ -460,14 +947,18 @@ async def upload_placed_orders(
             if _to_python_date(p.date) <= c_date:
                 closest_price = p
         selected_price = closest_price if closest_price is not None else earliest_price
-        qty = float(row["quantity_in_mc"])
+        try:
+            qty = float(row["quantity_in_mc"])
+        except Exception:
+            row_errors.append(_row_error(int(idx), "quantity_in_mc", "Must be numeric"))
+            continue
         prepared.append(
             {
                 "order_id": str(row["order_id"]),
                 "sku_id": sku_id,
                 "order_name": str(row["order_name"]),
                 "creation_date": c_date,
-                "receival_date": _to_python_date(row["receival_date"]),
+                "receival_date": receival_date,
                 "quantity_in_mc": qty,
                 "gross_weight_kg": qty * product.master_carton_gross_weight_kg,
                 "volume_cbm": qty * product.master_carton_volume_cbm,
@@ -477,8 +968,8 @@ async def upload_placed_orders(
                     else None
                 ),
                 "author": str(row["author"]) if not pd.isna(row["author"]) else None,
-                "status": str(row["status"]),
-                "owner_user_id": user.id,
+                "status": normalize_order_status(str(row["status"])) or "создан",
+                "owner_user_id": owner_user_id,
             }
         )
 
@@ -488,7 +979,11 @@ async def upload_placed_orders(
             detail=row_errors,
         )
 
-    count = await _replace_records(db, PlacedOrder, prepared, owner_user_id=user.id)
-    await refresh_orders_aggregated(db, owner_user_id=user.id)
-    return {"rows_inserted": count}
+    count = await _replace_records(db, PlacedOrder, prepared, owner_user_id=owner_user_id)
+    await refresh_orders_aggregated(db, owner_user_id=owner_user_id)
+    _schedule_materialized_refresh(owner_user_id)
+    return {
+        "rows_inserted": count,
+        "refresh_status": "scheduled",
+    }
 
