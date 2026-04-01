@@ -1,12 +1,17 @@
 from datetime import date
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Header, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
 from app.api.date_params import parse_query_date
 from app.api.deps import CurrentUser, DBSession, is_admin
-from app.api.v1.inventory_health import _build_category_summary, _compute_inventory_metrics
+from app.api.v1.inventory_health import (
+    _branch_filters_from_referer,
+    _build_category_summary,
+    _compute_inventory_metrics,
+    _merge_branch_filters,
+)
 from app.models.data_uploads import HistoricalSalesMonthly, PriceList, Product
 from app.models.derived import ForecastSalesMonthly
 
@@ -160,6 +165,7 @@ async def _inventory_issue_overview(
         db=db,
         user=user,
         view_type=view_type,
+        branch_names=None,
         date_from=resolved_from,
         date_to=resolved_to,
     )
@@ -190,22 +196,29 @@ async def _inventory_category_summary(
     view_type: str,
     date_from: date | None,
     date_to: date | None,
+    branch_names: list[str] | None = None,
 ):
     normalized_view_type = _normalize_dashboard_view_type(view_type)
-    resolved_from, resolved_to = await _resolve_last_year_period(db, user, date_from, date_to)
-    if resolved_from is None or resolved_to is None:
-        return _build_category_summary(
-            [],
-            category,
-            normalized_view_type,
-            stock_share_metrics=[],
-        )
+    parsed_date_from = parse_query_date(date_from, field_name="date_from")
+    parsed_date_to = parse_query_date(date_to, field_name="date_to", end_of_month=True)
+    _validate_range(parsed_date_from, parsed_date_to)
+    max_date = await _max_historical_date(db, user)
+    if max_date is None:
+        return _build_category_summary([], category, normalized_view_type, stock_share_metrics=[])
+    max_month = _month_start(max_date)
+    if parsed_date_to and _month_start(parsed_date_to) > max_month:
+        parsed_date_to = max_month
+    if parsed_date_from and _month_start(parsed_date_from) > max_month:
+        parsed_date_from = max_month
+    if parsed_date_from and parsed_date_to and parsed_date_from > parsed_date_to:
+        parsed_date_from = parsed_date_to
     metrics = await _compute_inventory_metrics_safe_for_dashboard(
         db=db,
         user=user,
         view_type=normalized_view_type,
-        date_from=resolved_from,
-        date_to=resolved_to,
+        branch_names=branch_names,
+        date_from=parsed_date_from,
+        date_to=parsed_date_to,
     )
     if normalized_view_type == "cases":
         return _build_category_summary(
@@ -221,8 +234,9 @@ async def _inventory_category_summary(
         db=db,
         user=user,
         view_type="cases",
-        date_from=resolved_from,
-        date_to=resolved_to,
+        branch_names=branch_names,
+        date_from=parsed_date_from,
+        date_to=parsed_date_to,
     )
     return _build_category_summary(
         metrics,
@@ -236,6 +250,7 @@ async def _compute_inventory_metrics_safe_for_dashboard(
     db: DBSession,
     user: CurrentUser,
     view_type: str,
+    branch_names: list[str] | None,
     date_from: date | None,
     date_to: date | None,
 ):
@@ -244,7 +259,7 @@ async def _compute_inventory_metrics_safe_for_dashboard(
             db=db,
             user=user,
             view_type=view_type,
-            branch_names=None,
+            branch_names=branch_names,
             date_from=date_from,
             date_to=date_to,
         )
@@ -440,10 +455,24 @@ async def get_dashboard_category_a(
     db: DBSession,
     user: CurrentUser,
     view_type: str = Query("DSP", description="DSP or Cases"),
+    branch_name: list[str] | None = Query(None),
+    branch: list[str] | None = Query(None),
+    referer: str | None = Header(default=None, alias="Referer"),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
 ):
-    return await _inventory_category_summary(db, user, "A", view_type, date_from, date_to)
+    merged_branch_filters = _merge_branch_filters(branch_name, branch) or _branch_filters_from_referer(
+        referer
+    )
+    return await _inventory_category_summary(
+        db,
+        user,
+        "A",
+        view_type,
+        date_from,
+        date_to,
+        branch_names=merged_branch_filters,
+    )
 
 
 @router.get("/inventory-health-overview/category_b")
@@ -451,10 +480,24 @@ async def get_dashboard_category_b(
     db: DBSession,
     user: CurrentUser,
     view_type: str = Query("DSP", description="DSP or Cases"),
+    branch_name: list[str] | None = Query(None),
+    branch: list[str] | None = Query(None),
+    referer: str | None = Header(default=None, alias="Referer"),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
 ):
-    return await _inventory_category_summary(db, user, "B", view_type, date_from, date_to)
+    merged_branch_filters = _merge_branch_filters(branch_name, branch) or _branch_filters_from_referer(
+        referer
+    )
+    return await _inventory_category_summary(
+        db,
+        user,
+        "B",
+        view_type,
+        date_from,
+        date_to,
+        branch_names=merged_branch_filters,
+    )
 
 
 @router.get("/inventory-health-overview/category_c")
@@ -462,10 +505,24 @@ async def get_dashboard_category_c(
     db: DBSession,
     user: CurrentUser,
     view_type: str = Query("DSP", description="DSP or Cases"),
+    branch_name: list[str] | None = Query(None),
+    branch: list[str] | None = Query(None),
+    referer: str | None = Header(default=None, alias="Referer"),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
 ):
-    return await _inventory_category_summary(db, user, "C", view_type, date_from, date_to)
+    merged_branch_filters = _merge_branch_filters(branch_name, branch) or _branch_filters_from_referer(
+        referer
+    )
+    return await _inventory_category_summary(
+        db,
+        user,
+        "C",
+        view_type,
+        date_from,
+        date_to,
+        branch_names=merged_branch_filters,
+    )
 
 
 @router.get("/stock-coverage", response_model=StockCoverageResponse)
@@ -483,6 +540,7 @@ async def get_stock_coverage(
         db=db,
         user=user,
         view_type=view_type,
+        branch_names=None,
         date_from=resolved_from,
         date_to=resolved_to,
     )

@@ -3,7 +3,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordRequestForm
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, DBSession
@@ -13,6 +13,8 @@ from app.core.security import (
     hash_password,
     verify_password,
 )
+from app.models.data_uploads import HistoricalSalesMonthly, PlacedOrder, PriceList, Product, ProductBranch
+from app.models.derived import BranchDistribution, DPReportMart, ForecastOrders, InventoryHealth
 from app.models.user import User, UserRole
 from app.schemas.user import Token, UserCreate, UserOut
 
@@ -23,6 +25,13 @@ class UserInfoOut(BaseModel):
     username: str
     role: str
     full_name: str
+    isAssortmentCreated: bool
+    isOrdersCreated: bool
+    isInventoryHealthCreated: bool
+    isDashboardCreated: bool
+    isSupplyChainCreated: bool
+    isDistributionCreated: bool
+    isReportsCreated: bool
 
 
 @router.post("/register", response_model=UserOut, status_code=status.HTTP_201_CREATED)
@@ -89,11 +98,53 @@ async def refresh_token(token: str) -> Token:
     return Token(access_token=access, refresh_token=refresh)
 
 
+async def _count_by_owner(db: AsyncSession, model, owner_user_id: int) -> int:
+    stmt = select(func.count()).select_from(model).where(model.owner_user_id == owner_user_id)
+    return int((await db.execute(stmt)).scalar_one() or 0)
+
+
 @router.get("/user-info", response_model=UserInfoOut)
-async def user_info(user: CurrentUser) -> UserInfoOut:
+async def user_info(db: DBSession, user: CurrentUser) -> UserInfoOut:
+    owner_user_id = int(user.id)
+
+    product_count = await _count_by_owner(db, Product, owner_user_id)
+    product_branch_count = await _count_by_owner(db, ProductBranch, owner_user_id)
+    historical_count = await _count_by_owner(db, HistoricalSalesMonthly, owner_user_id)
+    price_count = await _count_by_owner(db, PriceList, owner_user_id)
+    placed_orders_count = await _count_by_owner(db, PlacedOrder, owner_user_id)
+    inventory_health_count = await _count_by_owner(db, InventoryHealth, owner_user_id)
+    forecast_orders_count = await _count_by_owner(db, ForecastOrders, owner_user_id)
+    branch_distribution_count = await _count_by_owner(db, BranchDistribution, owner_user_id)
+    report_mart_count = await _count_by_owner(db, DPReportMart, owner_user_id)
+
+    # Stage 1: assortment prerequisites are fully uploaded.
+    is_assortment_created = (
+        product_count > 0
+        and product_branch_count > 0
+        and historical_count > 0
+        and price_count > 0
+    )
+    # Stage 2: orders file uploaded.
+    is_orders_created = is_assortment_created and placed_orders_count > 0
+    # Stage 3: inventory-health/dashboard marts are materialized.
+    is_inventory_health_created = is_orders_created and inventory_health_count > 0
+    is_dashboard_created = is_inventory_health_created
+    # Stage 4: supply-chain/distribution marts are ready (post-forecast refresh).
+    is_supply_chain_created = is_dashboard_created and forecast_orders_count > 0
+    is_distribution_created = is_supply_chain_created and branch_distribution_count > 0
+    # Final stage: reports mart is ready.
+    is_reports_created = is_distribution_created and report_mart_count > 0
+
     return {
         "username": user.email,
         "role": user.role.value if hasattr(user.role, "value") else str(user.role),
         "full_name": user.full_name,
+        "isAssortmentCreated": is_assortment_created,
+        "isOrdersCreated": is_orders_created,
+        "isInventoryHealthCreated": is_inventory_health_created,
+        "isDashboardCreated": is_dashboard_created,
+        "isSupplyChainCreated": is_supply_chain_created,
+        "isDistributionCreated": is_distribution_created,
+        "isReportsCreated": is_reports_created,
     }
 

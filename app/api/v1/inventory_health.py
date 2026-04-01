@@ -1,7 +1,8 @@
 from calendar import monthrange
 from datetime import date
+from urllib.parse import parse_qs, unquote, urlparse
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Header, HTTPException, Query, status
 from pydantic import BaseModel
 from sqlalchemy import func, select
 
@@ -61,6 +62,7 @@ class _SkuMetrics(BaseModel):
     sales_qty: float
     sales_dsp: float
     stock: float
+    stock_dsp: float
     share_business: float
     share_stock: float
     share_percent: float
@@ -114,10 +116,35 @@ def _merge_branch_filters(
         if not source:
             continue
         for value in source:
-            normalized = str(value).strip()
-            if normalized and normalized not in merged:
-                merged.append(str(localize_branch_name(normalized) or normalized))
+            raw = str(value).strip()
+            if not raw:
+                continue
+            # Support comma-separated style ("Алматы,Астана").
+            parts = [p.strip() for p in raw.split(",") if p.strip()]
+            for normalized in parts:
+                localized = str(localize_branch_name(normalized) or normalized)
+                if localized not in merged:
+                    merged.append(localized)
     return merged or None
+
+
+def _branch_filters_from_referer(referer: str | None) -> list[str] | None:
+    if not referer:
+        return None
+    try:
+        parsed = urlparse(referer)
+        qs = parse_qs(parsed.query)
+    except Exception:
+        return None
+    collected: list[str] = []
+    for key in ("branch", "branch_name"):
+        for raw in qs.get(key) or []:
+            decoded = unquote(str(raw or "")).strip()
+            if decoded:
+                collected.append(decoded)
+    if not collected:
+        return None
+    return _merge_branch_filters(None, collected)
 
 
 @router.get("/filter-options", response_model=InventoryHealthFilterOptionsResponse)
@@ -277,6 +304,7 @@ async def _compute_inventory_metrics(
         sales_qty = float(r.fact_quantity_in_mc or 0.0)
         sales_dsp = sales_qty * float(p.pieces_in_master_carton or 0.0) * dsp
         stock = float(r.past_available_stock or 0.0)
+        stock_dsp = stock * float(p.pieces_in_master_carton or 0.0) * dsp
 
         bucket = agg.setdefault(
             key,
@@ -287,11 +315,13 @@ async def _compute_inventory_metrics(
                 "sales_qty": 0.0,
                 "sales_dsp": 0.0,
                 "stock": 0.0,
+                "stock_dsp": 0.0,
             },
         )
         bucket["sales_qty"] = float(bucket["sales_qty"]) + sales_qty
         bucket["sales_dsp"] = float(bucket["sales_dsp"]) + sales_dsp
         bucket["stock"] = float(bucket["stock"]) + stock
+        bucket["stock_dsp"] = float(bucket["stock_dsp"]) + stock_dsp
 
     if not agg:
         return []
@@ -303,6 +333,7 @@ async def _compute_inventory_metrics(
     # Fallback to quantity share only when DSP total is zero to avoid degenerate buckets.
     abc_total_sales = total_sales_dsp if total_sales_dsp > 0 else total_sales_qty
     total_stock = sum(float(v["stock"]) for v in agg.values())
+    total_stock_dsp = sum(float(v["stock_dsp"]) for v in agg.values())
 
     interim: list[dict] = []
     for v in agg.values():
@@ -313,7 +344,11 @@ async def _compute_inventory_metrics(
             if total_sales_dsp > 0 and abc_total_sales > 0
             else (float(v["sales_qty"]) / abc_total_sales if abc_total_sales > 0 else 0.0)
         )
-        share_stock = float(v["stock"]) / total_stock if total_stock > 0 else 0.0
+        share_stock = (
+            (float(v["stock_dsp"]) / total_stock_dsp)
+            if metric == "dsp" and total_stock_dsp > 0
+            else ((float(v["stock"]) / total_stock) if total_stock > 0 else 0.0)
+        )
         health = (share_stock / share_business) * 100.0 if share_business > 0 else 0.0
         interim.append(
             {
@@ -323,6 +358,7 @@ async def _compute_inventory_metrics(
                 "sales_qty": float(v["sales_qty"]),
                 "sales_dsp": float(v["sales_dsp"]),
                 "stock": float(v["stock"]),
+                "stock_dsp": float(v["stock_dsp"]),
                 "share_business": share_business,
                 "share_stock": share_stock,
                 "share_percent": share_business * 100.0,
@@ -374,7 +410,7 @@ def _build_category_summary(
     sales_share_percent = (
         (category_sales_value / total_sales_value_all * 100.0) if total_sales_value_all > 0 else 0.0
     )
-    share_of_stock = (category_stock / total_stock) if total_stock > 0 else 0.0
+    share_of_stock = ((category_stock / total_stock) * 100.0) if total_stock > 0 else 0.0
     # Weighted average health index inside the category (A/B/C),
     # not weighted contribution to the whole portfolio.
     category_business_share = sum(m.share_business for m in filtered)
@@ -391,7 +427,7 @@ def _build_category_summary(
         percent_of_skus=round(percent_of_skus, 1),
         sales_share_percent=round(sales_share_percent, 1),
         total_sales_value=round(category_sales_value, 2),
-        share_of_stock=round(share_of_stock, 4),
+        share_of_stock=round(share_of_stock, 2),
         category_health_index=round(category_health_index, 2),
     )
 
@@ -466,15 +502,19 @@ async def get_category_a(
     view_type: str = Query("DSP", description="DSP or Cases"),
     branch_name: list[str] | None = Query(None),
     branch: list[str] | None = Query(None),
+    referer: str | None = Header(default=None, alias="Referer"),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
 ) -> CategorySummaryRow:
+    merged_branch_filters = _merge_branch_filters(branch_name, branch) or _branch_filters_from_referer(
+        referer
+    )
     return await _build_category_summary_cases_stock(
         db=db,
         user=user,
         category="A",
         view_type=view_type,
-        merged_branch_filters=_merge_branch_filters(branch_name, branch),
+        merged_branch_filters=merged_branch_filters,
         date_from=date_from,
         date_to=date_to,
     )
@@ -487,15 +527,19 @@ async def get_category_b(
     view_type: str = Query("DSP", description="DSP or Cases"),
     branch_name: list[str] | None = Query(None),
     branch: list[str] | None = Query(None),
+    referer: str | None = Header(default=None, alias="Referer"),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
 ) -> CategorySummaryRow:
+    merged_branch_filters = _merge_branch_filters(branch_name, branch) or _branch_filters_from_referer(
+        referer
+    )
     return await _build_category_summary_cases_stock(
         db=db,
         user=user,
         category="B",
         view_type=view_type,
-        merged_branch_filters=_merge_branch_filters(branch_name, branch),
+        merged_branch_filters=merged_branch_filters,
         date_from=date_from,
         date_to=date_to,
     )
@@ -508,15 +552,19 @@ async def get_category_c(
     view_type: str = Query("DSP", description="DSP or Cases"),
     branch_name: list[str] | None = Query(None),
     branch: list[str] | None = Query(None),
+    referer: str | None = Header(default=None, alias="Referer"),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
 ) -> CategorySummaryRow:
+    merged_branch_filters = _merge_branch_filters(branch_name, branch) or _branch_filters_from_referer(
+        referer
+    )
     return await _build_category_summary_cases_stock(
         db=db,
         user=user,
         category="C",
         view_type=view_type,
-        merged_branch_filters=_merge_branch_filters(branch_name, branch),
+        merged_branch_filters=merged_branch_filters,
         date_from=date_from,
         date_to=date_to,
     )

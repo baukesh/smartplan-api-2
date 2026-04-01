@@ -1,5 +1,6 @@
 from datetime import date
 from io import BytesIO
+import re
 
 import pandas as pd
 from fastapi import APIRouter, HTTPException, Query, status
@@ -9,6 +10,7 @@ from sqlalchemy import func, select, update
 
 from app.api.date_params import parse_query_date
 from app.api.deps import CurrentUser, DBSession, is_admin
+from app.core.source_normalization import normalize_source_value, source_matches
 from app.models.data_uploads import HistoricalSalesMonthly, PriceList, Product
 from app.models.derived import ForecastOrders
 
@@ -145,6 +147,15 @@ def _closest_dsp_for_period(prices: list[PriceList], period_date: date) -> float
     return float(selected.dsp)
 
 
+def _normalize_category_filter(value: str | None) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    normalized = re.sub(r"^[^0-9A-Za-zА-Яа-я]+", "", raw)
+    normalized = re.sub(r"[^0-9A-Za-zА-Яа-я]+$", "", normalized)
+    return normalized.strip().lower()
+
+
 async def _load_supply_rows(
     db: DBSession,
     user: CurrentUser,
@@ -157,12 +168,16 @@ async def _load_supply_rows(
     if not is_admin(user):
         p_stmt = p_stmt.where(Product.owner_user_id == user.id)
         fo_stmt = fo_stmt.where(ForecastOrders.owner_user_id == user.id)
-    if category:
-        p_stmt = p_stmt.where(Product.category == category)
-    if source:
-        p_stmt = p_stmt.where(Product.source == source)
-
     products = (await db.execute(p_stmt)).scalars().all()
+    if category:
+        wanted_category = _normalize_category_filter(category)
+        products = [
+            p
+            for p in products
+            if _normalize_category_filter(p.category) == wanted_category
+        ]
+    if source:
+        products = [p for p in products if source_matches(source, p.source)]
     product_by_sku = {p.sku_id: p for p in products}
     fo_rows = (await db.execute(fo_stmt.order_by(ForecastOrders.sku_id))).scalars().all()
     fo_by_sku = {r.sku_id: r for r in fo_rows if r.sku_id in product_by_sku}
@@ -257,9 +272,9 @@ async def get_supply_chain_filter_options(
     )
     sources = sorted(
         {
-            str(p.source).strip()
+            normalize_source_value(p.source)
             for p in products
-            if p.source is not None and str(p.source).strip()
+            if p.source is not None and normalize_source_value(p.source)
         }
     )
 
@@ -283,9 +298,9 @@ async def get_supply_chain_filter_options(
                 )
                 sources = sorted(
                     {
-                        str(p.source).strip()
+                        normalize_source_value(p.source)
                         for p in period_products
-                        if p.source is not None and str(p.source).strip()
+                        if p.source is not None and normalize_source_value(p.source)
                     }
                 )
 
@@ -341,6 +356,14 @@ async def update_adjusted_quantities(
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="updates cannot be empty",
+        )
+    if not period and not date_from and not date_to:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "period (or date_from/date_to) is required for PATCH /supply-chain "
+                "to avoid updating a different planning month than intended"
+            ),
         )
     period_date = await _resolve_period_from_args(db, user, period, date_from, date_to)
 

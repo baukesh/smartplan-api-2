@@ -6,13 +6,14 @@ from typing import List
 import pandas as pd
 from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import AliasChoices, BaseModel, Field
 from sqlalchemy import select, update
 
 from app.api.date_params import parse_query_date
 from app.api.deps import CurrentUser, DBSession, is_admin
 from app.core.branch_localization import normalize_branch_lookup
 from app.core.product_status import PRODUCT_STATUS_OPTIONS, normalize_product_status
+from app.core.source_normalization import normalize_source_value, source_matches
 from app.models.data_uploads import Branch, Product, ProductBranch, PriceList
 
 router = APIRouter(prefix="/assortment", tags=["assortment"])
@@ -50,7 +51,12 @@ class AssortmentStatusUpdateRequest(BaseModel):
 
 class AssortmentStockNormDaysUpdate(BaseModel):
     sku_code: str
-    stock_norm_days: float
+    general_stock_norm_days: float = Field(
+        validation_alias=AliasChoices("general_stock_norm_days", "stock_norm_days"),
+        serialization_alias="general_stock_norm_days",
+    )
+
+    model_config = {"populate_by_name": True}
 
 
 class AssortmentStockNormDaysUpdateRequest(BaseModel):
@@ -152,7 +158,7 @@ async def list_assortment(
             master_carton_gross_weight_kg=r.master_carton_gross_weight_kg,
             master_carton_net_weight_kg=r.master_carton_net_weight_kg,
             lead_time=r.lead_time,
-            source=r.source,
+            source=normalize_source_value(r.source),
             general_stock_norm_days=r.general_stock_norm_days,
             status=r.status,
             brand=r.brand,
@@ -231,10 +237,9 @@ async def update_assortment_items_stock_norm_days(
         scope_stmt = scope_stmt.where(Product.brand == brand.strip())
     if category:
         scope_stmt = scope_stmt.where(Product.category == category.strip())
-    if source:
-        scope_stmt = scope_stmt.where(Product.source == source.strip())
-
     scoped_products = (await db.execute(scope_stmt)).scalars().all()
+    if source:
+        scoped_products = [p for p in scoped_products if source_matches(source, p.source)]
     scoped_map: dict[str, list[Product]] = {}
     for p in scoped_products:
         scoped_map.setdefault(str(p.sku_code).strip(), []).append(p)
@@ -252,7 +257,7 @@ async def update_assortment_items_stock_norm_days(
             result = await db.execute(
                 update(Product)
                 .where(Product.owner_user_id == p.owner_user_id, Product.sku_id == p.sku_id)
-                .values(general_stock_norm_days=float(item.stock_norm_days))
+                .values(general_stock_norm_days=float(item.general_stock_norm_days))
             )
             updated += int(result.rowcount or 0)
 
@@ -293,9 +298,9 @@ async def download_assortment_items(
         stmt = stmt.where(Product.brand == brand.strip())
     if category:
         stmt = stmt.where(Product.category == category.strip())
-    if source:
-        stmt = stmt.where(Product.source == source.strip())
     rows = (await db.execute(stmt.order_by(Product.sku_code))).scalars().all()
+    if source:
+        rows = [r for r in rows if source_matches(source, r.source)]
 
     export_rows = [
         {
@@ -307,7 +312,7 @@ async def download_assortment_items(
             "master_carton_gross_weight_kg": r.master_carton_gross_weight_kg,
             "master_carton_net_weight_kg": r.master_carton_net_weight_kg,
             "lead_time": r.lead_time,
-            "source": r.source,
+            "source": normalize_source_value(r.source),
             "general_stock_norm_days": r.general_stock_norm_days,
             "status": r.status,
             "brand": r.brand,

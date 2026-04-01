@@ -265,6 +265,7 @@ async def update_order_statuses(
     return {"rows_updated": updated}
 
 
+@router.get("/details/", response_model=OrderDetailsResponse, include_in_schema=False)
 @router.get("/details", response_model=OrderDetailsResponse)
 async def get_order_details(
     db: DBSession,
@@ -338,6 +339,7 @@ async def get_order_details(
     )
 
 
+@router.patch("/details/", include_in_schema=False)
 @router.patch("/details")
 async def patch_order_details(
     db: DBSession,

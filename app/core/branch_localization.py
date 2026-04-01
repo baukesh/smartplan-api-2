@@ -6,6 +6,24 @@ BRANCH_NAME_RU_MAP = {
     "aktobe": "Актобе",
 }
 
+_LATIN_CONFUSABLES_MAP = {
+    "а": "a",
+    "е": "e",
+    "о": "o",
+    "р": "p",
+    "с": "c",
+    "х": "x",
+    "у": "y",
+    "к": "k",
+    "м": "m",
+    "т": "t",
+    "в": "b",
+    "н": "h",
+    "і": "i",
+    "ї": "i",
+    "ы": "y",
+}
+
 
 def localize_branch_name(value: str | None) -> str | None:
     if value is None:
@@ -13,7 +31,12 @@ def localize_branch_name(value: str | None) -> str | None:
     raw = str(value).strip()
     if not raw:
         return None
-    mapped = BRANCH_NAME_RU_MAP.get(raw.lower())
+    lowered = raw.lower()
+    mapped = BRANCH_NAME_RU_MAP.get(lowered)
+    if mapped is None:
+        # Support mixed-script variants like "Almatы" (latin + cyrillic).
+        deconfused = "".join(_LATIN_CONFUSABLES_MAP.get(ch, ch) for ch in lowered)
+        mapped = BRANCH_NAME_RU_MAP.get(deconfused)
     return mapped if mapped is not None else raw
 
 

@@ -14,6 +14,7 @@ from app.core.branch_localization import localize_branch_name, normalize_branch_
 from app.core.database import AsyncSessionLocal
 from app.core.order_status import normalize_order_status
 from app.core.product_status import normalize_product_status
+from app.core.source_normalization import normalize_source_value
 from app.models.data_uploads import (
     Branch,
     Product,
@@ -453,6 +454,7 @@ async def upload_assortment(
         if normalized_status is None:
             normalized_status = "новый"
         r["status"] = normalized_status
+        r["source"] = normalize_source_value(r.get("source"))
         r["owner_user_id"] = owner_user_id
     count = await _replace_records(db, Product, records, owner_user_id=owner_user_id)
     return {

@@ -381,6 +381,7 @@ async def get_distribution_summary(
     )
 
 
+@router.get("/details/", response_model=DistributionDetailsResponse, include_in_schema=False)
 @router.get("/details", response_model=DistributionDetailsResponse)
 async def get_distribution_details(
     db: DBSession,
@@ -472,6 +473,7 @@ async def patch_distribution_branch_adjustments(
     return {"rows_updated": updated}
 
 
+@router.patch("/details/", include_in_schema=False)
 @router.patch("/details")
 async def patch_distribution_detail_adjustments(
     db: DBSession,
@@ -533,6 +535,7 @@ async def patch_distribution_detail_adjustments(
     return {"rows_updated": updated}
 
 
+@router.get("/download/", include_in_schema=False)
 @router.get("/download")
 async def download_distribution(
     db: DBSession,
@@ -555,6 +558,7 @@ async def download_distribution(
     )
 
 
+@router.get("/details/download/", include_in_schema=False)
 @router.get("/details/download")
 async def download_distribution_details(
     db: DBSession,
