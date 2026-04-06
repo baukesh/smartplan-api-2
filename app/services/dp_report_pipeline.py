@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import UTC, date, datetime, timedelta
 import hashlib
 import json
+import logging
+import time
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
@@ -20,11 +22,14 @@ from app.models.data_uploads import (
 from app.models.derived import (
     BranchDistribution,
     DPReportMart,
+    ForecastInferenceCache,
     ForecastOrders,
     ForecastSalesMonthly,
     InventoryHealth,
 )
 from app.services.gpt_forecasting import forecast_baseline_quantities_in_mc
+
+logger = logging.getLogger(__name__)
 
 
 def _closest_price_on_or_before(
@@ -61,6 +66,12 @@ def _round2(v: float | None) -> float | None:
     return round(float(v), 2)
 
 
+def _round_qty(v: float | None) -> int:
+    if v is None:
+        return 0
+    return int(round(float(v)))
+
+
 def _avg_last_n(values: list[float], n: int = 6) -> float:
     if not values:
         return 0.0
@@ -68,9 +79,37 @@ def _avg_last_n(values: list[float], n: int = 6) -> float:
     return sum(tail) / len(tail) if tail else 0.0
 
 
+def _normalize_changed_keys(
+    changed_keys: list[tuple[str, str]] | None,
+) -> list[tuple[str, str]] | None:
+    if not changed_keys:
+        return None
+    normalized: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for sku_id, branch_id in changed_keys:
+        key = (str(sku_id).strip(), str(branch_id).strip())
+        if not key[0] or not key[1] or key in seen:
+            continue
+        seen.add(key)
+        normalized.append(key)
+    return normalized or None
+
+
+def _normalize_changed_skus(
+    changed_skus: list[str] | None,
+) -> list[str] | None:
+    if not changed_skus:
+        return None
+    normalized = sorted({str(s).strip() for s in changed_skus if str(s).strip()})
+    return normalized or None
+
+
 async def refresh_forecast_sales_monthly(
-    db: AsyncSession, owner_user_id: int | None = None
-) -> None:
+    db: AsyncSession,
+    owner_user_id: int | None = None,
+    changed_keys: list[tuple[str, str]] | None = None,
+) -> dict[str, int]:
+    changed_keys = _normalize_changed_keys(changed_keys)
     products = {
         p.sku_id: p
         for p in (
@@ -84,13 +123,14 @@ async def refresh_forecast_sales_monthly(
             select(ProductBranch).where(ProductBranch.owner_user_id == owner_user_id)
         )
     ).scalars().all()
-    hist_rows = (
-        await db.execute(
-            select(HistoricalSalesMonthly).where(
-                HistoricalSalesMonthly.owner_user_id == owner_user_id
-            )
+    hs_stmt = select(HistoricalSalesMonthly).where(
+        HistoricalSalesMonthly.owner_user_id == owner_user_id
+    )
+    if changed_keys:
+        hs_stmt = hs_stmt.where(
+            tuple_(HistoricalSalesMonthly.sku_id, HistoricalSalesMonthly.branch_id).in_(changed_keys)
         )
-    ).scalars().all()
+    hist_rows = (await db.execute(hs_stmt)).scalars().all()
     prices = (
         await db.execute(select(PriceList).where(PriceList.owner_user_id == owner_user_id))
     ).scalars().all()
@@ -121,11 +161,19 @@ async def refresh_forecast_sales_monthly(
     for sku in placed_orders_by_sku:
         placed_orders_by_sku[sku].sort(key=lambda x: x.creation_date)
 
-    await db.execute(
-        delete(ForecastSalesMonthly).where(
-            ForecastSalesMonthly.owner_user_id == owner_user_id
+    if changed_keys:
+        await db.execute(
+            delete(ForecastSalesMonthly).where(
+                ForecastSalesMonthly.owner_user_id == owner_user_id,
+                tuple_(ForecastSalesMonthly.sku_id, ForecastSalesMonthly.branch_id).in_(changed_keys),
+            )
         )
-    )
+    else:
+        await db.execute(
+            delete(ForecastSalesMonthly).where(
+                ForecastSalesMonthly.owner_user_id == owner_user_id
+            )
+        )
 
     to_insert: list[ForecastSalesMonthly] = []
 
@@ -164,6 +212,26 @@ async def refresh_forecast_sales_monthly(
             }
             for po in placed_orders_by_sku.get(sku_id, [])
         ]
+        cache_payload = {
+            "sku_id": sku_id,
+            "branch_id": branch_id,
+            "forecast_months": [d.isoformat() for d in forecast_months],
+            "history_context": history_context[-24:],
+            "orders_context": orders_context[-24:],
+            "current_stock": round(float(branch_stock.get((sku_id, branch_id), 0.0)), 6),
+            "stock_norm_days": round(
+                float(
+                    stock_norm_by_key.get((sku_id, branch_id), product.general_stock_norm_days)
+                    or 0.0
+                ),
+                6,
+            ),
+            "model": settings.OPENAI_FORECAST_MODEL,
+            "schema_version": settings.FORECAST_CACHE_SCHEMA_VERSION,
+        }
+        cache_key = hashlib.sha256(
+            json.dumps(cache_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+        ).hexdigest()
         job_payloads.append(
             {
                 "sku_id": sku_id,
@@ -178,6 +246,7 @@ async def refresh_forecast_sales_monthly(
                     stock_norm_by_key.get((sku_id, branch_id), product.general_stock_norm_days)
                     or 0.0
                 ),
+                "cache_key": cache_key,
             }
         )
 
@@ -185,8 +254,32 @@ async def refresh_forecast_sales_monthly(
     timeout_seconds = float(settings.OPENAI_FORECAST_TIMEOUT_SECONDS or 15.0)
     semaphore = asyncio.Semaphore(max_concurrency)
     memo: dict[str, list[float]] = {}
+    now_utc = datetime.now(UTC)
+    gpt_attempted = 0
+    gpt_fallbacks = 0
+    cache_hits = 0
+    cache_writes = 0
+    cache_ttl = timedelta(hours=max(int(settings.FORECAST_CACHE_TTL_HOURS or 1), 1))
+
+    cache_rows_by_hash: dict[str, ForecastInferenceCache] = {}
+    if settings.PERSISTENT_FORECAST_CACHE_ENABLED and job_payloads:
+        cache_keys = [str(job["cache_key"]) for job in job_payloads]
+        cache_rows = (
+            await db.execute(
+                select(ForecastInferenceCache).where(
+                    ForecastInferenceCache.owner_user_id == (owner_user_id or 0),
+                    ForecastInferenceCache.model_name == settings.OPENAI_FORECAST_MODEL,
+                    ForecastInferenceCache.schema_version == settings.FORECAST_CACHE_SCHEMA_VERSION,
+                    ForecastInferenceCache.payload_hash.in_(cache_keys),
+                )
+            )
+        ).scalars().all()
+        cache_rows_by_hash = {row.payload_hash: row for row in cache_rows}
+
+    cache_upserts: dict[str, tuple[str, str, list[float]]] = {}
 
     async def _get_baseline_series(job: dict) -> list[float]:
+        nonlocal gpt_attempted, gpt_fallbacks, cache_hits
         history_values = [
             float(x.get("fact_quantity_in_mc") or 0.0)
             for x in job["history_context"]
@@ -196,25 +289,27 @@ async def refresh_forecast_sales_monthly(
 
         # Skip model call when history is too short; use deterministic fallback.
         if len(history_values) < 6:
+            gpt_fallbacks += 1
             return fallback_series
 
-        cache_payload = {
-            "sku_id": job["sku_id"],
-            "branch_id": job["branch_id"],
-            "forecast_months": [d.isoformat() for d in job["forecast_months"]],
-            "history_context": job["history_context"][-24:],
-            "orders_context": job["orders_context"][-24:],
-            "current_stock": round(float(job["current_stock"]), 6),
-            "stock_norm_days": round(float(job["stock_norm_days"]), 6),
-            "model": settings.OPENAI_FORECAST_MODEL,
-        }
-        cache_key = hashlib.sha256(
-            json.dumps(cache_payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        ).hexdigest()
+        cache_key = str(job["cache_key"])
         if cache_key in memo:
             return memo[cache_key]
 
+        if settings.PERSISTENT_FORECAST_CACHE_ENABLED:
+            cache_row = cache_rows_by_hash.get(cache_key)
+            if cache_row and cache_row.expires_at >= now_utc:
+                try:
+                    persisted = json.loads(cache_row.forecast_values_json)
+                    if isinstance(persisted, list):
+                        cache_hits += 1
+                        memo[cache_key] = [float(v) for v in persisted]
+                        return memo[cache_key]
+                except Exception:
+                    pass
+
         async with semaphore:
+            gpt_attempted += 1
             series = await forecast_baseline_quantities_in_mc(
                 sku_id=job["sku_id"],
                 branch_id=job["branch_id"],
@@ -226,6 +321,8 @@ async def refresh_forecast_sales_monthly(
                 timeout_seconds=timeout_seconds,
             )
         memo[cache_key] = series
+        if settings.PERSISTENT_FORECAST_CACHE_ENABLED:
+            cache_upserts[cache_key] = (job["sku_id"], job["branch_id"], series)
         return series
 
     baseline_series_by_key: dict[tuple[str, str], list[float]] = {}
@@ -235,6 +332,27 @@ async def refresh_forecast_sales_monthly(
         )
         for idx, job in enumerate(job_payloads):
             baseline_series_by_key[(job["sku_id"], job["branch_id"])] = series_results[idx]
+
+    if settings.PERSISTENT_FORECAST_CACHE_ENABLED and cache_upserts:
+        for payload_hash, (sku_id, branch_id, series) in cache_upserts.items():
+            cache_row = cache_rows_by_hash.get(payload_hash)
+            if cache_row is None:
+                db.add(
+                    ForecastInferenceCache(
+                        owner_user_id=owner_user_id or 0,
+                        sku_id=sku_id,
+                        branch_id=branch_id,
+                        model_name=settings.OPENAI_FORECAST_MODEL,
+                        schema_version=settings.FORECAST_CACHE_SCHEMA_VERSION,
+                        payload_hash=payload_hash,
+                        forecast_values_json=json.dumps(series),
+                        expires_at=now_utc + cache_ttl,
+                    )
+                )
+            else:
+                cache_row.forecast_values_json = json.dumps(series)
+                cache_row.expires_at = now_utc + cache_ttl
+        cache_writes = len(cache_upserts)
 
     for job in job_payloads:
         sku_id = job["sku_id"]
@@ -260,7 +378,7 @@ async def refresh_forecast_sales_monthly(
                     sku_id=sku_id,
                     branch_id=branch_id,
                     date=forecast_date,
-                    baseline_forecast_quantity_in_mc=_round2(baseline_qty) or 0.0,
+                    baseline_forecast_quantity_in_mc=float(_round_qty(baseline_qty)),
                     baseline_forecast_gross_weight_kg=(
                         _round2(baseline_qty * product.master_carton_gross_weight_kg)
                     ),
@@ -280,27 +398,51 @@ async def refresh_forecast_sales_monthly(
 
     db.add_all(to_insert)
     await db.commit()
+    logger.info(
+        "refresh_forecast_sales_monthly done owner=%s series=%s gpt_attempted=%s fallback=%s cache_hits=%s cache_writes=%s incremental=%s",
+        owner_user_id,
+        len(job_payloads),
+        gpt_attempted,
+        gpt_fallbacks,
+        cache_hits,
+        cache_writes,
+        bool(changed_keys),
+    )
+    return {
+        "series_processed": len(job_payloads),
+        "gpt_attempted": gpt_attempted,
+        "gpt_fallbacks": gpt_fallbacks,
+        "cache_hits": cache_hits,
+        "cache_writes": cache_writes,
+    }
 
 
 async def refresh_dp_report_mart(
-    db: AsyncSession, owner_user_id: int | None = None
+    db: AsyncSession,
+    owner_user_id: int | None = None,
+    changed_skus: list[str] | None = None,
 ) -> None:
-    hist_rows = (
+    changed_skus = _normalize_changed_skus(changed_skus)
+    hs_stmt = select(HistoricalSalesMonthly).where(
+        HistoricalSalesMonthly.owner_user_id == owner_user_id
+    )
+    fc_stmt = select(ForecastSalesMonthly).where(
+        ForecastSalesMonthly.owner_user_id == owner_user_id
+    )
+    if changed_skus:
+        hs_stmt = hs_stmt.where(HistoricalSalesMonthly.sku_id.in_(changed_skus))
+        fc_stmt = fc_stmt.where(ForecastSalesMonthly.sku_id.in_(changed_skus))
         await db.execute(
-            select(HistoricalSalesMonthly).where(
-                HistoricalSalesMonthly.owner_user_id == owner_user_id
+            delete(DPReportMart).where(
+                DPReportMart.owner_user_id == owner_user_id,
+                DPReportMart.sku_id.in_(changed_skus),
             )
         )
-    ).scalars().all()
-    fc_rows = (
-        await db.execute(
-            select(ForecastSalesMonthly).where(
-                ForecastSalesMonthly.owner_user_id == owner_user_id
-            )
-        )
-    ).scalars().all()
+    else:
+        await db.execute(delete(DPReportMart).where(DPReportMart.owner_user_id == owner_user_id))
+    hist_rows = (await db.execute(hs_stmt)).scalars().all()
+    fc_rows = (await db.execute(fc_stmt)).scalars().all()
 
-    await db.execute(delete(DPReportMart).where(DPReportMart.owner_user_id == owner_user_id))
     to_insert: list[DPReportMart] = []
 
     for r in hist_rows:
@@ -364,27 +506,28 @@ async def refresh_dp_report_mart(
 
 
 async def refresh_forecast_orders(
-    db: AsyncSession, owner_user_id: int | None = None
+    db: AsyncSession,
+    owner_user_id: int | None = None,
+    changed_skus: list[str] | None = None,
 ) -> None:
-    fc_rows = (
-        await db.execute(
-            select(ForecastSalesMonthly).where(
-                ForecastSalesMonthly.owner_user_id == owner_user_id
-            )
-        )
-    ).scalars().all()
+    changed_skus = _normalize_changed_skus(changed_skus)
+    fc_stmt = select(ForecastSalesMonthly).where(
+        ForecastSalesMonthly.owner_user_id == owner_user_id
+    )
+    if changed_skus:
+        fc_stmt = fc_stmt.where(ForecastSalesMonthly.sku_id.in_(changed_skus))
+    fc_rows = (await db.execute(fc_stmt)).scalars().all()
     pb_rows = (
         await db.execute(
             select(ProductBranch).where(ProductBranch.owner_user_id == owner_user_id)
         )
     ).scalars().all()
-    hist_rows = (
-        await db.execute(
-            select(HistoricalSalesMonthly).where(
-                HistoricalSalesMonthly.owner_user_id == owner_user_id
-            )
-        )
-    ).scalars().all()
+    hs_stmt = select(HistoricalSalesMonthly).where(
+        HistoricalSalesMonthly.owner_user_id == owner_user_id
+    )
+    if changed_skus:
+        hs_stmt = hs_stmt.where(HistoricalSalesMonthly.sku_id.in_(changed_skus))
+    hist_rows = (await db.execute(hs_stmt)).scalars().all()
 
     pb_norm = {(r.sku_id, r.branch_id): float(r.stock_norm) for r in pb_rows}
 
@@ -406,9 +549,17 @@ async def refresh_forecast_orders(
             else row.baseline_forecast_quantity_in_mc
         )
 
-    await db.execute(
-        delete(ForecastOrders).where(ForecastOrders.owner_user_id == owner_user_id)
-    )
+    if changed_skus:
+        await db.execute(
+            delete(ForecastOrders).where(
+                ForecastOrders.owner_user_id == owner_user_id,
+                ForecastOrders.sku_id.in_(changed_skus),
+            )
+        )
+    else:
+        await db.execute(
+            delete(ForecastOrders).where(ForecastOrders.owner_user_id == owner_user_id)
+        )
     inserts: list[ForecastOrders] = []
 
     for sku_id, date_map in by_sku_date_branch.items():
@@ -462,9 +613,9 @@ async def refresh_forecast_orders(
                     sku_id=sku_id,
                     date=d,
                     month_prior_available_stock=_round2(month_prior_stock) or 0.0,
-                    average_l3m_quantity_in_mc=_round2(avg_l3) or 0.0,
-                    average_f3m_quantity_in_mc=_round2(avg_f3) or 0.0,
-                    recommended_quantity_in_mc=_round2(rec_total) or 0.0,
+                    average_l3m_quantity_in_mc=float(_round_qty(avg_l3)),
+                    average_f3m_quantity_in_mc=float(_round_qty(avg_f3)),
+                    recommended_quantity_in_mc=float(_round_qty(rec_total)),
                     adjusted_quantity_in_mc=None,
                     owner_user_id=owner_user_id or 0,
                 )
@@ -788,11 +939,81 @@ async def refresh_dp_vertical(db: AsyncSession, owner_user_id: int | None = None
 
 
 async def refresh_all_materialized(
-    db: AsyncSession, owner_user_id: int | None = None
+    db: AsyncSession,
+    owner_user_id: int | None = None,
+    changed_keys: list[tuple[str, str]] | None = None,
 ) -> None:
-    await refresh_forecast_sales_monthly(db, owner_user_id=owner_user_id)
-    await refresh_dp_report_mart(db, owner_user_id=owner_user_id)
-    await refresh_forecast_orders(db, owner_user_id=owner_user_id)
+    changed_keys = _normalize_changed_keys(changed_keys)
+    changed_skus = (
+        sorted({sku_id for sku_id, _branch_id in changed_keys}) if changed_keys else None
+    )
+    use_incremental = bool(
+        settings.INCREMENTAL_REFRESH_ENABLED and changed_keys and len(changed_keys) > 0
+    )
+
+    stage_start = time.perf_counter()
+    forecast_stats = await refresh_forecast_sales_monthly(
+        db,
+        owner_user_id=owner_user_id,
+        changed_keys=changed_keys if use_incremental else None,
+    )
+    logger.info(
+        "refresh_all_materialized stage=forecast_sales owner=%s elapsed_ms=%s incremental=%s",
+        owner_user_id,
+        round((time.perf_counter() - stage_start) * 1000, 1),
+        use_incremental,
+    )
+
+    stage_start = time.perf_counter()
+    await refresh_dp_report_mart(
+        db,
+        owner_user_id=owner_user_id,
+        changed_skus=changed_skus if use_incremental else None,
+    )
+    logger.info(
+        "refresh_all_materialized stage=dp_report owner=%s elapsed_ms=%s incremental=%s",
+        owner_user_id,
+        round((time.perf_counter() - stage_start) * 1000, 1),
+        use_incremental,
+    )
+
+    stage_start = time.perf_counter()
+    await refresh_forecast_orders(
+        db,
+        owner_user_id=owner_user_id,
+        changed_skus=changed_skus if use_incremental else None,
+    )
+    logger.info(
+        "refresh_all_materialized stage=forecast_orders owner=%s elapsed_ms=%s incremental=%s",
+        owner_user_id,
+        round((time.perf_counter() - stage_start) * 1000, 1),
+        use_incremental,
+    )
+
+    # Inventory/distribution stay full-rebuild for correctness guardrails.
+    stage_start = time.perf_counter()
     await refresh_inventory_health(db, owner_user_id=owner_user_id)
+    logger.info(
+        "refresh_all_materialized stage=inventory_health owner=%s elapsed_ms=%s incremental=false",
+        owner_user_id,
+        round((time.perf_counter() - stage_start) * 1000, 1),
+    )
+
+    stage_start = time.perf_counter()
     await refresh_branch_distribution(db, owner_user_id=owner_user_id)
+    logger.info(
+        "refresh_all_materialized stage=branch_distribution owner=%s elapsed_ms=%s incremental=false",
+        owner_user_id,
+        round((time.perf_counter() - stage_start) * 1000, 1),
+    )
+    logger.info(
+        "refresh_all_materialized completed owner=%s incremental=%s forecast_series=%s gpt_attempted=%s gpt_fallbacks=%s cache_hits=%s cache_writes=%s",
+        owner_user_id,
+        use_incremental,
+        forecast_stats.get("series_processed", 0),
+        forecast_stats.get("gpt_attempted", 0),
+        forecast_stats.get("gpt_fallbacks", 0),
+        forecast_stats.get("cache_hits", 0),
+        forecast_stats.get("cache_writes", 0),
+    )
 

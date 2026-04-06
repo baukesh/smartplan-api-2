@@ -8,6 +8,7 @@ from sqlalchemy import Select, exists, or_, select
 from app.api.date_params import parse_query_date
 from app.api.deps import CurrentUser, DBSession, is_admin, require_roles
 from app.core.branch_localization import localize_branch_name
+from app.models.data_uploads import Branch
 from app.models.reporting import DPReport, DPReportAccess
 from app.models.user import User, UserRole
 from app.services.reporting_service import (
@@ -199,11 +200,22 @@ def _project_tables_for_view_type(
     forecast_table: list[dict],
     view_type: str,
 ) -> tuple[list[dict], list[dict]]:
+    normalized_view = (view_type or "").strip().lower()
     suffix = _view_metric_suffix(view_type)
     fact_key = f"fact_{suffix}"
     target_key = f"target_{suffix}"
     baseline_key = f"baseline_forecast_{suffix}"
     adjusted_key = f"adjusted_forecast_{suffix}"
+    historical_stock_key = (
+        "past_available_stock_amount_kzt"
+        if normalized_view == "dsp"
+        else "past_available_stock"
+    )
+    forecast_stock_key = (
+        "future_available_stock_amount_kzt"
+        if normalized_view == "dsp"
+        else "future_available_stock"
+    )
 
     projected_historical: list[dict] = []
     for row in historical_table:
@@ -212,7 +224,7 @@ def _project_tables_for_view_type(
                 "period": row.get("period"),
                 "fact_value": round(float(row.get(fact_key, 0.0) or 0.0), 2),
                 "target_value": round(float(row.get(target_key, 0.0) or 0.0), 2),
-                "past_available_stock": round(float(row.get("past_available_stock", 0.0) or 0.0), 2),
+                "past_available_stock": round(float(row.get(historical_stock_key, 0.0) or 0.0), 2),
             }
         )
 
@@ -225,7 +237,7 @@ def _project_tables_for_view_type(
                 "adjusted_forecast_value": round(
                     float(row.get(adjusted_key, row.get(baseline_key, 0.0)) or 0.0), 2
                 ),
-                "future_available_stock": round(float(row.get("future_available_stock", 0.0) or 0.0), 2),
+                "future_available_stock": round(float(row.get(forecast_stock_key, 0.0) or 0.0), 2),
             }
         )
 
@@ -248,6 +260,20 @@ def _visible_reports_stmt(user: User) -> Select:
 async def _get_accessible_report(db: DBSession, user: User, report_id: int) -> DPReport | None:
     result = await db.execute(_visible_reports_stmt(user).where(DPReport.id == report_id))
     return result.scalar_one_or_none()
+
+
+async def _branch_options_for_owner(db: DBSession, owner_user_id: int) -> list[str]:
+    branch_rows = (
+        await db.execute(
+            select(Branch.branch_name).where(Branch.owner_user_id == owner_user_id)
+        )
+    ).all()
+    values = {
+        str(localize_branch_name(name) or name).strip()
+        for (name,) in branch_rows
+        if name is not None and str(name).strip()
+    }
+    return sorted(values)
 
 
 def _clean_list(values: list[str] | None) -> list[str]:
@@ -321,6 +347,7 @@ def _effective_filters_from_overrides(
     subline: list[str] | None,
     branch_name: list[str] | None,
 ) -> tuple[dict, list[str]]:
+    saved_branch_fallback = list(saved_branch_filter or saved_product_filter.get("branch_filter", []) or [])
     product_filter = {
         "sku_codes": list(saved_product_filter.get("sku_codes", []) or []),
         "brands": list(saved_product_filter.get("brands", []) or []),
@@ -341,7 +368,7 @@ def _effective_filters_from_overrides(
 
     if branch_name is None:
         effective_branch_filter = [
-            str(localize_branch_name(v) or v) for v in list(saved_branch_filter)
+            str(localize_branch_name(v) or v) for v in saved_branch_fallback
         ]
     else:
         effective_branch_filter = [
@@ -401,12 +428,14 @@ async def _build_report_detail(
             view_type=ctx.view_type,
         )
     card = report_card_payload(report)
+    branch_options = await _branch_options_for_owner(db, owner_user_id)
+    response_branch_filter = list(ctx.branch_filter or branch_options)
     return {
         "report": {
             "report_id": card["report_id"],
             "report_name": card["report_name"],
             "product_filter": ProductFilterPayload(**ctx.product_filter),
-            "branch_filter": ctx.branch_filter,
+            "branch_filter": response_branch_filter,
             "view_type": ctx.view_type,
             "date_from": ctx.date_from,
             "date_to": ctx.date_to,
@@ -480,7 +509,7 @@ async def get_new_report_template(
             report_id=0,
             report_name="New Demand Planning Report",
             product_filter=ProductFilterPayload(),
-            branch_filter=[],
+            branch_filter=await _branch_options_for_owner(db, user.id),
             view_type="cases",
             date_from=ctx.date_from,
             date_to=ctx.date_to,
@@ -635,7 +664,7 @@ async def preview_report(
             report_id=preview_report_id or 0,
             report_name=report_name,
             product_filter=ProductFilterPayload(**ctx.product_filter),
-            branch_filter=ctx.branch_filter,
+            branch_filter=list(ctx.branch_filter or await _branch_options_for_owner(db, owner_user_id)),
             view_type=ctx.view_type,
             date_from=ctx.date_from,
             date_to=ctx.date_to,

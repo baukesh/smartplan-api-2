@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 
 from sqlalchemy import Date, Float, String
 from sqlalchemy.orm import Mapped, mapped_column
@@ -141,4 +141,18 @@ class DistributionSkuAdjustment(Base, TimestampMixin):
     sku_id: Mapped[str] = mapped_column(String(64), index=True)
     adjusted_quantity_in_mc: Mapped[float] = mapped_column(Float)
     owner_user_id: Mapped[int] = mapped_column(index=True)
+
+
+class ForecastInferenceCache(Base, TimestampMixin):
+    __tablename__ = "forecast_inference_cache"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    owner_user_id: Mapped[int] = mapped_column(index=True)
+    sku_id: Mapped[str] = mapped_column(String(64), index=True)
+    branch_id: Mapped[str] = mapped_column(String(64), index=True)
+    model_name: Mapped[str] = mapped_column(String(128), index=True)
+    schema_version: Mapped[str] = mapped_column(String(32), index=True)
+    payload_hash: Mapped[str] = mapped_column(String(128), index=True)
+    forecast_values_json: Mapped[str] = mapped_column(String(8000))
+    expires_at: Mapped[datetime] = mapped_column(index=True)
 

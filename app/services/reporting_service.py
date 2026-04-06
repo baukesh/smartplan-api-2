@@ -10,7 +10,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.branch_localization import normalize_branch_lookup
-from app.models.data_uploads import Branch, HistoricalSalesMonthly, Product
+from app.models.data_uploads import Branch, HistoricalSalesMonthly, PriceList, Product
 from app.models.derived import ForecastSalesMonthly
 from app.models.reporting import DPReport, DPReportForecastOverride
 
@@ -41,6 +41,10 @@ class ReportingContext:
 
 def _month_start(d: date) -> date:
     return d.replace(day=1)
+
+
+def _qty_int(value: float | None) -> int:
+    return int(round(float(value or 0.0)))
 
 
 def _add_months(d: date, months: int) -> date:
@@ -246,6 +250,24 @@ async def build_report_tables(
     report_id: int | None = None,
 ) -> tuple[list[dict], list[dict]]:
     product_map, branch_name_by_id = await _load_owner_maps(db, owner_user_id)
+    price_rows = (
+        await db.execute(select(PriceList).where(PriceList.owner_user_id == owner_user_id))
+    ).scalars().all()
+    prices_by_sku: dict[str, list[PriceList]] = defaultdict(list)
+    for row in price_rows:
+        prices_by_sku[str(row.sku_id)].append(row)
+    for sku_id in prices_by_sku:
+        prices_by_sku[sku_id].sort(key=lambda x: x.date)
+
+    def _closest_dsp(sku_id: str, target_month: date) -> float:
+        prices = prices_by_sku.get(str(sku_id), [])
+        best: PriceList | None = None
+        for p in prices:
+            p_month = _month_start(p.date)
+            if p_month <= target_month:
+                if best is None or _month_start(best.date) < p_month:
+                    best = p
+        return float(best.dsp or 0.0) if best is not None else 0.0
 
     hist_rows = (
         await db.execute(
@@ -277,6 +299,17 @@ async def build_report_tables(
             "sku_name": product.sku_name,
         }
         key = _key_tuple(payload)
+        fact_qty = float(r.fact_quantity_in_mc or 0.0)
+        target_qty = float(r.target_quantity_in_mc or 0.0)
+        fact_amount = float(r.fact_amount_kzt or 0.0)
+        target_amount = float(r.target_amount_kzt or 0.0)
+        if abs(fact_amount) < 1e-9 or abs(target_amount) < 1e-9:
+            dsp = _closest_dsp(r.sku_id, _month_start(r.date))
+            pieces = float(product.pieces_in_master_carton or 0.0)
+            if abs(fact_amount) < 1e-9:
+                fact_amount = fact_qty * pieces * dsp
+            if abs(target_amount) < 1e-9:
+                target_amount = target_qty * pieces * dsp
         if key not in hist_buckets:
             hist_buckets[key] = {
                 **payload,
@@ -289,17 +322,21 @@ async def build_report_tables(
                 "target_volume_cbm": 0.0,
                 "target_amount_kzt": 0.0,
                 "past_available_stock": 0.0,
+                "past_available_stock_amount_kzt": 0.0,
             }
         bucket = hist_buckets[key]
-        bucket["fact_quantity_in_mc"] += float(r.fact_quantity_in_mc or 0.0)
+        dsp = _closest_dsp(r.sku_id, _month_start(r.date))
+        stock_mc = float(r.past_available_stock or 0.0)
+        bucket["fact_quantity_in_mc"] += fact_qty
         bucket["fact_gross_weight_kg"] += float(r.fact_gross_weight_kg or 0.0)
         bucket["fact_volume_cbm"] += float(r.fact_volume_cbm or 0.0)
-        bucket["fact_amount_kzt"] += float(r.fact_amount_kzt or 0.0)
-        bucket["target_quantity_in_mc"] += float(r.target_quantity_in_mc or 0.0)
+        bucket["fact_amount_kzt"] += fact_amount
+        bucket["target_quantity_in_mc"] += target_qty
         bucket["target_gross_weight_kg"] += float(r.target_gross_weight_kg or 0.0)
         bucket["target_volume_cbm"] += float(r.target_volume_cbm or 0.0)
-        bucket["target_amount_kzt"] += float(r.target_amount_kzt or 0.0)
-        bucket["past_available_stock"] += float(r.past_available_stock or 0.0)
+        bucket["target_amount_kzt"] += target_amount
+        bucket["past_available_stock"] += stock_mc
+        bucket["past_available_stock_amount_kzt"] += stock_mc * float(product.pieces_in_master_carton or 0.0) * dsp
 
     historical_table = _aggregate_period_totals(
         list(hist_buckets.values()),
@@ -313,6 +350,7 @@ async def build_report_tables(
             "target_volume_cbm",
             "target_amount_kzt",
             "past_available_stock",
+            "past_available_stock_amount_kzt",
         ],
     )
 
@@ -345,15 +383,24 @@ async def build_report_tables(
                 "sub_category": product.sub_category,
                 "subline": product.sub_line,
                 "sku_name": product.sku_name,
-                "baseline_forecast_quantity_in_mc": float(r.baseline_forecast_quantity_in_mc or 0.0),
                 "baseline_forecast_gross_weight_kg": float(r.baseline_forecast_gross_weight_kg or 0.0),
                 "baseline_forecast_volume_cbm": float(r.baseline_forecast_volume_cbm or 0.0),
                 "baseline_forecast_amount_kzt": float(r.baseline_forecast_amount_kzt or 0.0),
-                "adjusted_forecast_quantity_in_mc": float(r.adjusted_forecast_quantity_in_mc) if r.adjusted_forecast_quantity_in_mc is not None else float(r.baseline_forecast_quantity_in_mc or 0.0),
+                "baseline_forecast_quantity_in_mc": _qty_int(r.baseline_forecast_quantity_in_mc),
+                "adjusted_forecast_quantity_in_mc": (
+                    _qty_int(r.adjusted_forecast_quantity_in_mc)
+                    if r.adjusted_forecast_quantity_in_mc is not None
+                    else _qty_int(r.baseline_forecast_quantity_in_mc)
+                ),
                 "adjusted_forecast_gross_weight_kg": float(r.adjusted_forecast_gross_weight_kg) if r.adjusted_forecast_gross_weight_kg is not None else float(r.baseline_forecast_gross_weight_kg or 0.0),
                 "adjusted_forecast_volume_cbm": float(r.adjusted_forecast_volume_cbm) if r.adjusted_forecast_volume_cbm is not None else float(r.baseline_forecast_volume_cbm or 0.0),
                 "adjusted_forecast_amount_kzt": float(r.adjusted_forecast_amount_kzt) if r.adjusted_forecast_amount_kzt is not None else float(r.baseline_forecast_amount_kzt or 0.0),
                 "future_available_stock": float(r.future_available_stock or 0.0),
+                "future_available_stock_amount_kzt": (
+                    float(r.future_available_stock or 0.0)
+                    * float(product.pieces_in_master_carton or 0.0)
+                    * _closest_dsp(r.sku_id, _month_start(r.date))
+                ),
             }
         )
 
@@ -424,6 +471,7 @@ async def build_report_tables(
                 "adjusted_forecast_volume_cbm": 0.0,
                 "adjusted_forecast_amount_kzt": 0.0,
                 "future_available_stock": 0.0,
+                "future_available_stock_amount_kzt": 0.0,
             }
         b = forecast_buckets[key]
         for metric in [
@@ -436,6 +484,7 @@ async def build_report_tables(
             "adjusted_forecast_volume_cbm",
             "adjusted_forecast_amount_kzt",
             "future_available_stock",
+            "future_available_stock_amount_kzt",
         ]:
             b[metric] += float(r[metric] or 0.0)
 
@@ -451,6 +500,7 @@ async def build_report_tables(
             "adjusted_forecast_volume_cbm",
             "adjusted_forecast_amount_kzt",
             "future_available_stock",
+            "future_available_stock_amount_kzt",
         ],
     )
     return historical_table, forecast_table
@@ -467,6 +517,20 @@ async def build_reporting_context(
     date_to: date | None,
 ) -> ReportingContext:
     normalized_view = validate_view_type(view_type)
+    if normalized_view == "dsp":
+        price_exists = (
+            await db.execute(
+                select(PriceList.id).where(PriceList.owner_user_id == owner_user_id).limit(1)
+            )
+        ).first()
+        if price_exists is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    "DSP mode is unavailable until price-list is uploaded. "
+                    "Please upload price-list first."
+                ),
+            )
     resolved_planning = planning_month or await get_current_planning_month(db, owner_user_id)
     default_from, default_to = default_period_for_planning(resolved_planning)
     effective_from = _month_start(date_from or default_from)

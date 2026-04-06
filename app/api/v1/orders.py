@@ -14,7 +14,7 @@ from app.core.order_status import (
     display_order_status,
     normalize_order_status,
 )
-from app.models.data_uploads import PlacedOrder, Product
+from app.models.data_uploads import PlacedOrder, PriceList, Product
 from app.models.derived import OrdersAggregated
 from app.services.orders_aggregation import refresh_orders_aggregated
 
@@ -102,6 +102,15 @@ def _parse_page_size(page_size: str) -> int | None:
     return PAGE_SIZE_MAP[normalized]
 
 
+def _normalize_order_id_input(value: str) -> str:
+    normalized = str(value or "").strip()
+    if normalized.startswith("#"):
+        normalized = normalized[1:].strip()
+    if normalized.startswith("№"):
+        normalized = normalized[1:].strip()
+    return normalized
+
+
 async def _list_aggregated_orders(
     db: DBSession,
     user: CurrentUser,
@@ -123,9 +132,9 @@ async def _list_aggregated_orders(
     if normalized_status_filter:
         stmt = stmt.where(OrdersAggregated.status == normalized_status_filter)
     if parsed_date_from:
-        stmt = stmt.where(OrdersAggregated.creation_date >= parsed_date_from)
+        stmt = stmt.where(OrdersAggregated.receival_date >= parsed_date_from)
     if parsed_date_to:
-        stmt = stmt.where(OrdersAggregated.creation_date <= parsed_date_to)
+        stmt = stmt.where(OrdersAggregated.receival_date <= parsed_date_to)
     size = _parse_page_size(page_size)
     stmt = stmt.order_by(OrdersAggregated.creation_date.desc())
     raw_rows = list((await db.execute(stmt)).scalars().all())
@@ -239,7 +248,8 @@ async def update_order_statuses(
         normalized_status = normalize_order_status(change.status)
         if normalized_status is None:
             continue
-        stmt = update(PlacedOrder).where(PlacedOrder.order_id == change.order_id)
+        normalized_order_id = _normalize_order_id_input(change.order_id)
+        stmt = update(PlacedOrder).where(PlacedOrder.order_id == normalized_order_id)
         if not is_admin(user):
             stmt = stmt.where(PlacedOrder.owner_user_id == user.id)
         result = await db.execute(stmt.values(status=normalized_status))
@@ -254,7 +264,11 @@ async def update_order_statuses(
             for row in (
                 await db.execute(
                     select(PlacedOrder.owner_user_id)
-                    .where(PlacedOrder.order_id.in_([u.order_id for u in payload.updates]))
+                    .where(
+                        PlacedOrder.order_id.in_(
+                            [_normalize_order_id_input(u.order_id) for u in payload.updates]
+                        )
+                    )
                     .distinct()
                 )
             ).all()
@@ -274,7 +288,8 @@ async def get_order_details(
     page: int = Query(1, ge=1),
     page_size: str = Query("10"),
 ) -> OrderDetailsResponse:
-    stmt = select(PlacedOrder).where(PlacedOrder.order_id == order_id)
+    normalized_order_id = _normalize_order_id_input(order_id)
+    stmt = select(PlacedOrder).where(PlacedOrder.order_id == normalized_order_id)
     if not is_admin(user):
         stmt = stmt.where(PlacedOrder.owner_user_id == user.id)
     order_rows = (await db.execute(stmt)).scalars().all()
@@ -288,6 +303,14 @@ async def get_order_details(
             await db.execute(select(Product).where(Product.owner_user_id == owner_user_id))
         ).scalars().all()
     }
+    prices = (
+        await db.execute(select(PriceList).where(PriceList.owner_user_id == owner_user_id))
+    ).scalars().all()
+    prices_by_sku: dict[str, list[PriceList]] = {}
+    for price in prices:
+        prices_by_sku.setdefault(str(price.sku_id), []).append(price)
+    for sku_id in prices_by_sku:
+        prices_by_sku[sku_id].sort(key=lambda x: x.date)
 
     items: list[OrderDetailsRow] = []
     total_amount = 0.0
@@ -295,7 +318,20 @@ async def get_order_details(
         prod = products.get(row.sku_id)
         if not prod:
             continue
-        amount = float(row.amount_kzt or 0.0)
+        sorted_prices = prices_by_sku.get(str(row.sku_id), [])
+        closest_price = None
+        earliest_price = sorted_prices[0] if sorted_prices else None
+        for p in sorted_prices:
+            if p.date <= row.creation_date:
+                closest_price = p
+        selected_price = closest_price if closest_price is not None else earliest_price
+        amount = (
+            float(row.quantity_in_mc or 0.0)
+            * float(prod.pieces_in_master_carton or 0.0)
+            * float(selected_price.dsp or 0.0)
+            if selected_price is not None
+            else 0.0
+        )
         total_amount += amount
         items.append(
             OrderDetailsRow(
@@ -304,13 +340,13 @@ async def get_order_details(
                 quantity_in_mc=float(row.quantity_in_mc or 0.0),
                 gross_weight_kg=float(row.gross_weight_kg) if row.gross_weight_kg is not None else None,
                 volume_cbm=float(row.volume_cbm) if row.volume_cbm is not None else None,
-                amount_kzt=float(row.amount_kzt) if row.amount_kzt is not None else None,
+                amount_kzt=round(amount, 2),
             )
         )
 
     header = sorted(order_rows, key=lambda r: (r.creation_date, r.receival_date))[0]
     agg_stmt = select(OrdersAggregated).where(
-        OrdersAggregated.order_id == order_id,
+        OrdersAggregated.order_id == normalized_order_id,
         OrdersAggregated.owner_user_id == owner_user_id,
     )
     aggregated = (await db.execute(agg_stmt)).scalars().first()
@@ -347,7 +383,8 @@ async def patch_order_details(
     source_order_id: str = Query(...),
     payload: OrderDetailsPatchRequest = ...,
 ) -> dict:
-    stmt = select(PlacedOrder).where(PlacedOrder.order_id == source_order_id)
+    normalized_source_order_id = _normalize_order_id_input(source_order_id)
+    stmt = select(PlacedOrder).where(PlacedOrder.order_id == normalized_source_order_id)
     if not is_admin(user):
         stmt = stmt.where(PlacedOrder.owner_user_id == user.id)
     order_rows = (await db.execute(stmt)).scalars().all()
@@ -355,8 +392,12 @@ async def patch_order_details(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
 
     owner_user_id = order_rows[0].owner_user_id
-    target_order_id = payload.order_id.strip() if payload.order_id else source_order_id
-    if target_order_id != source_order_id:
+    target_order_id = (
+        _normalize_order_id_input(payload.order_id)
+        if payload.order_id
+        else normalized_source_order_id
+    )
+    if target_order_id != normalized_source_order_id:
         exists_stmt = select(PlacedOrder.id).where(
             and_(
                 PlacedOrder.order_id == target_order_id,
@@ -382,7 +423,7 @@ async def patch_order_details(
             detail="No fields to update",
         )
 
-    upd = update(PlacedOrder).where(PlacedOrder.order_id == source_order_id)
+    upd = update(PlacedOrder).where(PlacedOrder.order_id == normalized_source_order_id)
     if not is_admin(user):
         upd = upd.where(PlacedOrder.owner_user_id == user.id)
     result = await db.execute(upd.values(**values))

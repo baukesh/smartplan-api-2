@@ -1,5 +1,5 @@
 from io import BytesIO
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 import logging
 import asyncio
 
@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 UPLOAD_WRITE_LOCK = asyncio.Lock()
 REFRESH_DEBOUNCE_SECONDS = 2
 _pending_refresh_tasks: dict[int, asyncio.Task] = {}
+_pending_refresh_changed_keys: dict[int, set[tuple[str, str]]] = {}
+_refresh_status_by_owner: dict[int, dict] = {}
 
 
 class UploadSpec:
@@ -275,7 +277,12 @@ async def _replace_records(
 
 async def _refresh_materialized_safe(db: AsyncSession, owner_user_id: int) -> str | None:
     try:
-        await refresh_all_materialized(db, owner_user_id=owner_user_id)
+        changed_keys = list(_pending_refresh_changed_keys.get(owner_user_id, set()))
+        await refresh_all_materialized(
+            db,
+            owner_user_id=owner_user_id,
+            changed_keys=changed_keys,
+        )
         return None
     except Exception as exc:
         # Keep upload successful because base rows are already committed.
@@ -289,6 +296,13 @@ async def _refresh_materialized_safe(db: AsyncSession, owner_user_id: int) -> st
 
 async def _refresh_materialized_background(owner_user_id: int) -> None:
     async with AsyncSessionLocal() as session:
+        _refresh_status_by_owner[owner_user_id] = {
+            **_refresh_status_by_owner.get(owner_user_id, {}),
+            "in_progress": True,
+            "stage": "materialized_refresh",
+            "last_started_at": datetime.now(UTC).isoformat(),
+            "last_error": None,
+        }
         error = await _refresh_materialized_safe(session, owner_user_id=owner_user_id)
         if error:
             logger.warning(
@@ -296,6 +310,15 @@ async def _refresh_materialized_background(owner_user_id: int) -> None:
                 owner_user_id,
                 error,
             )
+        else:
+            _pending_refresh_changed_keys.pop(owner_user_id, None)
+        _refresh_status_by_owner[owner_user_id] = {
+            **_refresh_status_by_owner.get(owner_user_id, {}),
+            "in_progress": False,
+            "stage": "idle" if error is None else "failed",
+            "last_error": error,
+            "last_completed_at": datetime.now(UTC).isoformat(),
+        }
 
 
 async def _debounced_materialized_refresh(owner_user_id: int) -> None:
@@ -309,12 +332,81 @@ async def _debounced_materialized_refresh(owner_user_id: int) -> None:
 
 
 def _schedule_materialized_refresh(owner_user_id: int) -> None:
+    _refresh_status_by_owner[owner_user_id] = {
+        **_refresh_status_by_owner.get(owner_user_id, {}),
+        "in_progress": False,
+        "stage": "scheduled",
+        "last_scheduled_at": datetime.now(UTC).isoformat(),
+        "pending_changed_keys_count": len(
+            _pending_refresh_changed_keys.get(owner_user_id, set())
+        ),
+    }
     existing = _pending_refresh_tasks.get(owner_user_id)
     if existing and not existing.done():
         existing.cancel()
     _pending_refresh_tasks[owner_user_id] = asyncio.create_task(
         _debounced_materialized_refresh(owner_user_id)
     )
+
+
+def get_refresh_status(owner_user_id: int) -> dict:
+    return {
+        "in_progress": bool(
+            _refresh_status_by_owner.get(owner_user_id, {}).get("in_progress", False)
+        ),
+        "stage": str(_refresh_status_by_owner.get(owner_user_id, {}).get("stage", "idle")),
+        "last_error": _refresh_status_by_owner.get(owner_user_id, {}).get("last_error"),
+        "last_started_at": _refresh_status_by_owner.get(owner_user_id, {}).get(
+            "last_started_at"
+        ),
+        "last_completed_at": _refresh_status_by_owner.get(owner_user_id, {}).get(
+            "last_completed_at"
+        ),
+        "last_scheduled_at": _refresh_status_by_owner.get(owner_user_id, {}).get(
+            "last_scheduled_at"
+        ),
+        "pending_changed_keys_count": int(
+            _refresh_status_by_owner.get(owner_user_id, {}).get(
+                "pending_changed_keys_count", 0
+            )
+        ),
+    }
+
+
+async def _expand_changed_keys(
+    db: AsyncSession,
+    owner_user_id: int,
+    direct_keys: list[tuple[str, str]] | None = None,
+    sku_ids: list[str] | None = None,
+) -> list[tuple[str, str]]:
+    collected: set[tuple[str, str]] = set()
+    for sku_id, branch_id in direct_keys or []:
+        s = str(sku_id).strip()
+        b = str(branch_id).strip()
+        if s and b:
+            collected.add((s, b))
+    normalized_skus = sorted({str(s).strip() for s in (sku_ids or []) if str(s).strip()})
+    if normalized_skus:
+        rows = (
+            await db.execute(
+                select(ProductBranch).where(
+                    ProductBranch.owner_user_id == owner_user_id,
+                    ProductBranch.sku_id.in_(normalized_skus),
+                )
+            )
+        ).scalars().all()
+        for row in rows:
+            collected.add((str(row.sku_id).strip(), str(row.branch_id).strip()))
+    return sorted(collected)
+
+
+def _accumulate_changed_keys(owner_user_id: int, changed_keys: list[tuple[str, str]]) -> None:
+    bucket = _pending_refresh_changed_keys.setdefault(owner_user_id, set())
+    for sku_id, branch_id in changed_keys:
+        s = str(sku_id).strip()
+        b = str(branch_id).strip()
+        if s and b:
+            bucket.add((s, b))
 
 
 async def _resolve_branch_ids(
@@ -457,6 +549,12 @@ async def upload_assortment(
         r["source"] = normalize_source_value(r.get("source"))
         r["owner_user_id"] = owner_user_id
     count = await _replace_records(db, Product, records, owner_user_id=owner_user_id)
+    changed_keys = await _expand_changed_keys(
+        db,
+        owner_user_id=owner_user_id,
+        sku_ids=[str(r.get("sku_id", "")) for r in records],
+    )
+    _accumulate_changed_keys(owner_user_id, changed_keys)
     return {
         "rows_inserted": count,
         "refresh_status": "deferred_until_orders_upload",
@@ -532,6 +630,11 @@ async def upload_branch_stock_norm(
         r["current_stock"] = float(r["current_stock"])
         r["stock_norm"] = float(r["stock_norm"])
         r["owner_user_id"] = owner_user_id
+    changed_keys = [
+        (str(r.get("sku_id", "")).strip(), str(r.get("branch_id", "")).strip())
+        for r in records
+    ]
+    _accumulate_changed_keys(owner_user_id, changed_keys)
     count = await _replace_records(
         db,
         ProductBranch,
@@ -556,6 +659,13 @@ async def upload_price_list(
     if errors:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=errors)
     rows = df[PRICE_LIST_SPEC.required_columns].copy()
+    products = {
+        p.sku_id: p
+        for p in (
+            await db.execute(select(Product).where(Product.owner_user_id == owner_user_id))
+        ).scalars().all()
+    }
+    products_by_code = {str(p.sku_code).strip(): p for p in products.values()}
     row_errors: list[dict] = []
     records: list[dict] = []
     for idx, row in rows.iterrows():
@@ -564,12 +674,27 @@ async def upload_price_list(
         except Exception as exc:
             row_errors.append(_row_error(int(idx), "date", str(exc)))
             continue
-        sku_id = str(row["sku_id"]).strip()
-        if not sku_id:
+        raw_sku_value = str(row["sku_id"]).strip()
+        if not raw_sku_value:
             row_errors.append(
                 _row_error(int(idx), "sku_id", "sku_id cannot be empty", error_type="required_field")
             )
             continue
+        product = products.get(raw_sku_value) or products_by_code.get(raw_sku_value)
+        if product is None:
+            row_errors.append(
+                _row_error(
+                    int(idx),
+                    "sku_id",
+                    (
+                        f"Product not found for sku_id='{raw_sku_value}'. "
+                        "Provide a valid sku_id or sku_code in the sku_id column."
+                    ),
+                    error_type="foreign_key_missing",
+                )
+            )
+            continue
+        sku_id = str(product.sku_id).strip()
         try:
             invoice_price = float(row["invoice_price"])
         except Exception:
@@ -594,6 +719,12 @@ async def upload_price_list(
     count = await _replace_records(
         db, PriceList, records, owner_user_id=owner_user_id
     )
+    changed_keys = await _expand_changed_keys(
+        db,
+        owner_user_id=owner_user_id,
+        sku_ids=[str(r.get("sku_id", "")) for r in records],
+    )
+    _accumulate_changed_keys(owner_user_id, changed_keys)
     return {
         "rows_inserted": count,
         "refresh_status": "deferred_until_orders_upload",
@@ -843,6 +974,11 @@ async def upload_historical_sales_monthly(
     count = await _replace_records(
         db, HistoricalSalesMonthly, prepared, owner_user_id=owner_user_id
     )
+    changed_keys = [
+        (str(r.get("sku_id", "")).strip(), str(r.get("branch_id", "")).strip())
+        for r in prepared
+    ]
+    _accumulate_changed_keys(owner_user_id, changed_keys)
     return {
         "rows_inserted": count,
         "refresh_status": "deferred_until_orders_upload",
@@ -982,6 +1118,12 @@ async def upload_placed_orders(
         )
 
     count = await _replace_records(db, PlacedOrder, prepared, owner_user_id=owner_user_id)
+    changed_keys = await _expand_changed_keys(
+        db,
+        owner_user_id=owner_user_id,
+        sku_ids=[str(r.get("sku_id", "")) for r in prepared],
+    )
+    _accumulate_changed_keys(owner_user_id, changed_keys)
     await refresh_orders_aggregated(db, owner_user_id=owner_user_id)
     _schedule_materialized_refresh(owner_user_id)
     return {

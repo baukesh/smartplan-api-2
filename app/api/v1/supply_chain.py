@@ -23,17 +23,17 @@ class SupplyChainRow(BaseModel):
     sku_code: str
     sku_name: str
     month_prior_available_stock: float
-    average_l3m_quantity_in_mc: float
-    average_f3m_quantity_in_mc: float
-    recommended_quantity_in_mc: float
-    adjusted_quantity_in_mc: float | None = None
+    average_l3m_quantity_in_mc: int
+    average_f3m_quantity_in_mc: int
+    recommended_quantity_in_mc: int
+    adjusted_quantity_in_mc: int | None = None
 
 
 class SupplyChainListResponse(BaseModel):
     period: str
     items: list[SupplyChainRow]
     total_sum: float
-    total_quantity_in_mc: float
+    total_quantity_in_mc: int
     total_gross_weight: float
     total_volume: float
     total_items: int
@@ -42,7 +42,7 @@ class SupplyChainListResponse(BaseModel):
 
 class SupplyChainAdjustRow(BaseModel):
     sku_code: str
-    adjusted_quantity_in_mc: float | None = None
+    adjusted_quantity_in_mc: int | None = None
 
 
 class SupplyChainAdjustRequest(BaseModel):
@@ -63,6 +63,10 @@ class SupplyChainFilterOptionsResponse(BaseModel):
 
 def _month_start(d: date) -> date:
     return d.replace(day=1)
+
+
+def _qty_int(value: float | None) -> int:
+    return int(round(float(value or 0.0)))
 
 
 def _period_to_date(period: str) -> date:
@@ -187,10 +191,14 @@ async def _load_supply_rows(
             sku_code=product_by_sku[r.sku_id].sku_code,
             sku_name=product_by_sku[r.sku_id].sku_name,
             month_prior_available_stock=float(r.month_prior_available_stock),
-            average_l3m_quantity_in_mc=float(r.average_l3m_quantity_in_mc),
-            average_f3m_quantity_in_mc=float(r.average_f3m_quantity_in_mc),
-            recommended_quantity_in_mc=float(r.recommended_quantity_in_mc),
-            adjusted_quantity_in_mc=float(r.adjusted_quantity_in_mc) if r.adjusted_quantity_in_mc is not None else None,
+            average_l3m_quantity_in_mc=_qty_int(r.average_l3m_quantity_in_mc),
+            average_f3m_quantity_in_mc=_qty_int(r.average_f3m_quantity_in_mc),
+            recommended_quantity_in_mc=_qty_int(r.recommended_quantity_in_mc),
+            adjusted_quantity_in_mc=(
+                _qty_int(r.adjusted_quantity_in_mc)
+                if r.adjusted_quantity_in_mc is not None
+                else None
+            ),
         )
         for r in fo_rows
         if r.sku_id in product_by_sku
@@ -205,7 +213,7 @@ async def _compute_supply_totals(
     period_date: date,
     product_by_sku: dict[str, Product],
     fo_by_sku: dict[str, ForecastOrders],
-) -> tuple[float, float, float, float]:
+) -> tuple[float, int, float, float]:
     if not fo_by_sku:
         return 0.0, 0.0, 0.0, 0.0
 
@@ -218,7 +226,7 @@ async def _compute_supply_totals(
         prices_by_sku.setdefault(p.sku_id, []).append(p)
 
     total_sum = 0.0
-    total_quantity = 0.0
+    total_quantity = 0
     total_gross_weight = 0.0
     total_volume = 0.0
     for sku_id, fo in fo_by_sku.items():
@@ -226,9 +234,9 @@ async def _compute_supply_totals(
         if not product:
             continue
         quantity = (
-            float(fo.adjusted_quantity_in_mc)
+            _qty_int(fo.adjusted_quantity_in_mc)
             if fo.adjusted_quantity_in_mc is not None
-            else float(fo.recommended_quantity_in_mc)
+            else _qty_int(fo.recommended_quantity_in_mc)
         )
         dsp = _closest_dsp_for_period(prices_by_sku.get(sku_id, []), period_date)
         total_quantity += quantity
@@ -238,7 +246,7 @@ async def _compute_supply_totals(
 
     return (
         round(total_sum, 2),
-        round(total_quantity, 2),
+        int(total_quantity),
         round(total_gross_weight, 2),
         round(total_volume, 2),
     )
@@ -387,7 +395,13 @@ async def update_adjusted_quantities(
                     ForecastOrders.sku_id == sku_id,
                     ForecastOrders.date == period_date,
                 )
-                .values(adjusted_quantity_in_mc=row.adjusted_quantity_in_mc)
+                .values(
+                    adjusted_quantity_in_mc=(
+                        int(row.adjusted_quantity_in_mc)
+                        if row.adjusted_quantity_in_mc is not None
+                        else None
+                    )
+                )
             )
             result = await db.execute(stmt)
             updated += int(result.rowcount or 0)

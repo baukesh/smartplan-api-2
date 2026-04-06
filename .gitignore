@@ -40,6 +40,8 @@ htmlcov/
 
 # Local databases
 smartplan.db
+smartplan.db-wal
+smartplan.db-shm
 
 # Logs
 *.log

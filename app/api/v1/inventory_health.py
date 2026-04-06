@@ -22,7 +22,7 @@ class InventoryHealthTableRow(BaseModel):
     abc_category: str
     sales_value: float
     share_percent: float
-    health_index: float
+    health_index: int
 
 
 class InventoryHealthTableResponse(BaseModel):
@@ -39,7 +39,7 @@ class CategorySummaryRow(BaseModel):
     sales_share_percent: float
     total_sales_value: float
     share_of_stock: float
-    category_health_index: float
+    category_health_index: int
 
 
 class TopSkuShareRow(BaseModel):
@@ -428,7 +428,7 @@ def _build_category_summary(
         sales_share_percent=round(sales_share_percent, 1),
         total_sales_value=round(category_sales_value, 2),
         share_of_stock=round(share_of_stock, 2),
-        category_health_index=round(category_health_index, 2),
+        category_health_index=int(round(category_health_index)),
     )
 
 
@@ -487,7 +487,7 @@ async def get_inventory_health_table(
             abc_category=m.abc_category,
             sales_value=round(m.sales_dsp if _normalize_view_type(view_type) == "dsp" else m.sales_qty, 2),
             share_percent=round(m.share_percent, 2),
-            health_index=round(m.health_index, 2),
+            health_index=int(round(m.health_index)),
         )
         for m in metrics
     ]

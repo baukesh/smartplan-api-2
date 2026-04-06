@@ -7,6 +7,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, DBSession
+from app.api.v1.uploads import get_refresh_status
 from app.core.security import (
     create_access_token,
     create_refresh_token,
@@ -32,6 +33,18 @@ class UserInfoOut(BaseModel):
     isSupplyChainCreated: bool
     isDistributionCreated: bool
     isReportsCreated: bool
+    assortmentReady: bool
+    ordersReady: bool
+    forecastReady: bool
+    inventoryReady: bool
+    distributionReady: bool
+    refreshInProgress: bool
+    refreshStage: str
+    refreshLastError: str | None
+    refreshLastStartedAt: str | None
+    refreshLastCompletedAt: str | None
+    refreshLastScheduledAt: str | None
+    pendingChangedKeysCount: int
 
 
 @router.post("/register", response_model=UserOut, status_code=status.HTTP_201_CREATED)
@@ -134,6 +147,7 @@ async def user_info(db: DBSession, user: CurrentUser) -> UserInfoOut:
     is_distribution_created = is_supply_chain_created and branch_distribution_count > 0
     # Final stage: reports mart is ready.
     is_reports_created = is_distribution_created and report_mart_count > 0
+    refresh_status = get_refresh_status(owner_user_id)
 
     return {
         "username": user.email,
@@ -146,5 +160,17 @@ async def user_info(db: DBSession, user: CurrentUser) -> UserInfoOut:
         "isSupplyChainCreated": is_supply_chain_created,
         "isDistributionCreated": is_distribution_created,
         "isReportsCreated": is_reports_created,
+        "assortmentReady": is_assortment_created,
+        "ordersReady": is_orders_created,
+        "forecastReady": forecast_orders_count > 0,
+        "inventoryReady": inventory_health_count > 0,
+        "distributionReady": branch_distribution_count > 0,
+        "refreshInProgress": bool(refresh_status.get("in_progress", False)),
+        "refreshStage": str(refresh_status.get("stage", "idle")),
+        "refreshLastError": refresh_status.get("last_error"),
+        "refreshLastStartedAt": refresh_status.get("last_started_at"),
+        "refreshLastCompletedAt": refresh_status.get("last_completed_at"),
+        "refreshLastScheduledAt": refresh_status.get("last_scheduled_at"),
+        "pendingChangedKeysCount": int(refresh_status.get("pending_changed_keys_count", 0)),
     }
 

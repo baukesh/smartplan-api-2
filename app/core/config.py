@@ -40,8 +40,12 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = ""
     OPENAI_BASE_URL: str = "https://api.openai.com/v1"
     OPENAI_FORECAST_MODEL: str = "gpt-4o-mini"
-    OPENAI_FORECAST_MAX_CONCURRENCY: int = 4
+    OPENAI_FORECAST_MAX_CONCURRENCY: int = 8
     OPENAI_FORECAST_TIMEOUT_SECONDS: float = 15.0
+    FORECAST_CACHE_TTL_HOURS: int = 168
+    FORECAST_CACHE_SCHEMA_VERSION: str = "v1"
+    PERSISTENT_FORECAST_CACHE_ENABLED: bool = True
+    INCREMENTAL_REFRESH_ENABLED: bool = False
 
 
 @lru_cache

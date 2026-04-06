@@ -23,12 +23,13 @@ class DistributionAggregateRow(BaseModel):
     available_volume_cbm_per_branch: float
     available_gross_weight_kg_per_branch: float
     available_amount_kzt_per_branch: float
-    recommended_quantity_in_mc_per_branch: float
+    recommended_quantity_in_mc_per_branch: int
     recommended_volume_cbm_per_branch: float
     recommended_gross_weight_kg_per_branch: float
     recommended_amount_kzt_per_branch: float
-    adjusted_quantity_in_mc_per_branch: float
+    adjusted_quantity_in_mc_per_branch: int
     branch_health_index: int
+    branch_health_index_label: str
 
 
 class DistributionAggregateResponse(BaseModel):
@@ -49,10 +50,10 @@ class DistributionDetailRow(BaseModel):
     sku_name: str
     total_available_quantity_in_mc: float
     available_quantity_in_mc: float
-    average_l3m_quantity_in_mc: float
-    average_f3m_quantity_in_mc: float
-    recommended_quantity_in_mc: float
-    adjusted_quantity_in_mc: float | None = None
+    average_l3m_quantity_in_mc: int
+    average_f3m_quantity_in_mc: int
+    recommended_quantity_in_mc: int
+    adjusted_quantity_in_mc: int | None = None
 
 
 class DistributionDetailsResponse(BaseModel):
@@ -65,7 +66,7 @@ class DistributionDetailsResponse(BaseModel):
 
 class DistributionBranchAdjustRow(BaseModel):
     branch_name: str
-    adjusted_quantity_in_mc_per_branch: float
+    adjusted_quantity_in_mc_per_branch: int
 
 
 class DistributionBranchAdjustRequest(BaseModel):
@@ -74,8 +75,8 @@ class DistributionBranchAdjustRequest(BaseModel):
 
 class DistributionSkuAdjustRow(BaseModel):
     sku_code: str
-    adjusted_quantity_in_mc: float | None = None
-    adjusted_quantity_in_mc_per_branch: float | None = None
+    adjusted_quantity_in_mc: int | None = None
+    adjusted_quantity_in_mc_per_branch: int | None = None
 
 
 class DistributionSkuAdjustRequest(BaseModel):
@@ -95,12 +96,12 @@ class _SkuBranchCalc(BaseModel):
     master_carton_volume_cbm: float
     master_carton_gross_weight_kg: float
     dsp: float
-    avg_l3m: float
-    avg_f3m: float
-    recommended_quantity: float
+    avg_l3m: int
+    avg_f3m: int
+    recommended_quantity: int
     sales_share: float
     future_health_index: float
-    adjusted_detail_quantity: float | None = None
+    adjusted_detail_quantity: int | None = None
 
 
 def _parse_page_size(page_size: str) -> int | None:
@@ -127,6 +128,10 @@ def _month_start(d: date) -> date:
     return d.replace(day=1)
 
 
+def _qty_int(value: float | None) -> int:
+    return int(round(float(value or 0.0)))
+
+
 def _add_months(d: date, months: int) -> date:
     year = d.year + (d.month - 1 + months) // 12
     month = (d.month - 1 + months) % 12 + 1
@@ -135,6 +140,14 @@ def _add_months(d: date, months: int) -> date:
 
 def _branch_name_matches(query_value: str, branch_name: str, branch_id: str) -> bool:
     return normalize_branch_lookup(query_value) == normalize_branch_lookup(branch_name) or str(query_value).strip() == str(branch_id).strip()
+
+
+def _branch_health_index_label(index_value: float) -> str:
+    if 90 <= index_value <= 110:
+        return "Здоровый"
+    if (70 <= index_value < 90) or (110 < index_value <= 130):
+        return "Нормальный"
+    return "Критический"
 
 
 async def _resolve_planning_date(db: DBSession, user: CurrentUser) -> date:
@@ -232,7 +245,7 @@ async def _build_distribution_calc(
     }
 
     detail_adjustment_map = {
-        (a.owner_user_id, a.branch_id, a.sku_id): float(a.adjusted_quantity_in_mc)
+        (a.owner_user_id, a.branch_id, a.sku_id): _qty_int(a.adjusted_quantity_in_mc)
         for a in detail_adjustments
     }
 
@@ -247,13 +260,13 @@ async def _build_distribution_calc(
         dsp = _pick_dsp(prices, planning_date)
         avg_l3m_vals = l3_by_key.get((pb.owner_user_id, pb.sku_id, pb.branch_id), [])
         avg_f3m_vals = f3_by_key.get((pb.owner_user_id, pb.sku_id, pb.branch_id), [])
-        avg_l3m = (sum(avg_l3m_vals) / len(avg_l3m_vals)) if avg_l3m_vals else 0.0
-        avg_f3m = (sum(avg_f3m_vals) / len(avg_f3m_vals)) if avg_f3m_vals else 0.0
+        avg_l3m = _qty_int((sum(avg_l3m_vals) / len(avg_l3m_vals)) if avg_l3m_vals else 0.0)
+        avg_f3m = _qty_int((sum(avg_f3m_vals) / len(avg_f3m_vals)) if avg_f3m_vals else 0.0)
 
         current_stock = float(pb.current_stock or 0.0)
         stock_norm = float(pb.stock_norm or 0.0)
-        target_stock = stock_norm * avg_f3m / 30.0 if stock_norm > 0 else 0.0
-        recommended = max(target_stock - current_stock, 0.0)
+        target_stock = stock_norm * float(avg_f3m) / 30.0 if stock_norm > 0 else 0.0
+        recommended = _qty_int(max(target_stock - current_stock, 0.0))
         if target_stock > 0:
             future_health_index = ((current_stock - target_stock) / target_stock) + 1.0
         else:
@@ -308,7 +321,7 @@ async def get_distribution_aggregated(
         branch_adjust_stmt = branch_adjust_stmt.where(DistributionBranchAdjustment.owner_user_id == user.id)
     branch_adjust_rows = (await db.execute(branch_adjust_stmt)).scalars().all()
     branch_adjust_map = {
-        (r.owner_user_id, r.branch_id): float(r.adjusted_quantity_in_mc) for r in branch_adjust_rows
+        (r.owner_user_id, r.branch_id): _qty_int(r.adjusted_quantity_in_mc) for r in branch_adjust_rows
     }
 
     buckets: dict[tuple[int, str, str], dict[str, float]] = {}
@@ -339,7 +352,9 @@ async def get_distribution_aggregated(
 
     rows: list[DistributionAggregateRow] = []
     for (owner_user_id, branch_id, branch_name), vals in buckets.items():
-        adjusted_branch = branch_adjust_map.get((owner_user_id, branch_id), 0.0)
+        recommended_branch = _qty_int(vals["recommended_quantity_in_mc_per_branch"])
+        adjusted_branch = branch_adjust_map.get((owner_user_id, branch_id), recommended_branch)
+        branch_health_index = int(round(vals["sales_weighted_hi"] * 100))
         rows.append(
             DistributionAggregateRow(
                 branch_name=branch_name,
@@ -347,12 +362,13 @@ async def get_distribution_aggregated(
                 available_volume_cbm_per_branch=round(vals["available_volume_cbm_per_branch"], 2),
                 available_gross_weight_kg_per_branch=round(vals["available_gross_weight_kg_per_branch"], 2),
                 available_amount_kzt_per_branch=round(vals["available_amount_kzt_per_branch"], 2),
-                recommended_quantity_in_mc_per_branch=round(vals["recommended_quantity_in_mc_per_branch"], 2),
+                recommended_quantity_in_mc_per_branch=int(recommended_branch),
                 recommended_volume_cbm_per_branch=round(vals["recommended_volume_cbm_per_branch"], 2),
                 recommended_gross_weight_kg_per_branch=round(vals["recommended_gross_weight_kg_per_branch"], 2),
                 recommended_amount_kzt_per_branch=round(vals["recommended_amount_kzt_per_branch"], 2),
-                adjusted_quantity_in_mc_per_branch=round(adjusted_branch, 2),
-                branch_health_index=int(round(vals["sales_weighted_hi"] * 100)),
+                adjusted_quantity_in_mc_per_branch=int(_qty_int(adjusted_branch)),
+                branch_health_index=branch_health_index,
+                branch_health_index_label=_branch_health_index_label(branch_health_index),
             )
         )
     rows.sort(key=lambda x: x.branch_name)
@@ -401,10 +417,14 @@ async def get_distribution_details(
             sku_name=r.sku_name,
             total_available_quantity_in_mc=round(total_available_by_sku.get((r.owner_user_id, r.sku_id), 0.0), 2),
             available_quantity_in_mc=round(r.current_stock, 2),
-            average_l3m_quantity_in_mc=round(r.avg_l3m, 2),
-            average_f3m_quantity_in_mc=round(r.avg_f3m, 2),
-            recommended_quantity_in_mc=round(r.recommended_quantity, 2),
-            adjusted_quantity_in_mc=round(r.adjusted_detail_quantity, 2) if r.adjusted_detail_quantity is not None else None,
+            average_l3m_quantity_in_mc=int(r.avg_l3m),
+            average_f3m_quantity_in_mc=int(r.avg_f3m),
+            recommended_quantity_in_mc=int(r.recommended_quantity),
+            adjusted_quantity_in_mc=(
+                int(r.adjusted_detail_quantity)
+                if r.adjusted_detail_quantity is not None
+                else int(r.recommended_quantity)
+            ),
         )
         for r in selected
     ]
@@ -453,7 +473,7 @@ async def patch_distribution_branch_adjustments(
                     owner_user_id=owner_id,
                     planning_date=planning_date,
                     branch_id=branch_id,
-                    adjusted_quantity_in_mc=float(row.adjusted_quantity_in_mc_per_branch),
+                    adjusted_quantity_in_mc=int(row.adjusted_quantity_in_mc_per_branch),
                 )
             )
             updated += 1
@@ -465,7 +485,7 @@ async def patch_distribution_branch_adjustments(
                         owner_user_id=owner_user_id,
                         planning_date=planning_date,
                         branch_id=row.branch_name,
-                        adjusted_quantity_in_mc=float(row.adjusted_quantity_in_mc_per_branch),
+                        adjusted_quantity_in_mc=int(row.adjusted_quantity_in_mc_per_branch),
                     )
                 )
                 updated += 1
@@ -527,7 +547,7 @@ async def patch_distribution_detail_adjustments(
                         planning_date=planning_date,
                         branch_id=row.branch_id,
                         sku_id=row.sku_id,
-                        adjusted_quantity_in_mc=float(item.adjusted_quantity_in_mc),
+                        adjusted_quantity_in_mc=int(item.adjusted_quantity_in_mc),
                     )
                 )
             updated += 1

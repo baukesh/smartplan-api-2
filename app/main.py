@@ -150,6 +150,7 @@ async def _ensure_owner_columns(conn) -> None:
         "distribution_branch_adjustments",
         "distribution_sku_adjustments",
         "dp_report_forecast_overrides",
+        "forecast_inference_cache",
     ]
     owner_id = await _default_owner_id(conn)
     for table_name in tables:
