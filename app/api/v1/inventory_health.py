@@ -3,7 +3,7 @@ from datetime import date
 from urllib.parse import parse_qs, unquote, urlparse
 
 from fastapi import APIRouter, Header, HTTPException, Query, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
 from app.api.date_params import parse_query_date
@@ -29,6 +29,13 @@ class InventoryHealthTableResponse(BaseModel):
     items: list[InventoryHealthTableRow]
     total_items: int
     total_pages: int
+    filter_options: "InventoryHealthFilterOptions"
+
+
+class InventoryHealthFilterOptions(BaseModel):
+    sku_code: list[str] = Field(default_factory=list)
+    sku_name: list[str] = Field(default_factory=list)
+    abc_category: list[str] = Field(default_factory=list)
 
 
 class CategorySummaryRow(BaseModel):
@@ -45,6 +52,7 @@ class CategorySummaryRow(BaseModel):
 class TopSkuShareRow(BaseModel):
     sku_name: str
     share_of_stock: float
+    health_index_deviation: float
 
 
 class TopSkuShareResponse(BaseModel):
@@ -53,6 +61,12 @@ class TopSkuShareResponse(BaseModel):
 
 class InventoryHealthFilterOptionsResponse(BaseModel):
     branch_names: list[str]
+
+
+class HealthIndexInformationResponse(BaseModel):
+    healthy: str
+    normal: str
+    critical: str
 
 
 class _SkuMetrics(BaseModel):
@@ -107,6 +121,30 @@ def _month_bounds(d: date) -> tuple[date, date]:
     return first, last
 
 
+def _resolve_date_window(
+    *,
+    period: str | date | None,
+    date_from: str | date | None,
+    date_to: str | date | None,
+) -> tuple[date | None, date | None]:
+    # New frontend flow: period (single month) takes precedence when provided.
+    parsed_period = parse_query_date(period, field_name="period")
+    if parsed_period is not None:
+        return _month_bounds(parsed_period)
+
+    parsed_date_from = parse_query_date(date_from, field_name="date_from")
+    parsed_date_to = parse_query_date(date_to, field_name="date_to", end_of_month=True)
+    same_month = (
+        parsed_date_from is not None
+        and parsed_date_to is not None
+        and parsed_date_from.year == parsed_date_to.year
+        and parsed_date_from.month == parsed_date_to.month
+    )
+    if same_month:
+        return _month_bounds(parsed_date_from)
+    return parsed_date_from, parsed_date_to
+
+
 def _merge_branch_filters(
     branch_name: list[str] | None, branch: list[str] | None
 ) -> list[str] | None:
@@ -151,21 +189,11 @@ def _branch_filters_from_referer(referer: str | None) -> list[str] | None:
 async def get_inventory_health_filter_options(
     db: DBSession,
     user: CurrentUser,
+    period: str | None = Query(None),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
 ) -> InventoryHealthFilterOptionsResponse:
-    parsed_date_from = parse_query_date(date_from, field_name="date_from")
-    parsed_date_to = parse_query_date(date_to, field_name="date_to", end_of_month=True)
-    same_month = (
-        parsed_date_from is not None
-        and parsed_date_to is not None
-        and parsed_date_from.year == parsed_date_to.year
-        and parsed_date_from.month == parsed_date_to.month
-    )
-    if same_month:
-        d_from, d_to = _month_bounds(parsed_date_from)
-    else:
-        d_from, d_to = parsed_date_from, parsed_date_to
+    d_from, d_to = _resolve_date_window(period=period, date_from=date_from, date_to=date_to)
 
     hs_stmt = select(HistoricalSalesMonthly.branch_id)
     if not is_admin(user):
@@ -198,12 +226,14 @@ async def _compute_inventory_metrics(
     user: CurrentUser,
     view_type: str,
     branch_names: list[str] | None,
+    period: str | date | None,
     date_from: str | date | None,
     date_to: str | date | None,
 ) -> list[_SkuMetrics]:
     metric = _normalize_view_type(view_type)
-    parsed_date_from = parse_query_date(date_from, field_name="date_from")
-    parsed_date_to = parse_query_date(date_to, field_name="date_to", end_of_month=True)
+    d_from, d_to = _resolve_date_window(period=period, date_from=date_from, date_to=date_to)
+    requested_from_month = d_from.replace(day=1) if d_from else None
+    requested_to_month = d_to.replace(day=1) if d_to else None
 
     branch_stmt = select(Branch)
     if not is_admin(user):
@@ -235,8 +265,6 @@ async def _compute_inventory_metrics(
     max_existing_date = (await db.execute(date_scope_stmt)).scalar_one_or_none()
     if max_existing_date is not None:
         max_existing_month = max_existing_date.replace(day=1)
-        requested_from_month = parsed_date_from.replace(day=1) if parsed_date_from else None
-        requested_to_month = parsed_date_to.replace(day=1) if parsed_date_to else None
         if (requested_from_month and requested_from_month > max_existing_month) or (
             requested_to_month and requested_to_month > max_existing_month
         ):
@@ -244,17 +272,6 @@ async def _compute_inventory_metrics(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Please select only past dates available in historical_sales_monthly",
             )
-
-    same_month = (
-        parsed_date_from is not None
-        and parsed_date_to is not None
-        and parsed_date_from.year == parsed_date_to.year
-        and parsed_date_from.month == parsed_date_to.month
-    )
-    if same_month:
-        d_from, d_to = _month_bounds(parsed_date_from)
-    else:
-        d_from, d_to = parsed_date_from, parsed_date_to
 
     hs_stmt = select(HistoricalSalesMonthly)
     if not is_admin(user):
@@ -438,18 +455,19 @@ async def _build_category_summary_cases_stock(
     category: str,
     view_type: str,
     merged_branch_filters: list[str] | None,
+    period: str | None,
     date_from: str | None,
     date_to: str | None,
 ) -> CategorySummaryRow:
     metrics = await _compute_inventory_metrics(
-        db, user, view_type, merged_branch_filters, date_from, date_to
+        db, user, view_type, merged_branch_filters, period, date_from, date_to
     )
     normalized_view = _normalize_view_type(view_type)
     if normalized_view == "cases":
         return _build_category_summary(metrics, category, view_type, stock_share_metrics=metrics)
 
     cases_metrics = await _compute_inventory_metrics(
-        db, user, "cases", merged_branch_filters, date_from, date_to
+        db, user, "cases", merged_branch_filters, period, date_from, date_to
     )
     return _build_category_summary(
         metrics,
@@ -467,6 +485,10 @@ async def get_inventory_health_table(
     view_type: str = Query("DSP", description="DSP or Cases"),
     branch_name: list[str] | None = Query(None),
     branch: list[str] | None = Query(None),
+    sku_code: list[str] | None = Query(None),
+    sku_name: list[str] | None = Query(None),
+    abc_category: list[str] | None = Query(None),
+    period: str | None = Query(None),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
     page: int = Query(1, ge=1),
@@ -477,6 +499,7 @@ async def get_inventory_health_table(
         user=user,
         view_type=view_type,
         branch_names=_merge_branch_filters(branch_name, branch),
+        period=period,
         date_from=date_from,
         date_to=date_to,
     )
@@ -491,8 +514,37 @@ async def get_inventory_health_table(
         )
         for m in metrics
     ]
-    items, total_items, total_pages = _paginate(table, page=page, page_size=page_size)
-    return InventoryHealthTableResponse(items=items, total_items=total_items, total_pages=total_pages)
+    filter_options = InventoryHealthFilterOptions(
+        sku_code=sorted({str(r.sku_code).strip() for r in table if str(r.sku_code).strip()}),
+        sku_name=sorted({str(r.sku_name).strip() for r in table if str(r.sku_name).strip()}),
+        abc_category=sorted({str(r.abc_category).strip() for r in table if str(r.abc_category).strip()}),
+    )
+    filtered_table = table
+    if sku_code:
+        sku_code_values = {str(v).strip() for v in sku_code if str(v).strip()}
+        filtered_table = [
+            r for r in filtered_table if str(r.sku_code).strip() in sku_code_values
+        ]
+    if sku_name:
+        sku_name_values = {str(v).strip() for v in sku_name if str(v).strip()}
+        filtered_table = [
+            r for r in filtered_table if str(r.sku_name).strip() in sku_name_values
+        ]
+    if abc_category:
+        abc_values = {
+            str(v).strip().upper() for v in abc_category if str(v).strip()
+        }
+        filtered_table = [
+            r for r in filtered_table if str(r.abc_category).strip().upper() in abc_values
+        ]
+
+    items, total_items, total_pages = _paginate(filtered_table, page=page, page_size=page_size)
+    return InventoryHealthTableResponse(
+        items=items,
+        total_items=total_items,
+        total_pages=total_pages,
+        filter_options=filter_options,
+    )
 
 
 @router.get("/category-a", response_model=CategorySummaryRow)
@@ -503,6 +555,7 @@ async def get_category_a(
     branch_name: list[str] | None = Query(None),
     branch: list[str] | None = Query(None),
     referer: str | None = Header(default=None, alias="Referer"),
+    period: str | None = Query(None),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
 ) -> CategorySummaryRow:
@@ -515,6 +568,7 @@ async def get_category_a(
         category="A",
         view_type=view_type,
         merged_branch_filters=merged_branch_filters,
+        period=period,
         date_from=date_from,
         date_to=date_to,
     )
@@ -528,6 +582,7 @@ async def get_category_b(
     branch_name: list[str] | None = Query(None),
     branch: list[str] | None = Query(None),
     referer: str | None = Header(default=None, alias="Referer"),
+    period: str | None = Query(None),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
 ) -> CategorySummaryRow:
@@ -540,6 +595,7 @@ async def get_category_b(
         category="B",
         view_type=view_type,
         merged_branch_filters=merged_branch_filters,
+        period=period,
         date_from=date_from,
         date_to=date_to,
     )
@@ -553,6 +609,7 @@ async def get_category_c(
     branch_name: list[str] | None = Query(None),
     branch: list[str] | None = Query(None),
     referer: str | None = Header(default=None, alias="Referer"),
+    period: str | None = Query(None),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
 ) -> CategorySummaryRow:
@@ -565,6 +622,7 @@ async def get_category_c(
         category="C",
         view_type=view_type,
         merged_branch_filters=merged_branch_filters,
+        period=period,
         date_from=date_from,
         date_to=date_to,
     )
@@ -572,26 +630,24 @@ async def get_category_c(
 
 def _top_issue_rows(metrics: list[_SkuMetrics], issue_type: str, top_n: int) -> list[TopSkuShareRow]:
     total_stock = sum(m.stock for m in metrics)
+    def _deviation(m: _SkuMetrics) -> float:
+        return abs(float(m.health_index) - 100.0)
+
     if issue_type == "overstock":
-        chosen = sorted(
-            [m for m in metrics if m.health_index >= 100.0],
-            key=lambda m: m.health_index,
-            reverse=True,
-        )
+        chosen = [m for m in metrics if m.health_index >= 100.0]
     elif issue_type == "understock":
-        chosen = sorted(
-            [m for m in metrics if 0.0 < m.health_index < 100.0],
-            key=lambda m: m.health_index,
-        )
+        chosen = [m for m in metrics if 0.0 < m.health_index < 100.0]
     else:
         chosen = [m for m in metrics if abs(m.health_index) < 1e-9]
-        chosen = sorted(chosen, key=lambda m: m.share_stock, reverse=True)
+
+    chosen = sorted(chosen, key=lambda m: (_deviation(m), m.share_stock), reverse=True)
 
     sliced = chosen[: max(top_n, 0)]
     return [
         TopSkuShareRow(
             sku_name=m.sku_name,
             share_of_stock=round((m.stock / total_stock * 100.0) if total_stock > 0 else 0.0, 1),
+            health_index_deviation=round(_deviation(m), 2),
         )
         for m in sliced
     ]
@@ -604,12 +660,19 @@ async def get_overstock(
     view_type: str = Query("DSP", description="DSP or Cases"),
     branch_name: list[str] | None = Query(None),
     branch: list[str] | None = Query(None),
+    period: str | None = Query(None),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
     top_n: int = Query(5, ge=1),
 ) -> TopSkuShareResponse:
     metrics = await _compute_inventory_metrics(
-        db, user, view_type, _merge_branch_filters(branch_name, branch), date_from, date_to
+        db,
+        user,
+        view_type,
+        _merge_branch_filters(branch_name, branch),
+        period,
+        date_from,
+        date_to,
     )
     return TopSkuShareResponse(items=_top_issue_rows(metrics, "overstock", top_n))
 
@@ -621,12 +684,19 @@ async def get_understock(
     view_type: str = Query("DSP", description="DSP or Cases"),
     branch_name: list[str] | None = Query(None),
     branch: list[str] | None = Query(None),
+    period: str | None = Query(None),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
     top_n: int = Query(5, ge=1),
 ) -> TopSkuShareResponse:
     metrics = await _compute_inventory_metrics(
-        db, user, view_type, _merge_branch_filters(branch_name, branch), date_from, date_to
+        db,
+        user,
+        view_type,
+        _merge_branch_filters(branch_name, branch),
+        period,
+        date_from,
+        date_to,
     )
     return TopSkuShareResponse(items=_top_issue_rows(metrics, "understock", top_n))
 
@@ -638,12 +708,32 @@ async def get_out_of_stock(
     view_type: str = Query("DSP", description="DSP or Cases"),
     branch_name: list[str] | None = Query(None),
     branch: list[str] | None = Query(None),
+    period: str | None = Query(None),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
     top_n: int = Query(5, ge=1),
 ) -> TopSkuShareResponse:
     metrics = await _compute_inventory_metrics(
-        db, user, view_type, _merge_branch_filters(branch_name, branch), date_from, date_to
+        db,
+        user,
+        view_type,
+        _merge_branch_filters(branch_name, branch),
+        period,
+        date_from,
+        date_to,
     )
     return TopSkuShareResponse(items=_top_issue_rows(metrics, "out-of-stock", top_n))
+
+
+@router.get("/health-index-information-icon", response_model=HealthIndexInformationResponse)
+async def get_health_index_information_icon(
+    user: CurrentUser,
+) -> HealthIndexInformationResponse:
+    # Authenticated endpoint for frontend info icon tooltip content.
+    _ = user
+    return HealthIndexInformationResponse(
+        healthy="90-110",
+        normal="70-90 or 110-130",
+        critical="less than 70 or greater than 130",
+    )
 

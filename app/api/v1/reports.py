@@ -391,9 +391,14 @@ async def _build_report_detail(
     subline: list[str] | None = None,
     branch_name: list[str] | None = None,
     project_by_view_type: bool = False,
+    ignore_saved_product_filter: bool = False,
 ) -> dict:
     owner_user_id = int(report.created_by_id or 0)
-    saved_product_filter = parse_product_filter(report.product_filter_json or report.product_filter)
+    saved_product_filter = (
+        {}
+        if ignore_saved_product_filter
+        else parse_product_filter(report.product_filter_json or report.product_filter)
+    )
     saved_branch_filter = parse_branch_filter(report.branch_filter_json or report.branch_filter)
     effective_product_filter, effective_branch_filter = _effective_filters_from_overrides(
         saved_product_filter=saved_product_filter,
@@ -480,18 +485,39 @@ async def list_reports(
 async def get_new_report_template(
     db: DBSession,
     user: CurrentUser,
+    view_type: str | None = Query(default=None),
+    date_from: str | None = Query(default=None),
+    date_to: str | None = Query(default=None),
+    sku_code: list[str] | None = Query(default=None),
+    brand: list[str] | None = Query(default=None),
+    category: list[str] | None = Query(default=None),
+    sub_category: list[str] | None = Query(default=None),
+    subline: list[str] | None = Query(default=None),
+    branch_name: list[str] | None = Query(default=None),
 ) -> ReportDetailProjectedResponse:
     planning_month = await get_current_planning_month(db, user.id)
-    date_from, date_to = default_period_for_planning(planning_month)
+    default_from, default_to = default_period_for_planning(planning_month)
+    parsed_date_from = parse_query_date(date_from, field_name="date_from")
+    parsed_date_to = parse_query_date(date_to, field_name="date_to", end_of_month=True)
+    effective_product_filter, effective_branch_filter = _effective_filters_from_overrides(
+        saved_product_filter={},
+        saved_branch_filter=[],
+        sku_code=sku_code,
+        brand=brand,
+        category=category,
+        sub_category=sub_category,
+        subline=subline,
+        branch_name=branch_name,
+    )
     ctx = await build_reporting_context(
         db=db,
         owner_user_id=user.id,
-        view_type="cases",
-        product_filter={},
-        branch_filter=[],
+        view_type=view_type or "cases",
+        product_filter=effective_product_filter,
+        branch_filter=effective_branch_filter,
         planning_month=planning_month,
-        date_from=date_from,
-        date_to=date_to,
+        date_from=parsed_date_from or default_from,
+        date_to=parsed_date_to or default_to,
     )
     historical_table, forecast_table = await build_report_tables(
         db=db,
@@ -508,9 +534,9 @@ async def get_new_report_template(
         report=ReportCard(
             report_id=0,
             report_name="New Demand Planning Report",
-            product_filter=ProductFilterPayload(),
-            branch_filter=await _branch_options_for_owner(db, user.id),
-            view_type="cases",
+            product_filter=ProductFilterPayload(**ctx.product_filter),
+            branch_filter=list(ctx.branch_filter or await _branch_options_for_owner(db, user.id)),
+            view_type=ctx.view_type,
             date_from=ctx.date_from,
             date_to=ctx.date_to,
             is_draft=True,
@@ -712,6 +738,7 @@ async def get_report(
         subline=subline,
         branch_name=branch_name,
         project_by_view_type=True,
+        ignore_saved_product_filter=True,
     )
     return ReportDetailProjectedResponse(**payload_out)
 

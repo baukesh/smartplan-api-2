@@ -2,7 +2,7 @@ from datetime import date
 from typing import List
 
 from fastapi import APIRouter, HTTPException, Query, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import and_, select, update
 
 from app.api.date_params import parse_query_date
@@ -36,6 +36,16 @@ class OrdersPage(BaseModel):
     items: list[OrderRow]
     total_items: int
     total_pages: int
+    filter_options: "OrdersFilterOptions"
+
+
+class OrdersFilterOptions(BaseModel):
+    order_id: list[str] = Field(default_factory=list)
+    creation_date: list[str] = Field(default_factory=list)
+    receival_date: list[str] = Field(default_factory=list)
+    total_quantity_in_mc: list[str] = Field(default_factory=list)
+    total_amount_kzt: list[str] = Field(default_factory=list)
+    status: list[str] = Field(default_factory=list)
 
 
 class OrderStatusUpdateRow(BaseModel):
@@ -68,6 +78,16 @@ class OrderDetailsResponse(BaseModel):
     items: list[OrderDetailsRow]
     total_items: int
     total_pages: int
+    filter_options: "OrderDetailsFilterOptions"
+
+
+class OrderDetailsFilterOptions(BaseModel):
+    sku_code: list[str] = Field(default_factory=list)
+    sku_name: list[str] = Field(default_factory=list)
+    quantity_in_mc: list[str] = Field(default_factory=list)
+    gross_weight_kg: list[str] = Field(default_factory=list)
+    volume_cbm: list[str] = Field(default_factory=list)
+    amount_kzt: list[str] = Field(default_factory=list)
 
 
 class OrderDetailsPatchRequest(BaseModel):
@@ -111,26 +131,85 @@ def _normalize_order_id_input(value: str) -> str:
     return normalized
 
 
+def _parse_float_filters(
+    values: list[str] | None,
+    *,
+    field_name: str,
+) -> set[float] | None:
+    if not values:
+        return None
+    parsed: set[float] = set()
+    for raw in values:
+        normalized = str(raw).strip()
+        if not normalized:
+            continue
+        try:
+            parsed.add(float(normalized))
+        except Exception as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"{field_name} must contain numeric values",
+            ) from exc
+    return parsed or None
+
+
+def _parse_exact_date_filters(
+    values: list[str] | None,
+    *,
+    field_name: str,
+) -> set[date] | None:
+    if not values:
+        return None
+    parsed: set[date] = set()
+    for value in values:
+        dt = parse_query_date(value, field_name=field_name)
+        if dt is not None:
+            parsed.add(dt)
+    return parsed or None
+
+
 async def _list_aggregated_orders(
     db: DBSession,
     user: CurrentUser,
-    status_filter: str | None = None,
+    status_filter: list[str] | None = None,
     date_from: str | date | None = None,
     date_to: str | date | None = None,
+    order_id: list[str] | None = None,
+    creation_date: list[str] | None = None,
+    receival_date: list[str] | None = None,
+    total_quantity_in_mc: list[str] | None = None,
+    total_amount_kzt: list[str] | None = None,
     page: int = 1,
     page_size: str = "10",
 ) -> OrdersPage:
     parsed_date_from = parse_query_date(date_from, field_name="date_from")
     parsed_date_to = parse_query_date(date_to, field_name="date_to", end_of_month=True)
+    parsed_creation_dates = _parse_exact_date_filters(
+        creation_date, field_name="creation_date"
+    )
+    parsed_receival_dates = _parse_exact_date_filters(
+        receival_date, field_name="receival_date"
+    )
+    parsed_total_quantities = _parse_float_filters(
+        total_quantity_in_mc,
+        field_name="total_quantity_in_mc",
+    )
+    parsed_total_amounts = _parse_float_filters(
+        total_amount_kzt,
+        field_name="total_amount_kzt",
+    )
     stmt = _base_aggregated_stmt(user)
-    normalized_status_filter = normalize_order_status(status_filter) if status_filter else None
-    if status_filter and normalized_status_filter is None:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Unsupported status value: {status_filter}",
-        )
-    if normalized_status_filter:
-        stmt = stmt.where(OrdersAggregated.status == normalized_status_filter)
+    normalized_status_filters: set[str] | None = None
+    if status_filter:
+        normalized_status_filters = set()
+        for raw_status in status_filter:
+            normalized = normalize_order_status(raw_status)
+            if normalized is None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"Unsupported status value: {raw_status}",
+                )
+            normalized_status_filters.add(normalized)
     if parsed_date_from:
         stmt = stmt.where(OrdersAggregated.receival_date >= parsed_date_from)
     if parsed_date_to:
@@ -138,6 +217,66 @@ async def _list_aggregated_orders(
     size = _parse_page_size(page_size)
     stmt = stmt.order_by(OrdersAggregated.creation_date.desc())
     raw_rows = list((await db.execute(stmt)).scalars().all())
+    scoped_rows = raw_rows
+    if normalized_status_filters:
+        scoped_rows = [
+            r for r in scoped_rows if str(r.status).strip() in normalized_status_filters
+        ]
+    filter_options = OrdersFilterOptions(
+        order_id=sorted({str(r.order_id).strip() for r in scoped_rows if str(r.order_id).strip()}),
+        creation_date=sorted(
+            {r.creation_date.isoformat() for r in scoped_rows if r.creation_date is not None}
+        ),
+        receival_date=sorted(
+            {r.receival_date.isoformat() for r in scoped_rows if r.receival_date is not None}
+        ),
+        total_quantity_in_mc=sorted(
+            {str(round(float(r.total_quantity_in_mc or 0.0), 2)) for r in scoped_rows}
+        ),
+        total_amount_kzt=sorted(
+            {str(round(float(r.total_amount_kzt or 0.0), 2)) for r in scoped_rows}
+        ),
+        status=sorted(
+            {
+                str(display_order_status(r.status) or "").strip()
+                for r in scoped_rows
+                if str(display_order_status(r.status) or "").strip()
+            }
+        ),
+    )
+    filtered_rows = scoped_rows
+    if order_id:
+        normalized_order_ids = {
+            _normalize_order_id_input(v) for v in order_id if _normalize_order_id_input(v)
+        }
+        filtered_rows = [
+            r for r in filtered_rows if str(r.order_id).strip() in normalized_order_ids
+        ]
+    if parsed_creation_dates:
+        filtered_rows = [
+            r for r in filtered_rows if r.creation_date in parsed_creation_dates
+        ]
+    if parsed_receival_dates:
+        filtered_rows = [
+            r
+            for r in filtered_rows
+            if r.receival_date is not None and r.receival_date in parsed_receival_dates
+        ]
+    if parsed_total_quantities:
+        normalized_quantities = {round(v, 2) for v in parsed_total_quantities}
+        filtered_rows = [
+            r
+            for r in filtered_rows
+            if round(float(r.total_quantity_in_mc or 0.0), 2) in normalized_quantities
+        ]
+    if parsed_total_amounts:
+        normalized_amounts = {round(v, 2) for v in parsed_total_amounts}
+        filtered_rows = [
+            r
+            for r in filtered_rows
+            if round(float(r.total_amount_kzt or 0.0), 2) in normalized_amounts
+        ]
+
     rows = [
         OrderRow(
             order_id=row.order_id,
@@ -147,17 +286,23 @@ async def _list_aggregated_orders(
             total_amount_kzt=row.total_amount_kzt,
             status=display_order_status(row.status),
         )
-        for row in raw_rows
+        for row in filtered_rows
     ]
     total_items = len(rows)
     if size is None:
-        return OrdersPage(items=rows, total_items=total_items, total_pages=1 if total_items > 0 else 0)
+        return OrdersPage(
+            items=rows,
+            total_items=total_items,
+            total_pages=1 if total_items > 0 else 0,
+            filter_options=filter_options,
+        )
     total_pages = (total_items + size - 1) // size if total_items > 0 else 0
     offset = (page - 1) * size
     return OrdersPage(
         items=rows[offset : offset + size],
         total_items=total_items,
         total_pages=total_pages,
+        filter_options=filter_options,
     )
 
 
@@ -166,9 +311,14 @@ async def _list_aggregated_orders(
 async def list_orders(
     db: DBSession,
     user: CurrentUser,
-    status: str | None = Query(None),
+    status: list[str] | None = Query(None),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
+    order_id: list[str] | None = Query(None),
+    creation_date: list[str] | None = Query(None),
+    receival_date: list[str] | None = Query(None),
+    total_quantity_in_mc: list[str] | None = Query(None),
+    total_amount_kzt: list[str] | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: str = Query("10"),
 ) -> OrdersPage:
@@ -178,6 +328,11 @@ async def list_orders(
         status_filter=status,
         date_from=date_from,
         date_to=date_to,
+        order_id=order_id,
+        creation_date=creation_date,
+        receival_date=receival_date,
+        total_quantity_in_mc=total_quantity_in_mc,
+        total_amount_kzt=total_amount_kzt,
         page=page,
         page_size=page_size,
     )
@@ -187,18 +342,28 @@ async def list_orders(
 async def list_in_transit_orders(
     db: DBSession,
     user: CurrentUser,
-    status: str | None = Query(None),
+    status: list[str] | None = Query(None),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
+    order_id: list[str] | None = Query(None),
+    creation_date: list[str] | None = Query(None),
+    receival_date: list[str] | None = Query(None),
+    total_quantity_in_mc: list[str] | None = Query(None),
+    total_amount_kzt: list[str] | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: str = Query("10"),
 ) -> OrdersPage:
     return await _list_aggregated_orders(
         db=db,
         user=user,
-        status_filter=status or "в пути",
+        status_filter=status or ["в пути"],
         date_from=date_from,
         date_to=date_to,
+        order_id=order_id,
+        creation_date=creation_date,
+        receival_date=receival_date,
+        total_quantity_in_mc=total_quantity_in_mc,
+        total_amount_kzt=total_amount_kzt,
         page=page,
         page_size=page_size,
     )
@@ -208,18 +373,28 @@ async def list_in_transit_orders(
 async def list_completed_orders(
     db: DBSession,
     user: CurrentUser,
-    status: str | None = Query(None),
+    status: list[str] | None = Query(None),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
+    order_id: list[str] | None = Query(None),
+    creation_date: list[str] | None = Query(None),
+    receival_date: list[str] | None = Query(None),
+    total_quantity_in_mc: list[str] | None = Query(None),
+    total_amount_kzt: list[str] | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: str = Query("10"),
 ) -> OrdersPage:
     return await _list_aggregated_orders(
         db=db,
         user=user,
-        status_filter=status or "завершен",
+        status_filter=status or ["завершен"],
         date_from=date_from,
         date_to=date_to,
+        order_id=order_id,
+        creation_date=creation_date,
+        receival_date=receival_date,
+        total_quantity_in_mc=total_quantity_in_mc,
+        total_amount_kzt=total_amount_kzt,
         page=page,
         page_size=page_size,
     )
@@ -285,6 +460,12 @@ async def get_order_details(
     db: DBSession,
     user: CurrentUser,
     order_id: str = Query(...),
+    sku_code: list[str] | None = Query(None),
+    sku_name: list[str] | None = Query(None),
+    quantity_in_mc: list[str] | None = Query(None),
+    gross_weight_kg: list[str] | None = Query(None),
+    volume_cbm: list[str] | None = Query(None),
+    amount_kzt: list[str] | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: str = Query("10"),
 ) -> OrderDetailsResponse:
@@ -344,6 +525,87 @@ async def get_order_details(
             )
         )
 
+    filter_options = OrderDetailsFilterOptions(
+        sku_code=sorted({str(x.sku_code).strip() for x in items if str(x.sku_code).strip()}),
+        sku_name=sorted({str(x.sku_name).strip() for x in items if str(x.sku_name).strip()}),
+        quantity_in_mc=sorted(
+            {str(round(float(x.quantity_in_mc or 0.0), 2)) for x in items}
+        ),
+        gross_weight_kg=sorted(
+            {
+                str(round(float(x.gross_weight_kg or 0.0), 4))
+                for x in items
+                if x.gross_weight_kg is not None
+            }
+        ),
+        volume_cbm=sorted(
+            {
+                str(round(float(x.volume_cbm or 0.0), 4))
+                for x in items
+                if x.volume_cbm is not None
+            }
+        ),
+        amount_kzt=sorted({str(round(float(x.amount_kzt or 0.0), 2)) for x in items}),
+    )
+    filtered_items = items
+    if sku_code:
+        sku_code_values = {str(v).strip() for v in sku_code if str(v).strip()}
+        filtered_items = [
+            x for x in filtered_items if str(x.sku_code).strip() in sku_code_values
+        ]
+    if sku_name:
+        sku_name_values = {str(v).strip() for v in sku_name if str(v).strip()}
+        filtered_items = [
+            x for x in filtered_items if str(x.sku_name).strip() in sku_name_values
+        ]
+    parsed_quantities = _parse_float_filters(
+        quantity_in_mc,
+        field_name="quantity_in_mc",
+    )
+    if parsed_quantities:
+        quantity_values = {round(v, 2) for v in parsed_quantities}
+        filtered_items = [
+            x
+            for x in filtered_items
+            if round(float(x.quantity_in_mc or 0.0), 2) in quantity_values
+        ]
+    parsed_gross_weights = _parse_float_filters(
+        gross_weight_kg,
+        field_name="gross_weight_kg",
+    )
+    if parsed_gross_weights:
+        gross_weight_values = {round(v, 4) for v in parsed_gross_weights}
+        filtered_items = [
+            x
+            for x in filtered_items
+            if x.gross_weight_kg is not None
+            and round(float(x.gross_weight_kg or 0.0), 4) in gross_weight_values
+        ]
+    parsed_volumes = _parse_float_filters(
+        volume_cbm,
+        field_name="volume_cbm",
+    )
+    if parsed_volumes:
+        volume_values = {round(v, 4) for v in parsed_volumes}
+        filtered_items = [
+            x
+            for x in filtered_items
+            if x.volume_cbm is not None
+            and round(float(x.volume_cbm or 0.0), 4) in volume_values
+        ]
+    parsed_amounts = _parse_float_filters(
+        amount_kzt,
+        field_name="amount_kzt",
+    )
+    if parsed_amounts:
+        amount_values = {round(v, 2) for v in parsed_amounts}
+        filtered_items = [
+            x
+            for x in filtered_items
+            if round(float(x.amount_kzt or 0.0), 2) in amount_values
+        ]
+    total_amount_filtered = sum(float(x.amount_kzt or 0.0) for x in filtered_items)
+
     header = sorted(order_rows, key=lambda r: (r.creation_date, r.receival_date))[0]
     agg_stmt = select(OrdersAggregated).where(
         OrdersAggregated.order_id == normalized_order_id,
@@ -351,13 +613,13 @@ async def get_order_details(
     )
     aggregated = (await db.execute(agg_stmt)).scalars().first()
     size = _parse_page_size(page_size)
-    total_items = len(items)
+    total_items = len(filtered_items)
     if size is not None:
         offset = (page - 1) * size
-        paged_items = items[offset : offset + size]
+        paged_items = filtered_items[offset : offset + size]
         total_pages = (total_items + size - 1) // size if total_items > 0 else 0
     else:
-        paged_items = items
+        paged_items = filtered_items
         total_pages = 1 if total_items > 0 else 0
 
     return OrderDetailsResponse(
@@ -367,11 +629,12 @@ async def get_order_details(
         creation_date=header.creation_date,
         receival_date=header.receival_date,
         author=header.author,
-        total_skus=len(items),
-        total_amount_kzt=round(total_amount, 2),
+        total_skus=len(filtered_items),
+        total_amount_kzt=round(total_amount_filtered, 2),
         items=paged_items,
         total_items=total_items,
         total_pages=total_pages,
+        filter_options=filter_options,
     )
 
 

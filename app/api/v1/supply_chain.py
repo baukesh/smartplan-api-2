@@ -5,7 +5,7 @@ import re
 import pandas as pd
 from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import func, select, update
 
 from app.api.date_params import parse_query_date
@@ -38,6 +38,12 @@ class SupplyChainListResponse(BaseModel):
     total_volume: float
     total_items: int
     total_pages: int
+    filter_options: "SupplyChainFilterOptions"
+
+
+class SupplyChainFilterOptions(BaseModel):
+    sku_code: list[str] = Field(default_factory=list)
+    sku_name: list[str] = Field(default_factory=list)
 
 
 class SupplyChainAdjustRow(BaseModel):
@@ -325,19 +331,59 @@ async def get_supply_chain_view(
     date_to: str | None = Query(None),
     category: str | None = Query(None),
     source: str | None = Query(None),
+    sku_code: list[str] | None = Query(None),
+    sku_name: list[str] | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: str = Query("10"),
 ) -> SupplyChainListResponse:
     period_date = await _resolve_period_from_args(db, user, period, date_from, date_to)
     rows, product_by_sku, fo_by_sku = await _load_supply_rows(db, user, period_date, category, source)
+    filter_options = SupplyChainFilterOptions(
+        sku_code=sorted({str(r.sku_code).strip() for r in rows if str(r.sku_code).strip()}),
+        sku_name=sorted({str(r.sku_name).strip() for r in rows if str(r.sku_name).strip()}),
+    )
+    filtered_rows = rows
+    if sku_code:
+        sku_code_values = {str(v).strip() for v in sku_code if str(v).strip()}
+        filtered_rows = [
+            r for r in filtered_rows if str(r.sku_code).strip() in sku_code_values
+        ]
+    if sku_name:
+        sku_name_values = {str(v).strip() for v in sku_name if str(v).strip()}
+        filtered_rows = [
+            r for r in filtered_rows if str(r.sku_name).strip() in sku_name_values
+        ]
+
+    if sku_code or sku_name:
+        allowed_sku_ids = {
+            sku_id
+            for sku_id, product in product_by_sku.items()
+            if any(
+                str(r.sku_code).strip() == str(product.sku_code).strip()
+                and str(r.sku_name).strip() == str(product.sku_name).strip()
+                for r in filtered_rows
+            )
+        }
+        product_by_sku_for_totals = {
+            sku_id: product
+            for sku_id, product in product_by_sku.items()
+            if sku_id in allowed_sku_ids
+        }
+        fo_by_sku_for_totals = {
+            sku_id: row for sku_id, row in fo_by_sku.items() if sku_id in allowed_sku_ids
+        }
+    else:
+        product_by_sku_for_totals = product_by_sku
+        fo_by_sku_for_totals = fo_by_sku
+
     total_sum, total_quantity, total_gross_weight, total_volume = await _compute_supply_totals(
         db=db,
         user=user,
         period_date=period_date,
-        product_by_sku=product_by_sku,
-        fo_by_sku=fo_by_sku,
+        product_by_sku=product_by_sku_for_totals,
+        fo_by_sku=fo_by_sku_for_totals,
     )
-    items, total_items, total_pages = _paginate(rows, page=page, page_size=page_size)
+    items, total_items, total_pages = _paginate(filtered_rows, page=page, page_size=page_size)
     return SupplyChainListResponse(
         period=period_date.strftime("%Y-%m"),
         items=items,
@@ -347,6 +393,7 @@ async def get_supply_chain_view(
         total_volume=total_volume,
         total_items=total_items,
         total_pages=total_pages,
+        filter_options=filter_options,
     )
 
 
@@ -418,9 +465,23 @@ async def download_supply_chain(
     date_to: str | None = Query(None),
     category: str | None = Query(None),
     source: str | None = Query(None),
+    sku_code: list[str] | None = Query(None),
+    sku_name: list[str] | None = Query(None),
 ):
-    period_date = await _resolve_period_from_args(db, user, period, date_from, date_to)
-    rows, _, _ = await _load_supply_rows(db, user, period_date, category, source)
+    response = await get_supply_chain_view(
+        db=db,
+        user=user,
+        period=period,
+        date_from=date_from,
+        date_to=date_to,
+        category=category,
+        source=source,
+        sku_code=sku_code,
+        sku_name=sku_name,
+        page=1,
+        page_size="all",
+    )
+    rows = response.items
     export_rows = [
         {
             "sku_code": r.sku_code,

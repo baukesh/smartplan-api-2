@@ -99,6 +99,7 @@ class AssortmentItemsPage(BaseModel):
     items: list[AssortmentItem]
     total_items: int
     total_pages: int
+    filter_options: dict[str, list[str]]
 
 
 class BranchStockNormPage(BaseModel):
@@ -106,12 +107,14 @@ class BranchStockNormPage(BaseModel):
     page_size: int | None
     total_items: int
     total_pages: int
+    filter_options: dict[str, list[str]]
 
 
 class PriceListPage(BaseModel):
     items: list[PriceListRow]
     total_items: int
     total_pages: int
+    filter_options: dict[str, list[str]]
 
 
 def _parse_page_size(page_size: str) -> int | None:
@@ -134,20 +137,89 @@ def _paginate_list(items: list, page: int, page_size: str) -> tuple[list, int, i
     return items[offset : offset + size], total_items, total_pages
 
 
+def _clean_values(values: list[str] | None) -> set[str]:
+    return {str(v).strip() for v in (values or []) if str(v).strip()}
+
+
+def _parse_date_values(values: list[str] | None, *, field_name: str) -> set[date]:
+    parsed: set[date] = set()
+    for raw in values or []:
+        value = parse_query_date(raw, field_name=field_name)
+        if value is not None:
+            parsed.add(value)
+    return parsed
+
+
 @router.get("/items", response_model=AssortmentItemsPage)
 async def list_assortment(
     db: DBSession,
     user: CurrentUser,
-    status: str | None = Query(None),
+    status_filter: list[str] | None = Query(None, alias="status"),
+    sku_code: list[str] | None = Query(None),
+    sku_name: list[str] | None = Query(None),
+    mother_sku: list[str] | None = Query(None),
+    source: list[str] | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: str = Query("10"),
 ) -> AssortmentItemsPage:
     stmt = select(Product)
     if not is_admin(user):
         stmt = stmt.where(Product.owner_user_id == user.id)
-    if status:
-        stmt = stmt.where(Product.status == status)
     rows = (await db.execute(stmt.order_by(Product.sku_code))).scalars().all()
+
+    filter_options = {
+        "sku_code": sorted({str(r.sku_code).strip() for r in rows if str(r.sku_code).strip()}),
+        "sku_name": sorted({str(r.sku_name).strip() for r in rows if str(r.sku_name).strip()}),
+        "mother_sku": sorted({str(r.mother_sku).strip() for r in rows if r.mother_sku is not None and str(r.mother_sku).strip()}),
+        "source": sorted(
+            {
+                normalize_source_value(r.source)
+                for r in rows
+                if normalize_source_value(r.source)
+            }
+        ),
+        "status": sorted({str(r.status).strip() for r in rows if str(r.status).strip()}),
+    }
+
+    filtered_rows = rows
+    if status_filter:
+        normalized_statuses: set[str] = set()
+        for raw in status_filter:
+            normalized_status = normalize_product_status(raw)
+            if normalized_status is None:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"Invalid status value: {raw}. Allowed: {STATUS_OPTIONS}",
+                )
+            normalized_statuses.add(normalized_status)
+        filtered_rows = [
+            r for r in filtered_rows if str(r.status).strip() in normalized_statuses
+        ]
+    if sku_code:
+        sku_code_values = _clean_values(sku_code)
+        filtered_rows = [
+            r for r in filtered_rows if str(r.sku_code).strip() in sku_code_values
+        ]
+    if sku_name:
+        sku_name_values = _clean_values(sku_name)
+        filtered_rows = [
+            r for r in filtered_rows if str(r.sku_name).strip() in sku_name_values
+        ]
+    if mother_sku:
+        mother_sku_values = _clean_values(mother_sku)
+        filtered_rows = [
+            r
+            for r in filtered_rows
+            if r.mother_sku is not None and str(r.mother_sku).strip() in mother_sku_values
+        ]
+    if source:
+        source_values = _clean_values(source)
+        filtered_rows = [
+            r
+            for r in filtered_rows
+            if any(source_matches(source_value, r.source) for source_value in source_values)
+        ]
+
     rows_out = [
         AssortmentItem(
             sku_code=r.sku_code,
@@ -166,10 +238,15 @@ async def list_assortment(
             sub_category=r.sub_category,
             subline=r.sub_line,
         )
-        for r in rows
+        for r in filtered_rows
     ]
     items, total_items, total_pages = _paginate_list(rows_out, page=page, page_size=page_size)
-    return AssortmentItemsPage(items=items, total_items=total_items, total_pages=total_pages)
+    return AssortmentItemsPage(
+        items=items,
+        total_items=total_items,
+        total_pages=total_pages,
+        filter_options=filter_options,
+    )
 
 
 @router.get("/status-options", response_model=List[str])
@@ -337,7 +414,9 @@ async def download_assortment_items(
 async def get_branch_stock_matrix(
     db: DBSession,
     user: CurrentUser,
-    sku_code: str | None = Query(None),
+    sku_code: list[str] | None = Query(None),
+    sku_name: list[str] | None = Query(None),
+    mother_sku: list[str] | None = Query(None),
     branch_name: str | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: str = Query("10"),
@@ -366,9 +445,30 @@ async def get_branch_stock_matrix(
         for r in rows
         if (r.owner_user_id, r.sku_id) in product_map
     ]
+    filter_options = {
+        "sku_code": sorted({str(x.sku_code).strip() for x in rows_out if str(x.sku_code).strip()}),
+        "sku_name": sorted({str(x.sku_name).strip() for x in rows_out if str(x.sku_name).strip()}),
+        "mother_sku": sorted(
+            {
+                str(x.mother_sku).strip()
+                for x in rows_out
+                if x.mother_sku is not None and str(x.mother_sku).strip()
+            }
+        ),
+    }
     if sku_code:
-        sku_norm = sku_code.strip()
-        rows_out = [x for x in rows_out if x.sku_code == sku_norm]
+        sku_values = _clean_values(sku_code)
+        rows_out = [x for x in rows_out if str(x.sku_code).strip() in sku_values]
+    if sku_name:
+        sku_name_values = _clean_values(sku_name)
+        rows_out = [x for x in rows_out if str(x.sku_name).strip() in sku_name_values]
+    if mother_sku:
+        mother_sku_values = _clean_values(mother_sku)
+        rows_out = [
+            x
+            for x in rows_out
+            if x.mother_sku is not None and str(x.mother_sku).strip() in mother_sku_values
+        ]
     if branch_name:
         branch_norm = normalize_branch_lookup(branch_name)
         rows_out = [x for x in rows_out if normalize_branch_lookup(x.branch_name) == branch_norm]
@@ -390,6 +490,7 @@ async def get_branch_stock_matrix(
         page_size=page_size_out,
         total_items=total_items,
         total_pages=total_pages,
+        filter_options=filter_options,
     )
 
 
@@ -470,13 +571,17 @@ async def update_branch_matrix_stock_norm(
 async def download_branch_matrix(
     db: DBSession,
     user: CurrentUser,
-    sku_code: str | None = Query(None),
+    sku_code: list[str] | None = Query(None),
+    sku_name: list[str] | None = Query(None),
+    mother_sku: list[str] | None = Query(None),
     branch_name: str | None = Query(None),
 ):
     rows_page = await get_branch_stock_matrix(
         db=db,
         user=user,
         sku_code=sku_code,
+        sku_name=sku_name,
+        mother_sku=mother_sku,
         branch_name=branch_name,
         page=1,
         page_size="all",
@@ -505,6 +610,9 @@ async def download_branch_matrix(
 async def get_price_list(
     db: DBSession,
     user: CurrentUser,
+    sku_code: list[str] | None = Query(None),
+    sku_name: list[str] | None = Query(None),
+    date: list[str] | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: str = Query("10"),
 ) -> PriceListPage:
@@ -527,8 +635,28 @@ async def get_price_list(
         for r in rows
         if (r.owner_user_id, r.sku_id) in product_by_key
     ]
-    items, total_items, total_pages = _paginate_list(rows_out, page=page, page_size=page_size)
-    return PriceListPage(items=items, total_items=total_items, total_pages=total_pages)
+    filter_options = {
+        "sku_code": sorted({str(r.sku_code).strip() for r in rows_out if str(r.sku_code).strip()}),
+        "sku_name": sorted({str(r.sku_name).strip() for r in rows_out if str(r.sku_name).strip()}),
+        "date": sorted({r.date.isoformat() for r in rows_out}),
+    }
+    filtered_rows = rows_out
+    if sku_code:
+        sku_values = _clean_values(sku_code)
+        filtered_rows = [r for r in filtered_rows if str(r.sku_code).strip() in sku_values]
+    if sku_name:
+        sku_name_values = _clean_values(sku_name)
+        filtered_rows = [r for r in filtered_rows if str(r.sku_name).strip() in sku_name_values]
+    if date is not None:
+        parsed_dates = _parse_date_values(date, field_name="date")
+        filtered_rows = [r for r in filtered_rows if r.date in parsed_dates]
+    items, total_items, total_pages = _paginate_list(filtered_rows, page=page, page_size=page_size)
+    return PriceListPage(
+        items=items,
+        total_items=total_items,
+        total_pages=total_pages,
+        filter_options=filter_options,
+    )
 
 
 @router.patch("/price-list")
@@ -617,17 +745,23 @@ async def update_price_list_rows(
 async def download_price_list(
     db: DBSession,
     user: CurrentUser,
-    sku_code: str | None = Query(None),
+    sku_code: list[str] | None = Query(None),
+    sku_name: list[str] | None = Query(None),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
 ):
     parsed_date_from = parse_query_date(date_from, field_name="date_from")
     parsed_date_to = parse_query_date(date_to, field_name="date_to", end_of_month=True)
-    rows_page = await get_price_list(db=db, user=user, page=1, page_size="all")
+    rows_page = await get_price_list(
+        db=db,
+        user=user,
+        sku_code=sku_code,
+        sku_name=sku_name,
+        date=[],
+        page=1,
+        page_size="all",
+    )
     filtered_rows = rows_page.items
-    if sku_code:
-        sku_norm = sku_code.strip()
-        filtered_rows = [r for r in filtered_rows if r.sku_code == sku_norm]
     if parsed_date_from:
         filtered_rows = [r for r in filtered_rows if r.date >= parsed_date_from]
     if parsed_date_to:
