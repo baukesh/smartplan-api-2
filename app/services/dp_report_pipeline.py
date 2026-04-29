@@ -72,6 +72,12 @@ def _round_qty(v: float | None) -> int:
     return int(round(float(v)))
 
 
+def _as_aware_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
 def _avg_last_n(values: list[float], n: int = 6) -> float:
     if not values:
         return 0.0
@@ -86,8 +92,8 @@ def _normalize_changed_keys(
         return None
     normalized: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
-    for sku_id, branch_id in changed_keys:
-        key = (str(sku_id).strip(), str(branch_id).strip())
+    for sku_code, branch_id in changed_keys:
+        key = (str(sku_code).strip(), str(branch_id).strip())
         if not key[0] or not key[1] or key in seen:
             continue
         seen.add(key)
@@ -111,7 +117,7 @@ async def refresh_forecast_sales_monthly(
 ) -> dict[str, int]:
     changed_keys = _normalize_changed_keys(changed_keys)
     products = {
-        p.sku_id: p
+        str(p.sku_code).strip(): p
         for p in (
             await db.execute(
                 select(Product).where(Product.owner_user_id == owner_user_id)
@@ -128,7 +134,7 @@ async def refresh_forecast_sales_monthly(
     )
     if changed_keys:
         hs_stmt = hs_stmt.where(
-            tuple_(HistoricalSalesMonthly.sku_id, HistoricalSalesMonthly.branch_id).in_(changed_keys)
+            tuple_(HistoricalSalesMonthly.sku_code, HistoricalSalesMonthly.branch_id).in_(changed_keys)
         )
     hist_rows = (await db.execute(hs_stmt)).scalars().all()
     prices = (
@@ -142,22 +148,26 @@ async def refresh_forecast_sales_monthly(
 
     prices_by_sku: dict[str, list[PriceList]] = defaultdict(list)
     for p in prices:
-        prices_by_sku[p.sku_id].append(p)
+        prices_by_sku[str(p.sku_code or "").strip()].append(p)
     for sku in prices_by_sku:
         prices_by_sku[sku].sort(key=lambda x: x.date)
 
     hist_by_key: dict[tuple[str, str], list[HistoricalSalesMonthly]] = defaultdict(list)
     for row in hist_rows:
-        hist_by_key[(row.sku_id, row.branch_id)].append(row)
+        hist_by_key[(str(row.sku_code or "").strip(), row.branch_id)].append(row)
     for key in hist_by_key:
         hist_by_key[key].sort(key=lambda x: x.date)
 
-    branch_stock = {(b.sku_id, b.branch_id): b.current_stock for b in branch_rows}
-    stock_norm_by_key = {(b.sku_id, b.branch_id): b.stock_norm for b in branch_rows}
+    branch_stock = {
+        (str(b.sku_code or "").strip(), b.branch_id): b.current_stock for b in branch_rows
+    }
+    stock_norm_by_key = {
+        (str(b.sku_code or "").strip(), b.branch_id): b.stock_norm for b in branch_rows
+    }
 
     placed_orders_by_sku: dict[str, list[PlacedOrder]] = defaultdict(list)
     for po in placed_orders:
-        placed_orders_by_sku[po.sku_id].append(po)
+        placed_orders_by_sku[str(po.sku_code or "").strip()].append(po)
     for sku in placed_orders_by_sku:
         placed_orders_by_sku[sku].sort(key=lambda x: x.creation_date)
 
@@ -165,7 +175,7 @@ async def refresh_forecast_sales_monthly(
         await db.execute(
             delete(ForecastSalesMonthly).where(
                 ForecastSalesMonthly.owner_user_id == owner_user_id,
-                tuple_(ForecastSalesMonthly.sku_id, ForecastSalesMonthly.branch_id).in_(changed_keys),
+                tuple_(ForecastSalesMonthly.sku_code, ForecastSalesMonthly.branch_id).in_(changed_keys),
             )
         )
     else:
@@ -179,8 +189,8 @@ async def refresh_forecast_sales_monthly(
 
     job_payloads: list[dict] = []
     for key, rows in hist_by_key.items():
-        sku_id, branch_id = key
-        product = products.get(sku_id)
+        sku_code, branch_id = key
+        product = products.get(sku_code)
         if not product:
             continue
         if not rows:
@@ -210,18 +220,18 @@ async def refresh_forecast_sales_monthly(
                 "quantity_in_mc": float(po.quantity_in_mc or 0.0),
                 "status": po.status,
             }
-            for po in placed_orders_by_sku.get(sku_id, [])
+            for po in placed_orders_by_sku.get(sku_code, [])
         ]
         cache_payload = {
-            "sku_id": sku_id,
+            "sku_code": sku_code,
             "branch_id": branch_id,
             "forecast_months": [d.isoformat() for d in forecast_months],
             "history_context": history_context[-24:],
             "orders_context": orders_context[-24:],
-            "current_stock": round(float(branch_stock.get((sku_id, branch_id), 0.0)), 6),
+            "current_stock": round(float(branch_stock.get((sku_code, branch_id), 0.0)), 6),
             "stock_norm_days": round(
                 float(
-                    stock_norm_by_key.get((sku_id, branch_id), product.general_stock_norm_days)
+                    stock_norm_by_key.get((sku_code, branch_id), product.general_stock_norm_days)
                     or 0.0
                 ),
                 6,
@@ -234,16 +244,16 @@ async def refresh_forecast_sales_monthly(
         ).hexdigest()
         job_payloads.append(
             {
-                "sku_id": sku_id,
+                "sku_code": sku_code,
                 "branch_id": branch_id,
                 "product": product,
                 "rows": rows,
                 "forecast_months": forecast_months,
                 "history_context": history_context,
                 "orders_context": orders_context,
-                "current_stock": float(branch_stock.get((sku_id, branch_id), 0.0)),
+                "current_stock": float(branch_stock.get((sku_code, branch_id), 0.0)),
                 "stock_norm_days": float(
-                    stock_norm_by_key.get((sku_id, branch_id), product.general_stock_norm_days)
+                    stock_norm_by_key.get((sku_code, branch_id), product.general_stock_norm_days)
                     or 0.0
                 ),
                 "cache_key": cache_key,
@@ -276,7 +286,7 @@ async def refresh_forecast_sales_monthly(
         ).scalars().all()
         cache_rows_by_hash = {row.payload_hash: row for row in cache_rows}
 
-    cache_upserts: dict[str, tuple[str, str, list[float]]] = {}
+    cache_upserts: dict[str, tuple[str, str, str, list[float]]] = {}
 
     async def _get_baseline_series(job: dict) -> list[float]:
         nonlocal gpt_attempted, gpt_fallbacks, cache_hits
@@ -298,7 +308,7 @@ async def refresh_forecast_sales_monthly(
 
         if settings.PERSISTENT_FORECAST_CACHE_ENABLED:
             cache_row = cache_rows_by_hash.get(cache_key)
-            if cache_row and cache_row.expires_at >= now_utc:
+            if cache_row and _as_aware_utc(cache_row.expires_at) >= now_utc:
                 try:
                     persisted = json.loads(cache_row.forecast_values_json)
                     if isinstance(persisted, list):
@@ -311,7 +321,7 @@ async def refresh_forecast_sales_monthly(
         async with semaphore:
             gpt_attempted += 1
             series = await forecast_baseline_quantities_in_mc(
-                sku_id=job["sku_id"],
+                sku_code=job["sku_code"],
                 branch_id=job["branch_id"],
                 forecast_months=job["forecast_months"],
                 history=job["history_context"],
@@ -322,7 +332,12 @@ async def refresh_forecast_sales_monthly(
             )
         memo[cache_key] = series
         if settings.PERSISTENT_FORECAST_CACHE_ENABLED:
-            cache_upserts[cache_key] = (job["sku_id"], job["branch_id"], series)
+            cache_upserts[cache_key] = (
+                str(job["product"].sku_id),
+                str(job["sku_code"]),
+                job["branch_id"],
+                series,
+            )
         return series
 
     baseline_series_by_key: dict[tuple[str, str], list[float]] = {}
@@ -331,16 +346,17 @@ async def refresh_forecast_sales_monthly(
             *[_get_baseline_series(job) for job in job_payloads]
         )
         for idx, job in enumerate(job_payloads):
-            baseline_series_by_key[(job["sku_id"], job["branch_id"])] = series_results[idx]
+            baseline_series_by_key[(job["sku_code"], job["branch_id"])] = series_results[idx]
 
     if settings.PERSISTENT_FORECAST_CACHE_ENABLED and cache_upserts:
-        for payload_hash, (sku_id, branch_id, series) in cache_upserts.items():
+        for payload_hash, (sku_id, sku_code, branch_id, series) in cache_upserts.items():
             cache_row = cache_rows_by_hash.get(payload_hash)
             if cache_row is None:
                 db.add(
                     ForecastInferenceCache(
                         owner_user_id=owner_user_id or 0,
                         sku_id=sku_id,
+                        sku_code=sku_code,
                         branch_id=branch_id,
                         model_name=settings.OPENAI_FORECAST_MODEL,
                         schema_version=settings.FORECAST_CACHE_SCHEMA_VERSION,
@@ -355,17 +371,17 @@ async def refresh_forecast_sales_monthly(
         cache_writes = len(cache_upserts)
 
     for job in job_payloads:
-        sku_id = job["sku_id"]
+        sku_code = job["sku_code"]
         branch_id = job["branch_id"]
         product = job["product"]
         prev_stock = float(job["current_stock"])
         forecast_months = job["forecast_months"]
-        baseline_series = baseline_series_by_key.get((sku_id, branch_id), [])
+        baseline_series = baseline_series_by_key.get((sku_code, branch_id), [])
 
         for idx, forecast_date in enumerate(forecast_months):
             baseline_qty = float(baseline_series[idx]) if idx < len(baseline_series) else 0.0
             closest_dsp = _closest_price_on_or_before(
-                prices_by_sku.get(sku_id, []), forecast_date
+                prices_by_sku.get(sku_code, []), forecast_date
             )
             baseline_amount = None
             if closest_dsp is not None:
@@ -375,7 +391,8 @@ async def refresh_forecast_sales_monthly(
             future_stock = max(prev_stock - baseline_qty, 0.0)
             to_insert.append(
                 ForecastSalesMonthly(
-                    sku_id=sku_id,
+                    sku_id=product.sku_id,
+                    sku_code=sku_code,
                     branch_id=branch_id,
                     date=forecast_date,
                     baseline_forecast_quantity_in_mc=float(_round_qty(baseline_qty)),
@@ -430,12 +447,12 @@ async def refresh_dp_report_mart(
         ForecastSalesMonthly.owner_user_id == owner_user_id
     )
     if changed_skus:
-        hs_stmt = hs_stmt.where(HistoricalSalesMonthly.sku_id.in_(changed_skus))
-        fc_stmt = fc_stmt.where(ForecastSalesMonthly.sku_id.in_(changed_skus))
+        hs_stmt = hs_stmt.where(HistoricalSalesMonthly.sku_code.in_(changed_skus))
+        fc_stmt = fc_stmt.where(ForecastSalesMonthly.sku_code.in_(changed_skus))
         await db.execute(
             delete(DPReportMart).where(
                 DPReportMart.owner_user_id == owner_user_id,
-                DPReportMart.sku_id.in_(changed_skus),
+                DPReportMart.sku_code.in_(changed_skus),
             )
         )
     else:
@@ -449,6 +466,7 @@ async def refresh_dp_report_mart(
         to_insert.append(
             DPReportMart(
                 sku_id=r.sku_id,
+                sku_code=r.sku_code,
                 date=r.date,
                 branch_id=r.branch_id,
                 fact_quantity_in_mc=r.fact_quantity_in_mc,
@@ -477,6 +495,7 @@ async def refresh_dp_report_mart(
         to_insert.append(
             DPReportMart(
                 sku_id=r.sku_id,
+                sku_code=r.sku_code,
                 date=r.date,
                 branch_id=r.branch_id,
                 fact_quantity_in_mc=None,
@@ -515,7 +534,7 @@ async def refresh_forecast_orders(
         ForecastSalesMonthly.owner_user_id == owner_user_id
     )
     if changed_skus:
-        fc_stmt = fc_stmt.where(ForecastSalesMonthly.sku_id.in_(changed_skus))
+        fc_stmt = fc_stmt.where(ForecastSalesMonthly.sku_code.in_(changed_skus))
     fc_rows = (await db.execute(fc_stmt)).scalars().all()
     pb_rows = (
         await db.execute(
@@ -526,24 +545,24 @@ async def refresh_forecast_orders(
         HistoricalSalesMonthly.owner_user_id == owner_user_id
     )
     if changed_skus:
-        hs_stmt = hs_stmt.where(HistoricalSalesMonthly.sku_id.in_(changed_skus))
+        hs_stmt = hs_stmt.where(HistoricalSalesMonthly.sku_code.in_(changed_skus))
     hist_rows = (await db.execute(hs_stmt)).scalars().all()
 
-    pb_norm = {(r.sku_id, r.branch_id): float(r.stock_norm) for r in pb_rows}
+    pb_norm = {(str(r.sku_code or "").strip(), r.branch_id): float(r.stock_norm) for r in pb_rows}
 
     by_sku_date_branch: dict[str, dict[date, dict[str, ForecastSalesMonthly]]] = defaultdict(
         lambda: defaultdict(dict)
     )
     for row in fc_rows:
-        by_sku_date_branch[row.sku_id][row.date][row.branch_id] = row
+        by_sku_date_branch[str(row.sku_code or "").strip()][row.date][row.branch_id] = row
     hist_qty_total_by_sku_date: dict[tuple[str, date], float] = defaultdict(float)
     for row in hist_rows:
-        hist_qty_total_by_sku_date[(row.sku_id, row.date)] += float(
+        hist_qty_total_by_sku_date[(str(row.sku_code or "").strip(), row.date)] += float(
             row.fact_quantity_in_mc or 0.0
         )
     fc_qty_total_by_sku_date: dict[tuple[str, date], float] = defaultdict(float)
     for row in fc_rows:
-        fc_qty_total_by_sku_date[(row.sku_id, row.date)] += float(
+        fc_qty_total_by_sku_date[(str(row.sku_code or "").strip(), row.date)] += float(
             row.adjusted_forecast_quantity_in_mc
             if row.adjusted_forecast_quantity_in_mc is not None
             else row.baseline_forecast_quantity_in_mc
@@ -553,7 +572,7 @@ async def refresh_forecast_orders(
         await db.execute(
             delete(ForecastOrders).where(
                 ForecastOrders.owner_user_id == owner_user_id,
-                ForecastOrders.sku_id.in_(changed_skus),
+                ForecastOrders.sku_code.in_(changed_skus),
             )
         )
     else:
@@ -562,7 +581,7 @@ async def refresh_forecast_orders(
         )
     inserts: list[ForecastOrders] = []
 
-    for sku_id, date_map in by_sku_date_branch.items():
+    for sku_code, date_map in by_sku_date_branch.items():
         dates = sorted(date_map.keys())
         for idx, d in enumerate(dates):
             prev_d = _prev_month(d)
@@ -579,11 +598,11 @@ async def refresh_forecast_orders(
             # Per month, prefer historical fact; otherwise fallback to forecast.
             l3_months = [d, _prev_month(d), _prev_month(_prev_month(d))]
             for dd in l3_months:
-                hist_total = hist_qty_total_by_sku_date.get((sku_id, dd))
+                hist_total = hist_qty_total_by_sku_date.get((sku_code, dd))
                 if hist_total is not None:
                     l3_vals.append(float(hist_total))
                     continue
-                fc_total = fc_qty_total_by_sku_date.get((sku_id, dd))
+                fc_total = fc_qty_total_by_sku_date.get((sku_code, dd))
                 if fc_total is not None:
                     l3_vals.append(float(fc_total))
                     continue
@@ -604,13 +623,15 @@ async def refresh_forecast_orders(
                     if branch_id in prev_branch_rows
                     else 0.0
                 )
-                stock_norm = pb_norm.get((sku_id, branch_id), 0.0)
+                stock_norm = pb_norm.get((sku_code, branch_id), 0.0)
                 needed = stock_norm * (avg_f3 / 30.0)
                 rec_total += max(needed - prior_stock_b, 0.0)
 
+            sku_id = next(iter(date_map[d].values())).sku_id if date_map[d] else ""
             inserts.append(
                 ForecastOrders(
                     sku_id=sku_id,
+                    sku_code=sku_code,
                     date=d,
                     month_prior_available_stock=_round2(month_prior_stock) or 0.0,
                     average_l3m_quantity_in_mc=float(_round_qty(avg_l3)),
@@ -629,7 +650,7 @@ async def refresh_inventory_health(
     db: AsyncSession, owner_user_id: int | None = None
 ) -> None:
     products = {
-        p.sku_id: p
+        str(p.sku_code).strip(): p
         for p in (
             await db.execute(select(Product).where(Product.owner_user_id == owner_user_id))
         ).scalars().all()
@@ -657,21 +678,21 @@ async def refresh_inventory_health(
         await db.execute(select(PriceList).where(PriceList.owner_user_id == owner_user_id))
     ).scalars().all()
 
-    pb_map = {(r.sku_id, r.branch_id): r for r in pb_rows}
-    hist_map = {(r.sku_id, r.branch_id, r.date): r for r in hist_rows}
-    fc_map = {(r.sku_id, r.branch_id, r.date): r for r in fc_rows}
+    pb_map = {(str(r.sku_code or "").strip(), r.branch_id): r for r in pb_rows}
+    hist_map = {(str(r.sku_code or "").strip(), r.branch_id, r.date): r for r in hist_rows}
+    fc_map = {(str(r.sku_code or "").strip(), r.branch_id, r.date): r for r in fc_rows}
 
     prices_by_sku: dict[str, list[PriceList]] = defaultdict(list)
     for p in prices:
-        prices_by_sku[p.sku_id].append(p)
+        prices_by_sku[str(p.sku_code or "").strip()].append(p)
     for sku in prices_by_sku:
         prices_by_sku[sku].sort(key=lambda x: x.date)
 
     key_dates: dict[tuple[str, str], set[date]] = defaultdict(set)
     for r in hist_rows:
-        key_dates[(r.sku_id, r.branch_id)].add(r.date)
+        key_dates[(str(r.sku_code or "").strip(), r.branch_id)].add(r.date)
     for r in fc_rows:
-        key_dates[(r.sku_id, r.branch_id)].add(r.date)
+        key_dates[(str(r.sku_code or "").strip(), r.branch_id)].add(r.date)
 
     total_sales_by_date: dict[date, float] = defaultdict(float)
     for r in hist_rows:
@@ -683,22 +704,22 @@ async def refresh_inventory_health(
     inserts: list[InventoryHealth] = []
     temp_rows: list[dict] = []
 
-    for (sku_id, branch_id), dates in key_dates.items():
-        product = products.get(sku_id)
+    for (sku_code, branch_id), dates in key_dates.items():
+        product = products.get(sku_code)
         if not product:
             continue
-        pb = pb_map.get((sku_id, branch_id))
+        pb = pb_map.get((sku_code, branch_id))
         fc_for_key = sorted(
-            [r for r in fc_rows if r.sku_id == sku_id and r.branch_id == branch_id],
+            [r for r in fc_rows if str(r.sku_code or "").strip() == sku_code and r.branch_id == branch_id],
             key=lambda x: x.date,
         )
         fc_dates = [r.date for r in fc_for_key]
         for d in sorted(dates):
-            hist = hist_map.get((sku_id, branch_id, d))
-            fc = fc_map.get((sku_id, branch_id, d))
+            hist = hist_map.get((sku_code, branch_id, d))
+            fc = fc_map.get((sku_code, branch_id, d))
 
             sales_qty = float(hist.fact_quantity_in_mc) if hist else 0.0
-            closest_price = _closest_price_on_or_before(prices_by_sku.get(sku_id, []), d)
+            closest_price = _closest_price_on_or_before(prices_by_sku.get(sku_code, []), d)
             dsp = float(closest_price.dsp) if closest_price else 0.0
 
             if hist:
@@ -735,7 +756,8 @@ async def refresh_inventory_health(
             )
             temp_rows.append(
                 {
-                    "sku_id": sku_id,
+                    "sku_id": product.sku_id,
+                    "sku_code": sku_code,
                     "branch_id": branch_id,
                     "date": d,
                     "sales_qty": sales_qty,
@@ -756,7 +778,7 @@ async def refresh_inventory_health(
 
     sku_totals: dict[str, float] = defaultdict(float)
     for r in temp_rows:
-        sku_totals[r["sku_id"]] += r["sales_qty"]
+        sku_totals[r["sku_code"]] += r["sales_qty"]
     total_stock_by_date: dict[date, float] = defaultdict(float)
     for r in temp_rows:
         total_stock_by_date[r["date"]] += r["available_stock"]
@@ -784,6 +806,7 @@ async def refresh_inventory_health(
         inserts.append(
             InventoryHealth(
                 sku_id=r["sku_id"],
+                sku_code=r["sku_code"],
                 branch_id=r["branch_id"],
                 date=r["date"],
                 sales_quantity_in_mc=_round2(r["sales_qty"]) or 0.0,
@@ -799,7 +822,7 @@ async def refresh_inventory_health(
                 overstock=_round2(r["overstock"]) or 0.0,
                 understock=_round2(r["understock"]) or 0.0,
                 stock_out=_round2(r["stock_out"]) or 0.0,
-                category=categories.get(r["sku_id"], "C"),
+                category=categories.get(r["sku_code"], "C"),
                 health_index=_round2(health_index) or 0.0,
                 owner_user_id=owner_user_id or 0,
             )
@@ -813,7 +836,7 @@ async def refresh_branch_distribution(
     db: AsyncSession, owner_user_id: int | None = None
 ) -> None:
     products = {
-        p.sku_id: p
+        str(p.sku_code).strip(): p
         for p in (
             await db.execute(select(Product).where(Product.owner_user_id == owner_user_id))
         ).scalars().all()
@@ -839,11 +862,11 @@ async def refresh_branch_distribution(
 
     latest_dsp_by_sku: dict[str, float] = {}
     for p in sorted(prices, key=lambda x: x.date):
-        latest_dsp_by_sku[p.sku_id] = p.dsp
+        latest_dsp_by_sku[str(p.sku_code or "").strip()] = p.dsp
 
     latest_fo_by_sku: dict[str, ForecastOrders] = {}
     for row in sorted(fo_rows, key=lambda x: x.date):
-        latest_fo_by_sku[row.sku_id] = row
+        latest_fo_by_sku[str(row.sku_code or "").strip()] = row
 
     branch_buckets: dict[str, dict[str, float]] = defaultdict(
         lambda: {
@@ -860,29 +883,30 @@ async def refresh_branch_distribution(
 
     pb_by_sku: dict[str, list[ProductBranch]] = defaultdict(list)
     for pb in pb_rows:
-        pb_by_sku[pb.sku_id].append(pb)
-        product = products.get(pb.sku_id)
+        sku_code = str(pb.sku_code or "").strip()
+        pb_by_sku[sku_code].append(pb)
+        product = products.get(sku_code)
         if not product:
             continue
-        dsp = latest_dsp_by_sku.get(pb.sku_id, 0.0)
+        dsp = latest_dsp_by_sku.get(sku_code, 0.0)
         b = branch_buckets[pb.branch_id]
         b["available_quantity_in_mc"] += pb.current_stock
         b["available_volume_cbm"] += pb.current_stock * product.master_carton_volume_cbm
         b["available_gross_weight_kg"] += pb.current_stock * product.master_carton_gross_weight_kg
         b["available_amount_kzt"] += pb.current_stock * product.pieces_in_master_carton * dsp
 
-    for sku_id, fo in latest_fo_by_sku.items():
-        branches = pb_by_sku.get(sku_id, [])
+    for sku_code, fo in latest_fo_by_sku.items():
+        branches = pb_by_sku.get(sku_code, [])
         if not branches:
             continue
-        product = products.get(sku_id)
+        product = products.get(sku_code)
         if not product:
             continue
         total_norm = sum(b.stock_norm for b in branches)
         if total_norm <= 0:
             total_norm = float(len(branches))
         qty_total = fo.adjusted_quantity_in_mc or fo.recommended_quantity_in_mc
-        dsp = latest_dsp_by_sku.get(sku_id, 0.0)
+        dsp = latest_dsp_by_sku.get(sku_code, 0.0)
         for b in branches:
             share = (b.stock_norm / total_norm) if total_norm else 0.0
             qty = qty_total * share
@@ -945,7 +969,7 @@ async def refresh_all_materialized(
 ) -> None:
     changed_keys = _normalize_changed_keys(changed_keys)
     changed_skus = (
-        sorted({sku_id for sku_id, _branch_id in changed_keys}) if changed_keys else None
+        sorted({sku_code for sku_code, _branch_id in changed_keys}) if changed_keys else None
     )
     use_incremental = bool(
         settings.INCREMENTAL_REFRESH_ENABLED and changed_keys and len(changed_keys) > 0

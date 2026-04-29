@@ -122,7 +122,7 @@ def _parse_page_size(page_size: str) -> int | None:
     if normalized not in PAGE_SIZE_MAP:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="page_size must be one of: 10, 50, 100, all",
+            detail="Параметр page_size должен быть одним из: 10, 50, 100, all",
         )
     return PAGE_SIZE_MAP[normalized]
 
@@ -167,20 +167,6 @@ async def list_assortment(
         stmt = stmt.where(Product.owner_user_id == user.id)
     rows = (await db.execute(stmt.order_by(Product.sku_code))).scalars().all()
 
-    filter_options = {
-        "sku_code": sorted({str(r.sku_code).strip() for r in rows if str(r.sku_code).strip()}),
-        "sku_name": sorted({str(r.sku_name).strip() for r in rows if str(r.sku_name).strip()}),
-        "mother_sku": sorted({str(r.mother_sku).strip() for r in rows if r.mother_sku is not None and str(r.mother_sku).strip()}),
-        "source": sorted(
-            {
-                normalize_source_value(r.source)
-                for r in rows
-                if normalize_source_value(r.source)
-            }
-        ),
-        "status": sorted({str(r.status).strip() for r in rows if str(r.status).strip()}),
-    }
-
     filtered_rows = rows
     if status_filter:
         normalized_statuses: set[str] = set()
@@ -189,7 +175,7 @@ async def list_assortment(
             if normalized_status is None:
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail=f"Invalid status value: {raw}. Allowed: {STATUS_OPTIONS}",
+                    detail=f"Недопустимое значение status: {raw}. Допустимые: {STATUS_OPTIONS}",
                 )
             normalized_statuses.add(normalized_status)
         filtered_rows = [
@@ -240,6 +226,19 @@ async def list_assortment(
         )
         for r in filtered_rows
     ]
+    filter_options = {
+        "sku_code": sorted({str(r.sku_code).strip() for r in rows_out if str(r.sku_code).strip()}),
+        "sku_name": sorted({str(r.sku_name).strip() for r in rows_out if str(r.sku_name).strip()}),
+        "mother_sku": sorted(
+            {
+                str(r.mother_sku).strip()
+                for r in rows_out
+                if r.mother_sku is not None and str(r.mother_sku).strip()
+            }
+        ),
+        "source": sorted({str(r.source).strip() for r in rows_out if str(r.source).strip()}),
+        "status": sorted({str(r.status).strip() for r in rows_out if str(r.status).strip()}),
+    }
     items, total_items, total_pages = _paginate_list(rows_out, page=page, page_size=page_size)
     return AssortmentItemsPage(
         items=items,
@@ -263,13 +262,13 @@ async def update_assortment_item_statuses(
     if not payload.updates:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="No status updates provided",
+            detail="Не переданы изменения статусов",
         )
     invalid = [u.status for u in payload.updates if normalize_product_status(u.status) is None]
     if invalid:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Invalid status values: {sorted(set(invalid))}. Allowed: {STATUS_OPTIONS}",
+            detail=f"Недопустимые значения status: {sorted(set(invalid))}. Допустимые: {STATUS_OPTIONS}",
         )
 
     updated = 0
@@ -300,7 +299,7 @@ async def update_assortment_items_stock_norm_days(
     if not payload.updates:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="No stock_norm_days updates provided",
+            detail="Не переданы изменения stock_norm_days",
         )
 
     scope_stmt = select(Product)
@@ -333,7 +332,7 @@ async def update_assortment_items_stock_norm_days(
         for p in matches:
             result = await db.execute(
                 update(Product)
-                .where(Product.owner_user_id == p.owner_user_id, Product.sku_id == p.sku_id)
+                .where(Product.owner_user_id == p.owner_user_id, Product.sku_code == p.sku_code)
                 .values(general_stock_norm_days=float(item.general_stock_norm_days))
             )
             updated += int(result.rowcount or 0)
@@ -344,7 +343,7 @@ async def update_assortment_items_stock_norm_days(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={
                 "message": (
-                    "Some sku_code values were not found under current access/query filter scope"
+                    "Некоторые значения sku_code не найдены в текущей области доступа/фильтрации"
                 ),
                 "unresolved": unresolved,
             },
@@ -433,29 +432,18 @@ async def get_branch_stock_matrix(
     branches = (await db.execute(branch_stmt)).scalars().all()
     products = (await db.execute(product_stmt)).scalars().all()
     branch_map = {(b.owner_user_id, b.branch_id): b.branch_name for b in branches}
-    product_map = {(p.owner_user_id, p.sku_id): p for p in products}
+    product_map = {(p.owner_user_id, str(p.sku_code).strip()): p for p in products}
     rows_out = [
         BranchStockNormRow(
-            sku_code=product_map[(r.owner_user_id, r.sku_id)].sku_code,
-            sku_name=product_map[(r.owner_user_id, r.sku_id)].sku_name,
-            mother_sku=product_map[(r.owner_user_id, r.sku_id)].mother_sku,
+            sku_code=product_map[(r.owner_user_id, str(r.sku_code or "").strip())].sku_code,
+            sku_name=product_map[(r.owner_user_id, str(r.sku_code or "").strip())].sku_name,
+            mother_sku=product_map[(r.owner_user_id, str(r.sku_code or "").strip())].mother_sku,
             branch_name=branch_map.get((r.owner_user_id, r.branch_id), r.branch_id),
             stock_norm=r.stock_norm,
         )
         for r in rows
-        if (r.owner_user_id, r.sku_id) in product_map
+        if (r.owner_user_id, str(r.sku_code or "").strip()) in product_map
     ]
-    filter_options = {
-        "sku_code": sorted({str(x.sku_code).strip() for x in rows_out if str(x.sku_code).strip()}),
-        "sku_name": sorted({str(x.sku_name).strip() for x in rows_out if str(x.sku_name).strip()}),
-        "mother_sku": sorted(
-            {
-                str(x.mother_sku).strip()
-                for x in rows_out
-                if x.mother_sku is not None and str(x.mother_sku).strip()
-            }
-        ),
-    }
     if sku_code:
         sku_values = _clean_values(sku_code)
         rows_out = [x for x in rows_out if str(x.sku_code).strip() in sku_values]
@@ -472,6 +460,17 @@ async def get_branch_stock_matrix(
     if branch_name:
         branch_norm = normalize_branch_lookup(branch_name)
         rows_out = [x for x in rows_out if normalize_branch_lookup(x.branch_name) == branch_norm]
+    filter_options = {
+        "sku_code": sorted({str(x.sku_code).strip() for x in rows_out if str(x.sku_code).strip()}),
+        "sku_name": sorted({str(x.sku_name).strip() for x in rows_out if str(x.sku_name).strip()}),
+        "mother_sku": sorted(
+            {
+                str(x.mother_sku).strip()
+                for x in rows_out
+                if x.mother_sku is not None and str(x.mother_sku).strip()
+            }
+        ),
+    }
     unique_skus = sorted({x.sku_code for x in rows_out})
     size = _parse_page_size(page_size)
     total_items = len(unique_skus)
@@ -503,7 +502,7 @@ async def update_branch_matrix_stock_norm(
     if not payload.updates:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="No stock_norm updates provided",
+            detail="Не переданы изменения stock_norm",
         )
 
     product_stmt = select(Product)
@@ -514,13 +513,13 @@ async def update_branch_matrix_stock_norm(
     products = (await db.execute(product_stmt)).scalars().all()
     branches = (await db.execute(branch_stmt)).scalars().all()
 
-    product_ids_by_key: dict[tuple[int, str], str] = {
-        (p.owner_user_id, str(p.sku_code).strip()): p.sku_id for p in products
+    product_codes_by_key: dict[tuple[int, str], str] = {
+        (p.owner_user_id, str(p.sku_code).strip()): str(p.sku_code).strip() for p in products
     }
     branch_ids_by_key: dict[tuple[int, str], str] = {
         (b.owner_user_id, normalize_branch_lookup(b.branch_name)): b.branch_id for b in branches
     }
-    owners = sorted({owner_id for owner_id, _ in product_ids_by_key.keys()})
+    owners = sorted({owner_id for owner_id, _ in product_codes_by_key.keys()})
 
     updated = 0
     unresolved: list[dict[str, str]] = []
@@ -529,19 +528,22 @@ async def update_branch_matrix_stock_norm(
         normalized_branch = normalize_branch_lookup(item.branch_name)
         matched_any = False
         for owner_id in owners:
-            sku_id = product_ids_by_key.get((owner_id, normalized_sku))
+            sku_code_value = product_codes_by_key.get((owner_id, normalized_sku))
             branch_id = branch_ids_by_key.get((owner_id, normalized_branch))
-            if not sku_id or not branch_id:
+            if not sku_code_value or not branch_id:
                 continue
             matched_any = True
             stmt = (
                 update(ProductBranch)
                 .where(
                     ProductBranch.owner_user_id == owner_id,
-                    ProductBranch.sku_id == sku_id,
+                    ProductBranch.sku_code == sku_code_value,
                     ProductBranch.branch_id == branch_id,
                 )
-                .values(stock_norm=item.stock_norm)
+                .values(
+                    stock_norm=item.stock_norm,
+                    sku_code=sku_code_value,
+                )
             )
             result = await db.execute(stmt)
             updated += int(result.rowcount or 0)
@@ -558,7 +560,7 @@ async def update_branch_matrix_stock_norm(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail={
-                "message": "Some updates could not be resolved by sku_code/branch_name",
+                "message": "Некоторые изменения не удалось сопоставить по sku_code/branch_name",
                 "unresolved": unresolved,
             },
         )
@@ -623,23 +625,18 @@ async def get_price_list(
         product_stmt = product_stmt.where(Product.owner_user_id == user.id)
     rows = (await db.execute(stmt.order_by(PriceList.date))).scalars().all()
     products = (await db.execute(product_stmt)).scalars().all()
-    product_by_key = {(p.owner_user_id, p.sku_id): p for p in products}
+    product_by_key = {(p.owner_user_id, str(p.sku_code).strip()): p for p in products}
     rows_out = [
         PriceListRow(
-            sku_code=product_by_key[(r.owner_user_id, r.sku_id)].sku_code,
-            sku_name=product_by_key[(r.owner_user_id, r.sku_id)].sku_name,
+            sku_code=product_by_key[(r.owner_user_id, str(r.sku_code or "").strip())].sku_code,
+            sku_name=product_by_key[(r.owner_user_id, str(r.sku_code or "").strip())].sku_name,
             date=r.date,
             invoice_price=r.invoice_price,
             dsp=r.dsp,
         )
         for r in rows
-        if (r.owner_user_id, r.sku_id) in product_by_key
+        if (r.owner_user_id, str(r.sku_code or "").strip()) in product_by_key
     ]
-    filter_options = {
-        "sku_code": sorted({str(r.sku_code).strip() for r in rows_out if str(r.sku_code).strip()}),
-        "sku_name": sorted({str(r.sku_name).strip() for r in rows_out if str(r.sku_name).strip()}),
-        "date": sorted({r.date.isoformat() for r in rows_out}),
-    }
     filtered_rows = rows_out
     if sku_code:
         sku_values = _clean_values(sku_code)
@@ -650,6 +647,11 @@ async def get_price_list(
     if date is not None:
         parsed_dates = _parse_date_values(date, field_name="date")
         filtered_rows = [r for r in filtered_rows if r.date in parsed_dates]
+    filter_options = {
+        "sku_code": sorted({str(r.sku_code).strip() for r in filtered_rows if str(r.sku_code).strip()}),
+        "sku_name": sorted({str(r.sku_name).strip() for r in filtered_rows if str(r.sku_name).strip()}),
+        "date": sorted({r.date.isoformat() for r in filtered_rows}),
+    }
     items, total_items, total_pages = _paginate_list(filtered_rows, page=page, page_size=page_size)
     return PriceListPage(
         items=items,
@@ -678,20 +680,20 @@ async def update_price_list_rows(
     sku_by_owner_and_code: dict[tuple[int, str], str] = {}
     for p in products:
         normalized = _normalize_sku_lookup(p.sku_code)
-        sku_by_owner_and_code[(p.owner_user_id, normalized)] = p.sku_id
+        sku_by_owner_and_code[(p.owner_user_id, normalized)] = str(p.sku_code).strip()
     owners = sorted({owner_id for owner_id, _ in sku_by_owner_and_code.keys()})
 
     normalized_sku = _normalize_sku_lookup(sku_code)
     updated = 0
     conflicts: list[dict[str, str]] = []
     for owner_id in owners:
-        sku_id = sku_by_owner_and_code.get((owner_id, normalized_sku))
-        if not sku_id:
+        sku_code_value = sku_by_owner_and_code.get((owner_id, normalized_sku))
+        if not sku_code_value:
             continue
         if payload.new_date != date:
             existing_stmt = select(PriceList.id).where(
                 PriceList.owner_user_id == owner_id,
-                PriceList.sku_id == sku_id,
+                PriceList.sku_code == sku_code_value,
                 PriceList.date == payload.new_date,
             )
             existing_row = (await db.execute(existing_stmt)).first()
@@ -707,13 +709,14 @@ async def update_price_list_rows(
             update(PriceList)
             .where(
                 PriceList.owner_user_id == owner_id,
-                PriceList.sku_id == sku_id,
+                PriceList.sku_code == sku_code_value,
                 PriceList.date == date,
             )
             .values(
                 date=payload.new_date,
                 invoice_price=payload.invoice_price,
                 dsp=payload.dsp,
+                sku_code=sku_code.strip(),
             )
         )
         result = await db.execute(stmt)
@@ -724,7 +727,7 @@ async def update_price_list_rows(
             status_code=status.HTTP_409_CONFLICT,
             detail={
                 "message": (
-                    "Cannot update date: target date already exists for the same sku_code"
+                    "Невозможно обновить дату: целевая дата уже существует для данного sku_code"
                 ),
                 "conflicts": conflicts,
             },
@@ -734,7 +737,7 @@ async def update_price_list_rows(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=(
-                "Price-list row not found for provided sku_code/date under current access scope"
+                "Строка price-list не найдена для переданных sku_code/date в текущей области доступа"
             ),
         )
     await db.commit()

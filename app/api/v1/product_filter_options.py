@@ -14,6 +14,7 @@ class ProductFilterOptionsResponse(BaseModel):
     sub_category: list[str]
     subline: list[str]
     sku_code: list[str]
+    sku_name: list[str]
 
 
 def _clean_list(values: list[str] | None) -> list[str]:
@@ -27,6 +28,7 @@ async def get_product_filter_options(
     db: DBSession,
     user: CurrentUser,
     sku_code: list[str] | None = Query(default=None),
+    sku_name: list[str] | None = Query(default=None),
     brand: list[str] | None = Query(default=None),
     category: list[str] | None = Query(default=None),
     sub_category: list[str] | None = Query(default=None),
@@ -38,6 +40,7 @@ async def get_product_filter_options(
     products = (await db.execute(stmt)).scalars().all()
 
     sku_set = set(_clean_list(sku_code))
+    sku_name_set = set(_clean_list(sku_name))
     brand_set = set(_clean_list(brand))
     category_set = set(_clean_list(category))
     sub_category_set = set(_clean_list(sub_category))
@@ -47,6 +50,7 @@ async def get_product_filter_options(
         p
         for p in products
         if (not sku_set or p.sku_code in sku_set)
+        and (not sku_name_set or p.sku_name in sku_name_set)
         and (not brand_set or p.brand in brand_set)
         and (not category_set or p.category in category_set)
         and (not sub_category_set or p.sub_category in sub_category_set)
@@ -70,5 +74,8 @@ async def get_product_filter_options(
         ),
         sku_code=sorted(
             {str(p.sku_code).strip() for p in filtered if str(p.sku_code).strip()}
+        ),
+        sku_name=sorted(
+            {str(p.sku_name).strip() for p in filtered if str(p.sku_name).strip()}
         ),
     )

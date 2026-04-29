@@ -2,10 +2,13 @@ from io import BytesIO
 from datetime import UTC, date, datetime
 import logging
 import asyncio
+from pathlib import Path
+import zipfile
 
 import pandas as pd
 from fastapi import APIRouter, File, HTTPException, UploadFile, status
-from sqlalchemy import delete, inspect as sqla_inspect, select
+from fastapi.responses import StreamingResponse
+from sqlalchemy import delete, inspect as sqla_inspect, select, tuple_
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,6 +36,13 @@ REFRESH_DEBOUNCE_SECONDS = 2
 _pending_refresh_tasks: dict[int, asyncio.Task] = {}
 _pending_refresh_changed_keys: dict[int, set[tuple[str, str]]] = {}
 _refresh_status_by_owner: dict[int, dict] = {}
+TEMPLATE_FILENAMES = [
+    "assortment_template.xlsx",
+    "branch_stock_norm_template.xlsx",
+    "orders_template.xlsx",
+    "price_list_template.xlsx",
+    "sales_template.xlsx",
+]
 
 
 class UploadSpec:
@@ -58,13 +68,12 @@ def _owner_user_id(user: CurrentUser) -> int:
             return int(identity[0])
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Unable to resolve user id for upload operation",
+            detail="Не удалось определить идентификатор пользователя для операции загрузки",
         )
 
 
 ASSORTMENT_SPEC = UploadSpec(
     [
-        "sku_id",
         "sku_code",
         "mother_sku",
         "barcode",
@@ -95,7 +104,6 @@ BRANCH_STOCK_NORM_SPEC = UploadSpec(
 
 PRICE_LIST_SPEC = UploadSpec(
     [
-        "sku_id",
         "date",
         "invoice_price",
         "dsp",
@@ -134,7 +142,7 @@ def _load_excel(file: UploadFile) -> pd.DataFrame:
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Failed to parse Excel file: {exc}",
+            detail=f"Не удалось прочитать Excel-файл: {exc}",
         ) from exc
 
 
@@ -145,7 +153,7 @@ def _validate_columns(df: pd.DataFrame, spec: UploadSpec) -> list[dict]:
         errors.append(
             {
                 "type": "missing_columns",
-                "message": "One or more required columns are missing",
+                "message": "Отсутствует один или несколько обязательных столбцов",
                 "columns": missing,
             }
         )
@@ -168,7 +176,7 @@ def _parse_upload_date(value: object, *, allow_month_only: bool = True) -> date:
     if isinstance(value, date):
         return value
     if pd.isna(value):
-        raise ValueError("Date value is empty")
+        raise ValueError("Значение даты пустое")
 
     if isinstance(value, (int, float)):
         # Excel serial date format (origin 1899-12-30)
@@ -176,7 +184,7 @@ def _parse_upload_date(value: object, *, allow_month_only: bool = True) -> date:
 
     raw = str(value).strip()
     if not raw:
-        raise ValueError("Date value is empty")
+        raise ValueError("Значение даты пустое")
 
     # ISO full date.
     try:
@@ -216,7 +224,7 @@ def _parse_upload_date(value: object, *, allow_month_only: bool = True) -> date:
         pass
 
     raise ValueError(
-        "Unsupported date format. Use Excel date, YYYY-MM-DD, YYYY-MM, DD/MM/YYYY, or MM/YYYY"
+        "Неподдерживаемый формат даты. Используйте Excel-дату, YYYY-MM-DD, YYYY-MM, DD/MM/YYYY или MM/YYYY"
     )
 
 
@@ -265,12 +273,66 @@ async def _replace_records(
                     continue
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="Database is temporarily busy. Please retry upload.",
+                    detail="База данных временно занята. Повторите попытку загрузки.",
                 ) from exc
         if last_exc is not None:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Database is temporarily busy. Please retry upload.",
+                detail="База данных временно занята. Повторите попытку загрузки.",
+            ) from last_exc
+    return 0
+
+
+def _deduplicate_records_by_key(records: list[dict], key_fields: list[str]) -> list[dict]:
+    deduped: dict[tuple, dict] = {}
+    for record in records:
+        key = tuple(record.get(field) for field in key_fields)
+        deduped[key] = record
+    return list(deduped.values())
+
+
+async def _upsert_records_by_key(
+    db: AsyncSession,
+    model: type,
+    records: list[dict],
+    owner_user_id: int,
+    key_fields: list[str],
+) -> int:
+    deduped_records = _deduplicate_records_by_key(records, key_fields)
+    if not deduped_records:
+        return 0
+
+    async with UPLOAD_WRITE_LOCK:
+        max_attempts = 5
+        last_exc: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                key_values = [tuple(record.get(field) for field in key_fields) for record in deduped_records]
+                delete_stmt = delete(model).where(model.owner_user_id == owner_user_id)
+                if len(key_fields) == 1:
+                    field = getattr(model, key_fields[0])
+                    delete_stmt = delete_stmt.where(field.in_([key[0] for key in key_values]))
+                else:
+                    fields = [getattr(model, field_name) for field_name in key_fields]
+                    delete_stmt = delete_stmt.where(tuple_(*fields).in_(key_values))
+                await db.execute(delete_stmt)
+                db.add_all([model(**record) for record in deduped_records])
+                await db.commit()
+                return len(deduped_records)
+            except OperationalError as exc:
+                await db.rollback()
+                last_exc = exc
+                if "database is locked" in str(exc).lower() and attempt < max_attempts:
+                    await asyncio.sleep(0.3 * attempt)
+                    continue
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="База данных временно занята. Повторите попытку загрузки.",
+                ) from exc
+        if last_exc is not None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="База данных временно занята. Повторите попытку загрузки.",
             ) from last_exc
     return 0
 
@@ -377,7 +439,7 @@ async def _expand_changed_keys(
     db: AsyncSession,
     owner_user_id: int,
     direct_keys: list[tuple[str, str]] | None = None,
-    sku_ids: list[str] | None = None,
+    sku_codes: list[str] | None = None,
 ) -> list[tuple[str, str]]:
     collected: set[tuple[str, str]] = set()
     for sku_id, branch_id in direct_keys or []:
@@ -385,25 +447,25 @@ async def _expand_changed_keys(
         b = str(branch_id).strip()
         if s and b:
             collected.add((s, b))
-    normalized_skus = sorted({str(s).strip() for s in (sku_ids or []) if str(s).strip()})
-    if normalized_skus:
+    normalized_sku_codes = sorted({str(s).strip() for s in (sku_codes or []) if str(s).strip()})
+    if normalized_sku_codes:
         rows = (
             await db.execute(
                 select(ProductBranch).where(
                     ProductBranch.owner_user_id == owner_user_id,
-                    ProductBranch.sku_id.in_(normalized_skus),
+                    ProductBranch.sku_code.in_(normalized_sku_codes),
                 )
             )
         ).scalars().all()
         for row in rows:
-            collected.add((str(row.sku_id).strip(), str(row.branch_id).strip()))
+            collected.add((str(row.sku_code or "").strip(), str(row.branch_id).strip()))
     return sorted(collected)
 
 
 def _accumulate_changed_keys(owner_user_id: int, changed_keys: list[tuple[str, str]]) -> None:
     bucket = _pending_refresh_changed_keys.setdefault(owner_user_id, set())
-    for sku_id, branch_id in changed_keys:
-        s = str(sku_id).strip()
+    for sku_code, branch_id in changed_keys:
+        s = str(sku_code).strip()
         b = str(branch_id).strip()
         if s and b:
             bucket.add((s, b))
@@ -475,7 +537,7 @@ def _validate_historical_sales_columns(df: pd.DataFrame) -> list[dict]:
         errors.append(
             {
                 "type": "missing_columns",
-                "message": "One or more required columns are missing",
+                "message": "Отсутствует один или несколько обязательных столбцов",
                 "columns": missing,
             }
         )
@@ -483,7 +545,7 @@ def _validate_historical_sales_columns(df: pd.DataFrame) -> list[dict]:
         errors.append(
             {
                 "type": "missing_columns",
-                "message": "One of sku_id or sku_code must be provided",
+                "message": "Должен быть заполнен один из столбцов: sku_id или sku_code",
                 "columns": ["sku_id|sku_code"],
             }
         )
@@ -491,8 +553,62 @@ def _validate_historical_sales_columns(df: pd.DataFrame) -> list[dict]:
         errors.append(
             {
                 "type": "missing_columns",
-                "message": "One of branch_name or branch_id must be provided",
+                "message": "Должен присутствовать как минимум один из столбцов: branch_name или branch_id",
                 "columns": ["branch_name|branch_id"],
+            }
+        )
+    return errors
+
+
+def _validate_branch_stock_norm_columns(df: pd.DataFrame) -> list[dict]:
+    errors: list[dict] = []
+    required_columns = [
+        "branch_name",
+        "current_stock",
+        "stock_norm",
+    ]
+    missing = [c for c in required_columns if c not in df.columns]
+    if missing:
+        errors.append(
+            {
+                "type": "missing_columns",
+                "message": "Отсутствует один или несколько обязательных столбцов",
+                "columns": missing,
+            }
+        )
+    if "sku_id" not in df.columns and "sku_code" not in df.columns:
+        errors.append(
+            {
+                "type": "missing_columns",
+                "message": "Должен быть заполнен один из столбцов: sku_id или sku_code",
+                "columns": ["sku_id|sku_code"],
+            }
+        )
+    return errors
+
+
+def _validate_price_list_columns(df: pd.DataFrame) -> list[dict]:
+    errors: list[dict] = []
+    required_columns = [
+        "date",
+        "invoice_price",
+        "dsp",
+    ]
+    missing = [c for c in required_columns if c not in df.columns]
+    if missing:
+        errors.append(
+            {
+                "type": "missing_columns",
+                "message": "Отсутствует один или несколько обязательных столбцов",
+                "columns": missing,
+            }
+        )
+    if "sku_id" not in df.columns and "sku_code" not in df.columns:
+        errors.append(
+            {
+                "type": "missing_columns",
+                "message": "Должен быть заполнен один из столбцов: sku_id или sku_code",
+                "columns": ["sku_id|sku_code"],
             }
         )
     return errors
@@ -514,7 +630,7 @@ def _validate_placed_orders_columns(df: pd.DataFrame) -> list[dict]:
         errors.append(
             {
                 "type": "missing_columns",
-                "message": "One or more required columns are missing",
+                "message": "Отсутствует один или несколько обязательных столбцов",
                 "columns": missing,
             }
         )
@@ -522,11 +638,72 @@ def _validate_placed_orders_columns(df: pd.DataFrame) -> list[dict]:
         errors.append(
             {
                 "type": "missing_columns",
-                "message": "One of sku_id or sku_code must be provided",
+                "message": "Должен быть заполнен один из столбцов: sku_id или sku_code",
                 "columns": ["sku_id|sku_code"],
             }
         )
     return errors
+
+
+def _validate_assortment_columns(df: pd.DataFrame) -> list[dict]:
+    errors: list[dict] = []
+    required_columns = [
+        "sku_code",
+        "mother_sku",
+        "barcode",
+        "sku_name",
+        "pieces_in_master_carton",
+        "master_carton_volume_cbm",
+        "master_carton_gross_weight_kg",
+        "master_carton_net_weight_kg",
+        "lead_time",
+        "source",
+        "general_stock_norm_days",
+        "status",
+        "brand",
+        "category",
+        "sub_category",
+        "sub_line",
+    ]
+    missing = [c for c in required_columns if c not in df.columns]
+    if missing:
+        errors.append(
+            {
+                "type": "missing_columns",
+                "message": "Отсутствует один или несколько обязательных столбцов",
+                "columns": missing,
+            }
+        )
+    return errors
+
+
+@router.get("/download-excel-templates-zip/", include_in_schema=False)
+@router.get("/download-excel-templates-zip")
+async def download_excel_templates_zip(user: CurrentUser):
+    _ = user
+    templates_dir = Path(__file__).resolve().parents[3] / "tmp_uploads" / "upload_files_templates"
+    missing_files = [name for name in TEMPLATE_FILENAMES if not (templates_dir / name).exists()]
+    if missing_files:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "message": "Не найдены один или несколько файлов шаблонов",
+                "missing_files": missing_files,
+            },
+        )
+
+    output = BytesIO()
+    with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_DEFLATED) as zip_file:
+        for filename in TEMPLATE_FILENAMES:
+            file_path = templates_dir / filename
+            zip_file.write(file_path, arcname=filename)
+    output.seek(0)
+
+    return StreamingResponse(
+        output,
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="template.zip"'},
+    )
 
 
 @router.post("/assortment")
@@ -537,27 +714,46 @@ async def upload_assortment(
 ):
     owner_user_id = _owner_user_id(user)
     df = _load_excel(file)
-    errors = _validate_columns(df, ASSORTMENT_SPEC)
+    errors = _validate_assortment_columns(df)
     if errors:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=errors)
     records = df[ASSORTMENT_SPEC.required_columns].to_dict(orient="records")
-    for r in records:
+    row_errors: list[dict] = []
+    for idx, r in enumerate(records):
+        sku_code = str(r.get("sku_code", "") or "").strip()
+        if not sku_code:
+            row_errors.append(
+                _row_error(int(idx), "sku_code", "Поле sku_code не может быть пустым", error_type="required_field")
+            )
+            continue
+        # sku_id remains required by Product model; during sku_code cutover we mirror sku_code.
+        r["sku_id"] = sku_code
+        r["sku_code"] = sku_code
         normalized_status = normalize_product_status(str(r.get("status", "")))
         if normalized_status is None:
             normalized_status = "новый"
         r["status"] = normalized_status
         r["source"] = normalize_source_value(r.get("source"))
         r["owner_user_id"] = owner_user_id
-    count = await _replace_records(db, Product, records, owner_user_id=owner_user_id)
+    if row_errors:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=row_errors)
+    count = await _upsert_records_by_key(
+        db,
+        Product,
+        records,
+        owner_user_id=owner_user_id,
+        key_fields=["sku_code"],
+    )
     changed_keys = await _expand_changed_keys(
         db,
         owner_user_id=owner_user_id,
-        sku_ids=[str(r.get("sku_id", "")) for r in records],
+        sku_codes=[str(r.get("sku_code", "")) for r in records],
     )
     _accumulate_changed_keys(owner_user_id, changed_keys)
+    _schedule_materialized_refresh(owner_user_id)
     return {
         "rows_inserted": count,
-        "refresh_status": "deferred_until_orders_upload",
+        "refresh_status": "scheduled",
     }
 
 
@@ -569,7 +765,7 @@ async def upload_branch_stock_norm(
 ):
     owner_user_id = _owner_user_id(user)
     df = _load_excel(file)
-    errors = _validate_columns(df, BRANCH_STOCK_NORM_SPEC)
+    errors = _validate_branch_stock_norm_columns(df)
     if errors:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=errors)
     row_errors: list[dict] = []
@@ -581,7 +777,7 @@ async def upload_branch_stock_norm(
                 _row_error(
                     int(idx),
                     "current_stock",
-                    "current_stock cannot be empty",
+                    "Поле current_stock не может быть пустым",
                     error_type="required_field",
                 )
             )
@@ -593,7 +789,7 @@ async def upload_branch_stock_norm(
                     _row_error(
                         int(idx),
                         "current_stock",
-                        "current_stock must be a numeric value",
+                        "Поле current_stock должно быть числом",
                     )
                 )
         if pd.isna(stock_norm) or str(stock_norm).strip() == "":
@@ -601,7 +797,7 @@ async def upload_branch_stock_norm(
                 _row_error(
                     int(idx),
                     "stock_norm",
-                    "stock_norm cannot be empty",
+                    "Поле stock_norm не может быть пустым",
                     error_type="required_field",
                 )
             )
@@ -613,7 +809,7 @@ async def upload_branch_stock_norm(
                     _row_error(
                         int(idx),
                         "stock_norm",
-                        "stock_norm must be a numeric value",
+                        "Поле stock_norm должно быть числом",
                     )
                 )
     if row_errors:
@@ -623,27 +819,75 @@ async def upload_branch_stock_norm(
         owner_user_id=owner_user_id,
         branch_names=df["branch_name"].astype(str).tolist(),
     )
-    records = df[BRANCH_STOCK_NORM_SPEC.required_columns].to_dict(orient="records")
-    for r in records:
+    products = (
+        await db.execute(select(Product).where(Product.owner_user_id == owner_user_id))
+    ).scalars().all()
+    products_by_id = {str(p.sku_id).strip(): p for p in products}
+    products_by_code = {str(p.sku_code).strip(): p for p in products}
+    records = []
+    for _, row in df.iterrows():
+        records.append(
+            {
+                "sku_id": row.get("sku_id") if "sku_id" in df.columns else None,
+                "sku_code": row.get("sku_code") if "sku_code" in df.columns else None,
+                "branch_name": row.get("branch_name"),
+                "current_stock": row.get("current_stock"),
+                "stock_norm": row.get("stock_norm"),
+            }
+        )
+    row_errors: list[dict] = []
+    for idx, r in enumerate(records):
         branch_name = str(localize_branch_name(str(r.pop("branch_name")).strip()) or "").strip()
         r["branch_id"] = branch_map[branch_name]
+        raw_sku_id = r.get("sku_id")
+        raw_sku_code = r.get("sku_code")
+        sku_id_value = "" if pd.isna(raw_sku_id) else str(raw_sku_id or "").strip()
+        sku_code_value = "" if pd.isna(raw_sku_code) else str(raw_sku_code or "").strip()
+        raw_sku = sku_id_value or sku_code_value
+        if not raw_sku:
+            row_errors.append(
+                _row_error(
+                    int(idx),
+                    "sku_id|sku_code",
+                    "Должен быть заполнен sku_id или sku_code",
+                    error_type="required_field",
+                )
+            )
+            continue
+        product = products_by_id.get(raw_sku) or products_by_code.get(raw_sku)
+        if product is None:
+            row_errors.append(
+                _row_error(
+                    int(idx),
+                    "sku_id",
+                    f"Товар не найден для sku_id/sku_code '{raw_sku}'",
+                    error_type="foreign_key_missing",
+                )
+            )
+            continue
+        r["sku_id"] = str(product.sku_id).strip()
+        r["sku_code"] = str(product.sku_code).strip()
         r["current_stock"] = float(r["current_stock"])
         r["stock_norm"] = float(r["stock_norm"])
         r["owner_user_id"] = owner_user_id
+    if row_errors:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=row_errors)
     changed_keys = [
-        (str(r.get("sku_id", "")).strip(), str(r.get("branch_id", "")).strip())
+        (str(r.get("sku_code", "")).strip(), str(r.get("branch_id", "")).strip())
         for r in records
     ]
     _accumulate_changed_keys(owner_user_id, changed_keys)
-    count = await _replace_records(
+    count = await _upsert_records_by_key(
         db,
         ProductBranch,
         records,
         owner_user_id=owner_user_id,
+        key_fields=["sku_code", "branch_id"],
     )
+    _schedule_materialized_refresh(owner_user_id)
     return {
         "rows_inserted": count,
-        "refresh_status": "deferred_until_orders_upload",
+        "refresh_status": "scheduled",
     }
 
 
@@ -655,10 +899,10 @@ async def upload_price_list(
 ):
     owner_user_id = _owner_user_id(user)
     df = _load_excel(file)
-    errors = _validate_columns(df, PRICE_LIST_SPEC)
+    errors = _validate_price_list_columns(df)
     if errors:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=errors)
-    rows = df[PRICE_LIST_SPEC.required_columns].copy()
+    rows = df.copy()
     products = {
         p.sku_id: p
         for p in (
@@ -674,10 +918,19 @@ async def upload_price_list(
         except Exception as exc:
             row_errors.append(_row_error(int(idx), "date", str(exc)))
             continue
-        raw_sku_value = str(row["sku_id"]).strip()
+        raw_sku_id = row.get("sku_id") if "sku_id" in rows.columns else None
+        raw_sku_code = row.get("sku_code") if "sku_code" in rows.columns else None
+        sku_id_value = "" if pd.isna(raw_sku_id) else str(raw_sku_id).strip()
+        sku_code_value = "" if pd.isna(raw_sku_code) else str(raw_sku_code).strip()
+        raw_sku_value = sku_id_value or sku_code_value
         if not raw_sku_value:
             row_errors.append(
-                _row_error(int(idx), "sku_id", "sku_id cannot be empty", error_type="required_field")
+                _row_error(
+                    int(idx),
+                    "sku_id|sku_code",
+                    "Должен быть заполнен sku_id или sku_code",
+                    error_type="required_field",
+                )
             )
             continue
         product = products.get(raw_sku_value) or products_by_code.get(raw_sku_value)
@@ -685,10 +938,10 @@ async def upload_price_list(
             row_errors.append(
                 _row_error(
                     int(idx),
-                    "sku_id",
+                    "sku_id|sku_code",
                     (
-                        f"Product not found for sku_id='{raw_sku_value}'. "
-                        "Provide a valid sku_id or sku_code in the sku_id column."
+                        f"Товар не найден для sku_id='{sku_id_value}' и "
+                        f"sku_code='{sku_code_value}'"
                     ),
                     error_type="foreign_key_missing",
                 )
@@ -698,16 +951,17 @@ async def upload_price_list(
         try:
             invoice_price = float(row["invoice_price"])
         except Exception:
-            row_errors.append(_row_error(int(idx), "invoice_price", "Must be numeric"))
+            row_errors.append(_row_error(int(idx), "invoice_price", "Поле должно быть числом"))
             continue
         try:
             dsp = float(row["dsp"])
         except Exception:
-            row_errors.append(_row_error(int(idx), "dsp", "Must be numeric"))
+            row_errors.append(_row_error(int(idx), "dsp", "Поле должно быть числом"))
             continue
         records.append(
             {
                 "sku_id": sku_id,
+                "sku_code": str(product.sku_code).strip(),
                 "date": parsed_date,
                 "invoice_price": invoice_price,
                 "dsp": dsp,
@@ -716,18 +970,23 @@ async def upload_price_list(
         )
     if row_errors:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=row_errors)
-    count = await _replace_records(
-        db, PriceList, records, owner_user_id=owner_user_id
+    count = await _upsert_records_by_key(
+        db,
+        PriceList,
+        records,
+        owner_user_id=owner_user_id,
+        key_fields=["sku_code", "date"],
     )
     changed_keys = await _expand_changed_keys(
         db,
         owner_user_id=owner_user_id,
-        sku_ids=[str(r.get("sku_id", "")) for r in records],
+        sku_codes=[str(r.get("sku_code", "")) for r in records],
     )
     _accumulate_changed_keys(owner_user_id, changed_keys)
+    _schedule_materialized_refresh(owner_user_id)
     return {
         "rows_inserted": count,
-        "refresh_status": "deferred_until_orders_upload",
+        "refresh_status": "scheduled",
     }
 
 
@@ -817,7 +1076,7 @@ async def upload_historical_sales_monthly(
                 _row_error(
                     int(idx),
                     "sku_id|sku_code",
-                    "Either sku_id or sku_code must be provided",
+                    "Должен быть заполнен sku_id или sku_code",
                     error_type="required_field",
                 )
             )
@@ -833,7 +1092,7 @@ async def upload_historical_sales_monthly(
                     _row_error(
                         int(idx),
                         "sku_id|sku_code",
-                        "Conflicting sku_id and sku_code values in the same row",
+                        "Конфликтующие значения sku_id и sku_code в одной строке",
                         error_type="conflict",
                     )
                 )
@@ -846,7 +1105,7 @@ async def upload_historical_sales_monthly(
                     int(idx),
                     "sku_id|sku_code",
                     (
-                        f"Product not found for sku_id='{sku_id_value}' and "
+                        f"Товар не найден для sku_id='{sku_id_value}' и "
                         f"sku_code='{sku_code_value}'"
                     ),
                     error_type="foreign_key_missing",
@@ -855,10 +1114,20 @@ async def upload_historical_sales_monthly(
             continue
         sku_id = product.sku_id
 
+        raw_hub_name = row.get("hub_name") if "hub_name" in rows.columns else None
+        # Backward compatibility: legacy sales files may not contain hub_name.
+        if "hub_name" not in rows.columns:
+            hub_name = "KZ-HUB"
+        else:
+            hub_name = "" if pd.isna(raw_hub_name) else str(raw_hub_name).strip()
+            if not hub_name:
+                hub_name = "KZ-HUB"
+
         raw_branch_name = row.get("branch_name") if "branch_name" in rows.columns else None
         raw_branch_id = row.get("branch_id") if "branch_id" in rows.columns else None
         branch_name_value = None if pd.isna(raw_branch_name) else str(raw_branch_name).strip()
         branch_id_value = None if pd.isna(raw_branch_id) else str(raw_branch_id).strip()
+        is_hub_row = not branch_name_value and not branch_id_value
 
         resolved_branch_id_from_name = None
         if branch_name_value:
@@ -870,17 +1139,6 @@ async def upload_historical_sales_monthly(
             branch_id_value if branch_id_value and branch_id_value in branch_id_to_name else None
         )
 
-        if not branch_name_value and not branch_id_value:
-            row_errors.append(
-                _row_error(
-                    int(idx),
-                    "branch_name|branch_id",
-                    "Either branch_name or branch_id must be provided",
-                    error_type="required_field",
-                )
-            )
-            continue
-
         if branch_name_value and branch_id_value:
             if (
                 resolved_branch_id_from_name is not None
@@ -891,19 +1149,19 @@ async def upload_historical_sales_monthly(
                     _row_error(
                         int(idx),
                         "branch_name|branch_id",
-                        "Conflicting branch_name and branch_id values in the same row",
+                        "Конфликтующие значения branch_name и branch_id в одной строке",
                         error_type="conflict",
                     )
                 )
                 continue
 
-        branch_id = resolved_branch_id_from_name or resolved_branch_id_from_id
-        if branch_id is None:
+        branch_id = "" if is_hub_row else (resolved_branch_id_from_name or resolved_branch_id_from_id)
+        if not is_hub_row and branch_id is None:
             row_errors.append(
                 _row_error(
                     int(idx),
                     "branch_name|branch_id",
-                    "Branch not found for provided branch_name/branch_id",
+                    "Филиал не найден по переданным branch_name/branch_id",
                     error_type="foreign_key_missing",
                 )
             )
@@ -922,19 +1180,27 @@ async def upload_historical_sales_monthly(
             if _to_python_date(p.date) <= r_date:
                 closest_price = p
         try:
-            fact_qty = float(row["fact_quantity_in_mc"])
+            raw_fact_qty = row.get("fact_quantity_in_mc")
+            if is_hub_row and (pd.isna(raw_fact_qty) or str(raw_fact_qty).strip() == ""):
+                fact_qty = 0.0
+            else:
+                fact_qty = float(raw_fact_qty)
         except Exception:
-            row_errors.append(_row_error(int(idx), "fact_quantity_in_mc", "Must be numeric"))
+            row_errors.append(_row_error(int(idx), "fact_quantity_in_mc", "Поле должно быть числом"))
             continue
         try:
-            target_qty = float(row["target_quantity_in_mc"])
+            raw_target_qty = row.get("target_quantity_in_mc")
+            if is_hub_row and (pd.isna(raw_target_qty) or str(raw_target_qty).strip() == ""):
+                target_qty = 0.0
+            else:
+                target_qty = float(raw_target_qty)
         except Exception:
-            row_errors.append(_row_error(int(idx), "target_quantity_in_mc", "Must be numeric"))
+            row_errors.append(_row_error(int(idx), "target_quantity_in_mc", "Поле должно быть числом"))
             continue
         try:
             past_available_stock = float(row["past_available_stock"])
         except Exception:
-            row_errors.append(_row_error(int(idx), "past_available_stock", "Must be numeric"))
+            row_errors.append(_row_error(int(idx), "past_available_stock", "Поле должно быть числом"))
             continue
 
         fact_amount = (
@@ -950,6 +1216,8 @@ async def upload_historical_sales_monthly(
         prepared.append(
             {
                 "sku_id": sku_id,
+                "sku_code": str(product.sku_code).strip(),
+                "hub_name": hub_name,
                 "date": r_date,
                 "branch_id": branch_id,
                 "fact_quantity_in_mc": fact_qty,
@@ -971,17 +1239,22 @@ async def upload_historical_sales_monthly(
             detail=row_errors,
         )
 
-    count = await _replace_records(
-        db, HistoricalSalesMonthly, prepared, owner_user_id=owner_user_id
+    count = await _upsert_records_by_key(
+        db,
+        HistoricalSalesMonthly,
+        prepared,
+        owner_user_id=owner_user_id,
+        key_fields=["sku_code", "branch_id", "hub_name", "date"],
     )
     changed_keys = [
-        (str(r.get("sku_id", "")).strip(), str(r.get("branch_id", "")).strip())
+        (str(r.get("sku_code", "")).strip(), str(r.get("branch_id", "")).strip())
         for r in prepared
     ]
     _accumulate_changed_keys(owner_user_id, changed_keys)
+    _schedule_materialized_refresh(owner_user_id)
     return {
         "rows_inserted": count,
-        "refresh_status": "deferred_until_orders_upload",
+        "refresh_status": "scheduled",
     }
 
 
@@ -1032,7 +1305,7 @@ async def upload_placed_orders(
                 _row_error(
                     int(idx),
                     "sku_id|sku_code",
-                    "Either sku_id or sku_code must be provided",
+                    "Должен быть заполнен sku_id или sku_code",
                     error_type="required_field",
                 )
             )
@@ -1047,7 +1320,7 @@ async def upload_placed_orders(
                     _row_error(
                         int(idx),
                         "sku_id|sku_code",
-                        "Conflicting sku_id and sku_code values in the same row",
+                        "Конфликтующие значения sku_id и sku_code в одной строке",
                         error_type="conflict",
                     )
                 )
@@ -1060,7 +1333,7 @@ async def upload_placed_orders(
                     int(idx),
                     "sku_id|sku_code",
                     (
-                        f"Product not found for sku_id='{sku_id_value}' and "
+                        f"Товар не найден для sku_id='{sku_id_value}' и "
                         f"sku_code='{sku_code_value}'"
                     ),
                     error_type="foreign_key_missing",
@@ -1088,12 +1361,13 @@ async def upload_placed_orders(
         try:
             qty = float(row["quantity_in_mc"])
         except Exception:
-            row_errors.append(_row_error(int(idx), "quantity_in_mc", "Must be numeric"))
+            row_errors.append(_row_error(int(idx), "quantity_in_mc", "Поле должно быть числом"))
             continue
         prepared.append(
             {
                 "order_id": str(row["order_id"]),
                 "sku_id": sku_id,
+                "sku_code": str(product.sku_code).strip(),
                 "order_name": str(row["order_name"]),
                 "creation_date": c_date,
                 "receival_date": receival_date,
@@ -1117,11 +1391,17 @@ async def upload_placed_orders(
             detail=row_errors,
         )
 
-    count = await _replace_records(db, PlacedOrder, prepared, owner_user_id=owner_user_id)
+    count = await _upsert_records_by_key(
+        db,
+        PlacedOrder,
+        prepared,
+        owner_user_id=owner_user_id,
+        key_fields=["order_id", "sku_code"],
+    )
     changed_keys = await _expand_changed_keys(
         db,
         owner_user_id=owner_user_id,
-        sku_ids=[str(r.get("sku_id", "")) for r in prepared],
+        sku_codes=[str(r.get("sku_code", "")) for r in prepared],
     )
     _accumulate_changed_keys(owner_user_id, changed_keys)
     await refresh_orders_aggregated(db, owner_user_id=owner_user_id)

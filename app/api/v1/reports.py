@@ -8,8 +8,9 @@ from sqlalchemy import Select, exists, or_, select
 from app.api.date_params import parse_query_date
 from app.api.deps import CurrentUser, DBSession, is_admin, require_roles
 from app.core.branch_localization import localize_branch_name
-from app.models.data_uploads import Branch
-from app.models.reporting import DPReport, DPReportAccess
+from app.models.data_uploads import Branch, HistoricalSalesMonthly, Product
+from app.models.derived import ForecastSalesMonthly
+from app.models.reporting import DPReport, DPReportAccess, DPReportForecastOverride
 from app.models.user import User, UserRole
 from app.services.reporting_service import (
     build_report_tables,
@@ -22,6 +23,7 @@ from app.services.reporting_service import (
     replace_report_overrides,
     report_card_payload,
     to_json_string,
+    upsert_report_overrides,
 )
 
 router = APIRouter(prefix="/reports", tags=["reports"])
@@ -29,6 +31,7 @@ router = APIRouter(prefix="/reports", tags=["reports"])
 
 class ProductFilterPayload(BaseModel):
     sku_codes: list[str] = Field(default_factory=list)
+    sku_names: list[str] = Field(default_factory=list)
     brands: list[str] = Field(default_factory=list)
     categories: list[str] = Field(default_factory=list)
     sub_categories: list[str] = Field(default_factory=list)
@@ -110,14 +113,32 @@ class ForecastDetailedRow(BaseModel):
 
 class ReportDetailProjectedResponse(BaseModel):
     report: ReportCard
+    min_date: str | None = None
+    max_date: str | None = None
     historical_table: list[HistoricalProjectedRow]
     forecast_table: list[ForecastProjectedRow]
 
 
 class ReportDetailDetailedResponse(BaseModel):
     report: ReportCard
+    min_date: str | None = None
+    max_date: str | None = None
     historical_table: list[HistoricalDetailedRow]
     forecast_table: list[ForecastDetailedRow]
+
+
+class ReportOverrideRow(BaseModel):
+    period: str
+    baseline_forecast_value: float
+    adjusted_forecast_value: float
+    adjustment_reason: str | None = None
+
+
+class ReportOverrideResponse(BaseModel):
+    report: ReportCard
+    min_date: str | None = None
+    max_date: str | None = None
+    forecast_table: list[ReportOverrideRow]
 
 
 class ReportUpsertPayload(BaseModel):
@@ -209,11 +230,15 @@ def _project_tables_for_view_type(
     historical_stock_key = (
         "past_available_stock_amount_kzt"
         if normalized_view == "dsp"
+        else "past_available_stock_gross_weight_kg"
+        if normalized_view == "gross weight"
         else "past_available_stock"
     )
     forecast_stock_key = (
         "future_available_stock_amount_kzt"
         if normalized_view == "dsp"
+        else "future_available_stock_gross_weight_kg"
+        if normalized_view == "gross weight"
         else "future_available_stock"
     )
 
@@ -282,12 +307,64 @@ def _clean_list(values: list[str] | None) -> list[str]:
     return [str(v).strip() for v in values if str(v).strip()]
 
 
+def _single_filter_value(values: list[str] | None) -> str | None:
+    cleaned = list(dict.fromkeys(_clean_list(values)))
+    if len(cleaned) == 1:
+        return cleaned[0]
+    return None
+
+
+async def _resolve_override_sku_name(
+    db: DBSession,
+    owner_user_id: int,
+    sku_code: list[str] | None,
+    sku_name: list[str] | None,
+) -> str | None:
+    explicit_sku_name = _single_filter_value(sku_name)
+    if explicit_sku_name:
+        return explicit_sku_name
+
+    single_sku_code = _single_filter_value(sku_code)
+    if not single_sku_code:
+        return None
+
+    product = (
+        await db.execute(
+            select(Product).where(
+                Product.owner_user_id == owner_user_id,
+                Product.sku_code == single_sku_code,
+            )
+        )
+    ).scalar_one_or_none()
+    return str(product.sku_name).strip() if product is not None else None
+
+
+async def _resolve_sku_names_from_codes(
+    db: DBSession,
+    owner_user_id: int,
+    sku_codes: list[str],
+) -> set[str]:
+    cleaned_codes = _clean_list(sku_codes)
+    if not cleaned_codes:
+        return set()
+
+    products = (
+        await db.execute(
+            select(Product).where(
+                Product.owner_user_id == owner_user_id,
+                Product.sku_code.in_(cleaned_codes),
+            )
+        )
+    ).scalars().all()
+    return {str(product.sku_name).strip() for product in products if str(product.sku_name).strip()}
+
+
 def _parse_period_text(period: str) -> date:
     raw = str(period or "").strip()
     if not raw:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="forecast_table.period must be a non-empty string",
+            detail="Поле forecast_table.period должно быть непустой строкой",
         )
     for fmt_value in ("%Y-%m-%d", "%Y-%m"):
         try:
@@ -300,7 +377,7 @@ def _parse_period_text(period: str) -> date:
             continue
     raise HTTPException(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        detail="forecast_table.period must be in YYYY-MM or YYYY-MM-DD format",
+        detail="Поле forecast_table.period должно быть в формате YYYY-MM или YYYY-MM-DD",
     )
 
 
@@ -336,11 +413,150 @@ def _resolve_report_planning_month(report: DPReport) -> date | None:
     return None
 
 
+def _month_start(d: date) -> date:
+    return d.replace(day=1)
+
+
+def _add_months(d: date, months: int) -> date:
+    year = d.year + (d.month - 1 + months) // 12
+    month = (d.month - 1 + months) % 12 + 1
+    return date(year, month, 1)
+
+
+def _month_iso(d: date) -> str:
+    return f"{d.year:04d}-{d.month:02d}"
+
+
+def _iter_months(start: date, end: date):
+    current = _month_start(start)
+    last = _month_start(end)
+    while current <= last:
+        yield current
+        current = _add_months(current, 1)
+
+
+def _matches_applied_filters(product: Product, branch_name_value: str, product_filter: dict, branch_filter: list[str]) -> bool:
+    if branch_filter:
+        normalized_filter = {str(localize_branch_name(v) or v).strip().lower() for v in branch_filter if str(v).strip()}
+        if str(localize_branch_name(branch_name_value) or branch_name_value).strip().lower() not in normalized_filter:
+            return False
+    sku_codes = {str(v).strip() for v in (product_filter.get("sku_codes") or []) if str(v).strip()}
+    sku_names = {str(v).strip() for v in (product_filter.get("sku_names") or []) if str(v).strip()}
+    brands = {str(v).strip() for v in (product_filter.get("brands") or []) if str(v).strip()}
+    categories = {str(v).strip() for v in (product_filter.get("categories") or []) if str(v).strip()}
+    sub_categories = {str(v).strip() for v in (product_filter.get("sub_categories") or []) if str(v).strip()}
+    sublines = {str(v).strip() for v in (product_filter.get("sublines") or []) if str(v).strip()}
+    if sku_codes and str(product.sku_code or "").strip() not in sku_codes:
+        return False
+    if sku_names and str(product.sku_name or "").strip() not in sku_names:
+        return False
+    if brands and str(product.brand or "").strip() not in brands:
+        return False
+    if categories and str(product.category or "").strip() not in categories:
+        return False
+    if sub_categories and str(product.sub_category or "").strip() not in sub_categories:
+        return False
+    if sublines and str(product.sub_line or "").strip() not in sublines:
+        return False
+    return True
+
+
+def _fill_projected_historical_months(rows: list[dict], start_month: date, end_month: date) -> list[dict]:
+    by_period = {str(r.get("period")): r for r in rows}
+    out: list[dict] = []
+    for m in _iter_months(start_month, end_month):
+        key = m.isoformat()
+        row = by_period.get(key)
+        if row is None:
+            row = {
+                "period": key,
+                "fact_value": 0.0,
+                "target_value": 0.0,
+                "past_available_stock": 0.0,
+            }
+        out.append(row)
+    return out
+
+
+def _fill_projected_forecast_months(rows: list[dict], start_month: date, end_month: date) -> list[dict]:
+    by_period = {str(r.get("period")): r for r in rows}
+    out: list[dict] = []
+    for m in _iter_months(start_month, end_month):
+        key = m.isoformat()
+        row = by_period.get(key)
+        if row is None:
+            row = {
+                "period": key,
+                "baseline_forecast_value": 0.0,
+                "adjusted_forecast_value": 0.0,
+                "future_available_stock": 0.0,
+            }
+        out.append(row)
+    return out
+
+
+async def _compute_min_max_dates(
+    db: DBSession,
+    owner_user_id: int,
+    product_filter: dict,
+    branch_filter: list[str],
+) -> tuple[date | None, date | None, date | None]:
+    products = (
+        await db.execute(select(Product).where(Product.owner_user_id == owner_user_id))
+    ).scalars().all()
+    product_by_code = {str(p.sku_code or "").strip(): p for p in products}
+    branches = (
+        await db.execute(select(Branch).where(Branch.owner_user_id == owner_user_id))
+    ).scalars().all()
+    branch_by_id = {str(b.branch_id).strip(): str(b.branch_name) for b in branches}
+
+    hist_rows = (
+        await db.execute(
+            select(HistoricalSalesMonthly).where(HistoricalSalesMonthly.owner_user_id == owner_user_id)
+        )
+    ).scalars().all()
+    forecast_rows = (
+        await db.execute(
+            select(ForecastSalesMonthly).where(ForecastSalesMonthly.owner_user_id == owner_user_id)
+        )
+    ).scalars().all()
+
+    min_hist: date | None = None
+    max_hist: date | None = None
+    max_forecast: date | None = None
+
+    for r in hist_rows:
+        sku_code = str(r.sku_code or "").strip()
+        product = product_by_code.get(sku_code)
+        if product is None:
+            continue
+        branch_name_value = branch_by_id.get(str(r.branch_id).strip(), str(r.branch_id).strip())
+        if not _matches_applied_filters(product, branch_name_value, product_filter, branch_filter):
+            continue
+        m = _month_start(r.date)
+        min_hist = m if min_hist is None else min(min_hist, m)
+        max_hist = m if max_hist is None else max(max_hist, m)
+
+    for r in forecast_rows:
+        sku_code = str(r.sku_code or "").strip()
+        product = product_by_code.get(sku_code)
+        if product is None:
+            continue
+        branch_name_value = branch_by_id.get(str(r.branch_id).strip(), str(r.branch_id).strip())
+        if not _matches_applied_filters(product, branch_name_value, product_filter, branch_filter):
+            continue
+        m = _month_start(r.date)
+        max_forecast = m if max_forecast is None else max(max_forecast, m)
+
+    return min_hist, max_hist, (max_forecast or max_hist)
+
+
 def _effective_filters_from_overrides(
     *,
     saved_product_filter: dict,
     saved_branch_filter: list[str],
     sku_code: list[str] | None,
+    sku_name: list[str] | None,
     brand: list[str] | None,
     category: list[str] | None,
     sub_category: list[str] | None,
@@ -350,6 +566,7 @@ def _effective_filters_from_overrides(
     saved_branch_fallback = list(saved_branch_filter or saved_product_filter.get("branch_filter", []) or [])
     product_filter = {
         "sku_codes": list(saved_product_filter.get("sku_codes", []) or []),
+        "sku_names": list(saved_product_filter.get("sku_names", []) or []),
         "brands": list(saved_product_filter.get("brands", []) or []),
         "categories": list(saved_product_filter.get("categories", []) or []),
         "sub_categories": list(saved_product_filter.get("sub_categories", []) or []),
@@ -357,6 +574,8 @@ def _effective_filters_from_overrides(
     }
     if sku_code is not None:
         product_filter["sku_codes"] = _clean_list(sku_code)
+    if sku_name is not None:
+        product_filter["sku_names"] = _clean_list(sku_name)
     if brand is not None:
         product_filter["brands"] = _clean_list(brand)
     if category is not None:
@@ -385,6 +604,7 @@ async def _build_report_detail(
     date_from_override: date | None = None,
     date_to_override: date | None = None,
     sku_code: list[str] | None = None,
+    sku_name: list[str] | None = None,
     brand: list[str] | None = None,
     category: list[str] | None = None,
     sub_category: list[str] | None = None,
@@ -392,6 +612,7 @@ async def _build_report_detail(
     branch_name: list[str] | None = None,
     project_by_view_type: bool = False,
     ignore_saved_product_filter: bool = False,
+    ignore_saved_branch_filter: bool = False,
 ) -> dict:
     owner_user_id = int(report.created_by_id or 0)
     saved_product_filter = (
@@ -399,11 +620,12 @@ async def _build_report_detail(
         if ignore_saved_product_filter
         else parse_product_filter(report.product_filter_json or report.product_filter)
     )
-    saved_branch_filter = parse_branch_filter(report.branch_filter_json or report.branch_filter)
+    saved_branch_filter = [] if ignore_saved_branch_filter else parse_branch_filter(report.branch_filter_json or report.branch_filter)
     effective_product_filter, effective_branch_filter = _effective_filters_from_overrides(
         saved_product_filter=saved_product_filter,
         saved_branch_filter=saved_branch_filter,
         sku_code=sku_code,
+        sku_name=sku_name,
         brand=brand,
         category=category,
         sub_category=sub_category,
@@ -432,6 +654,34 @@ async def _build_report_detail(
             forecast_table=forecast_table,
             view_type=ctx.view_type,
         )
+
+    min_hist_month, max_hist_month_available, max_available_month = await _compute_min_max_dates(
+        db=db,
+        owner_user_id=owner_user_id,
+        product_filter=ctx.product_filter,
+        branch_filter=ctx.branch_filter,
+    )
+
+    if max_available_month is not None:
+        requested_from = _month_start(ctx.date_from)
+        requested_to = _month_start(ctx.date_to)
+        max_hist_month = max_hist_month_available or _add_months(_month_start(ctx.planning_month), -1)
+
+        include_historical = requested_from <= max_hist_month
+        include_forecast = requested_to > max_hist_month
+
+        if include_historical:
+            hist_end = min(requested_to, max_hist_month)
+            historical_table = _fill_projected_historical_months(historical_table, requested_from, hist_end)
+        else:
+            historical_table = []
+
+        if include_forecast:
+            forecast_start = max(requested_from, _add_months(max_hist_month, 1))
+            forecast_table = _fill_projected_forecast_months(forecast_table, forecast_start, requested_to)
+        else:
+            forecast_table = []
+
     card = report_card_payload(report)
     branch_options = await _branch_options_for_owner(db, owner_user_id)
     response_branch_filter = list(ctx.branch_filter or branch_options)
@@ -447,9 +697,49 @@ async def _build_report_detail(
             "is_draft": card["is_draft"],
             "planning_month": ctx.planning_month,
         },
+        "min_date": _month_iso(min_hist_month) if min_hist_month else None,
+        "max_date": _month_iso(max_available_month) if max_available_month else None,
         "historical_table": historical_table,
         "forecast_table": forecast_table,
     }
+
+
+def _matches_override_scope(
+    override: DPReportForecastOverride,
+    *,
+    branch_names: set[str],
+    brands: set[str],
+    categories: set[str],
+    sub_categories: set[str],
+    sublines: set[str],
+    sku_names: set[str],
+) -> bool:
+    if branch_names and override.branch_name is not None and override.branch_name not in branch_names:
+        return False
+    if brands and override.brand is not None and override.brand not in brands:
+        return False
+    if categories and override.category is not None and override.category not in categories:
+        return False
+    if sub_categories and override.sub_category is not None and override.sub_category not in sub_categories:
+        return False
+    if sublines and override.subline is not None and override.subline not in sublines:
+        return False
+    if sku_names and override.sku_name is not None and override.sku_name not in sku_names:
+        return False
+    return True
+
+
+def _aggregate_adjustment_reasons(rows: list[DPReportForecastOverride]) -> dict[str, str]:
+    by_period: dict[str, list[str]] = {}
+    for row in rows:
+        reason = str(row.adjustment_reason or "").strip()
+        if not reason:
+            continue
+        period_key = _month_start(row.period).isoformat()
+        bucket = by_period.setdefault(period_key, [])
+        if reason not in bucket:
+            bucket.append(reason)
+    return {period: ", ".join(reasons) for period, reasons in by_period.items() if reasons}
 
 
 @router.get("", response_model=List[ReportCard], include_in_schema=False)
@@ -489,6 +779,7 @@ async def get_new_report_template(
     date_from: str | None = Query(default=None),
     date_to: str | None = Query(default=None),
     sku_code: list[str] | None = Query(default=None),
+    sku_name: list[str] | None = Query(default=None),
     brand: list[str] | None = Query(default=None),
     category: list[str] | None = Query(default=None),
     sub_category: list[str] | None = Query(default=None),
@@ -503,6 +794,7 @@ async def get_new_report_template(
         saved_product_filter={},
         saved_branch_filter=[],
         sku_code=sku_code,
+        sku_name=sku_name,
         brand=brand,
         category=category,
         sub_category=sub_category,
@@ -557,6 +849,7 @@ async def create_report(
     date_from: str | None = Query(default=None),
     date_to: str | None = Query(default=None),
     sku_code: list[str] | None = Query(default=None),
+    sku_name: list[str] | None = Query(default=None),
     brand: list[str] | None = Query(default=None),
     category: list[str] | None = Query(default=None),
     sub_category: list[str] | None = Query(default=None),
@@ -569,6 +862,7 @@ async def create_report(
         saved_product_filter={},
         saved_branch_filter=[],
         sku_code=sku_code,
+        sku_name=sku_name,
         brand=brand,
         category=category,
         sub_category=sub_category,
@@ -646,7 +940,7 @@ async def preview_report(
         base_report = await _get_accessible_report(db, user, report_id)
         if not base_report:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail="Report not found"
+                status_code=status.HTTP_404_NOT_FOUND, detail="Отчет не найден"
             )
         owner_user_id = int(base_report.created_by_id or user.id)
         planning_month = base_report.planning_month
@@ -702,7 +996,7 @@ async def preview_report(
     )
 
 
-@router.get("/{report_id}", response_model=ReportDetailProjectedResponse)
+@router.get("/{report_id:int}", response_model=ReportDetailProjectedResponse)
 async def get_report(
     db: DBSession,
     user: CurrentUser,
@@ -714,6 +1008,7 @@ async def get_report(
     date_from: str | None = Query(default=None),
     date_to: str | None = Query(default=None),
     sku_code: list[str] | None = Query(default=None),
+    sku_name: list[str] | None = Query(default=None),
     brand: list[str] | None = Query(default=None),
     category: list[str] | None = Query(default=None),
     sub_category: list[str] | None = Query(default=None),
@@ -724,7 +1019,7 @@ async def get_report(
     parsed_date_to = parse_query_date(date_to, field_name="date_to", end_of_month=True)
     report = await _get_accessible_report(db, user, report_id)
     if not report:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Отчет не найден")
     payload_out = await _build_report_detail(
         db,
         report,
@@ -732,6 +1027,7 @@ async def get_report(
         date_from_override=parsed_date_from,
         date_to_override=parsed_date_to,
         sku_code=sku_code,
+        sku_name=sku_name,
         brand=brand,
         category=category,
         sub_category=sub_category,
@@ -739,11 +1035,121 @@ async def get_report(
         branch_name=branch_name,
         project_by_view_type=True,
         ignore_saved_product_filter=True,
+        ignore_saved_branch_filter=True,
     )
     return ReportDetailProjectedResponse(**payload_out)
 
 
-@router.patch("/{report_id}", response_model=ReportDetailProjectedResponse)
+@router.get("/override/", response_model=ReportOverrideResponse, include_in_schema=False)
+@router.get("/override", response_model=ReportOverrideResponse)
+async def get_report_override(
+    db: DBSession,
+    user: CurrentUser,
+    report_id: int = Query(...),
+    view_type: str | None = Query(
+        default=None,
+        description="Transient projection filter for this GET only. Values: DSP, Cases, Gross weight.",
+    ),
+    date_from: str | None = Query(default=None),
+    date_to: str | None = Query(default=None),
+    sku_code: list[str] | None = Query(default=None),
+    brand: list[str] | None = Query(default=None),
+    category: list[str] | None = Query(default=None),
+    sub_category: list[str] | None = Query(default=None),
+    subline: list[str] | None = Query(default=None),
+    sublines: list[str] | None = Query(default=None),
+    sku_name: list[str] | None = Query(default=None),
+    branch_name: list[str] | None = Query(default=None),
+) -> ReportOverrideResponse:
+    parsed_date_from = parse_query_date(date_from, field_name="date_from")
+    parsed_date_to = parse_query_date(date_to, field_name="date_to", end_of_month=True)
+    report = await _get_accessible_report(db, user, report_id)
+    if not report:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Отчет не найден")
+
+    merged_subline = (subline or []) + (sublines or [])
+    payload_out = await _build_report_detail(
+        db,
+        report,
+        view_type_override=view_type,
+        date_from_override=parsed_date_from,
+        date_to_override=parsed_date_to,
+        sku_code=sku_code,
+        sku_name=sku_name,
+        brand=brand,
+        category=category,
+        sub_category=sub_category,
+        subline=merged_subline or None,
+        branch_name=branch_name,
+        project_by_view_type=True,
+        ignore_saved_product_filter=True,
+        ignore_saved_branch_filter=True,
+    )
+
+    metric_type = normalize_override_metric(payload_out["report"]["view_type"]) or ""
+    effective_filter_obj = payload_out["report"]["product_filter"]
+    effective_filter = (
+        effective_filter_obj.model_dump()
+        if hasattr(effective_filter_obj, "model_dump")
+        else dict(effective_filter_obj or {})
+    )
+    branch_filter = payload_out["report"]["branch_filter"]
+    effective_sku_names = {
+        str(v).strip() for v in (effective_filter.get("sku_names") or []) if str(v).strip()
+    }
+    effective_sku_names.update(
+        await _resolve_sku_names_from_codes(
+            db=db,
+            owner_user_id=int(report.created_by_id or user.id),
+            sku_codes=list(effective_filter.get("sku_codes") or []),
+        )
+    )
+    override_rows = (
+        await db.execute(
+            select(DPReportForecastOverride).where(
+                DPReportForecastOverride.report_id == report.id,
+                DPReportForecastOverride.owner_user_id == int(report.created_by_id or user.id),
+                DPReportForecastOverride.metric_type == metric_type,
+            )
+        )
+    ).scalars().all()
+    scoped_override_rows = [
+        row
+        for row in override_rows
+        if _matches_override_scope(
+            row,
+            branch_names={str(v).strip() for v in branch_filter if str(v).strip()},
+            brands={str(v).strip() for v in (effective_filter.get("brands") or []) if str(v).strip()},
+            categories={str(v).strip() for v in (effective_filter.get("categories") or []) if str(v).strip()},
+            sub_categories={str(v).strip() for v in (effective_filter.get("sub_categories") or []) if str(v).strip()},
+            sublines={str(v).strip() for v in (effective_filter.get("sublines") or []) if str(v).strip()},
+            sku_names=effective_sku_names,
+        )
+    ]
+    reasons_by_period = _aggregate_adjustment_reasons(scoped_override_rows)
+    rows_out: list[ReportOverrideRow] = []
+    for row in payload_out["forecast_table"]:
+        period = str(row.get("period") or "")
+        baseline_value = round(float(row.get("baseline_forecast_value", 0.0) or 0.0), 2)
+        adjusted_value = round(float(row.get("adjusted_forecast_value", 0.0) or 0.0), 2)
+        rows_out.append(
+            ReportOverrideRow(
+                period=period,
+                baseline_forecast_value=baseline_value,
+                adjusted_forecast_value=adjusted_value,
+                adjustment_reason=reasons_by_period.get(period),
+            )
+        )
+
+    return ReportOverrideResponse(
+        report=ReportCard(**payload_out["report"]),
+        min_date=payload_out.get("min_date"),
+        max_date=payload_out.get("max_date"),
+        forecast_table=rows_out,
+    )
+
+
+@router.patch("/{report_id:int}", response_model=ReportDetailProjectedResponse)
 async def update_report(
     db: DBSession,
     user: CurrentUser,
@@ -753,6 +1159,7 @@ async def update_report(
     date_from: str | None = Query(default=None),
     date_to: str | None = Query(default=None),
     sku_code: list[str] | None = Query(default=None),
+    sku_name: list[str] | None = Query(default=None),
     brand: list[str] | None = Query(default=None),
     category: list[str] | None = Query(default=None),
     sub_category: list[str] | None = Query(default=None),
@@ -763,15 +1170,16 @@ async def update_report(
     parsed_date_to = parse_query_date(date_to, field_name="date_to", end_of_month=True)
     report = await _get_accessible_report(db, user, report_id)
     if not report:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Отчет не найден")
     if not is_admin(user) and report.created_by_id != user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not enough permissions")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Недостаточно прав")
     saved_product_filter = parse_product_filter(report.product_filter_json or report.product_filter)
     saved_branch_filter = parse_branch_filter(report.branch_filter_json or report.branch_filter)
     effective_product_filter, effective_branch_filter = _effective_filters_from_overrides(
         saved_product_filter=saved_product_filter,
         saved_branch_filter=saved_branch_filter,
         sku_code=sku_code,
+        sku_name=sku_name,
         brand=brand,
         category=category,
         sub_category=sub_category,
@@ -810,18 +1218,30 @@ async def update_report(
         }:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="view_type must be provided as query param (DSP, Cases, Gross Weight) or be valid on report",
+                detail="Параметр view_type должен быть передан в query (DSP, Cases, Gross Weight) или быть валидным в отчете",
             )
+        override_sku_name = await _resolve_override_sku_name(
+            db=db,
+            owner_user_id=int(report.created_by_id or user.id),
+            sku_code=sku_code,
+            sku_name=sku_name,
+        )
         overrides = [
             {
                 "period": adj.period,
                 "metric_type": normalized_metric,
                 "value": adj.value,
                 "adjustment_reason": adj.adjustment_reason,
+                "branch_name": _single_filter_value(branch_name),
+                "brand": _single_filter_value(brand),
+                "category": _single_filter_value(category),
+                "sub_category": _single_filter_value(sub_category),
+                "subline": _single_filter_value(subline),
+                "sku_name": override_sku_name,
             }
             for adj in payload.forecast_adjustments
         ]
-        await replace_report_overrides(
+        await upsert_report_overrides(
             db=db,
             report_id=report.id,
             owner_user_id=int(report.created_by_id or user.id),
@@ -833,7 +1253,7 @@ async def update_report(
     return ReportDetailProjectedResponse(**payload_out)
 
 
-@router.delete("/{report_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{report_id:int}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_report(
     db: DBSession,
     user: CurrentUser,
@@ -843,12 +1263,12 @@ async def delete_report(
     if not report:
         return
     if not is_admin(user) and report.created_by_id != user.id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not enough permissions")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Недостаточно прав")
     report.is_deleted = True
     await db.commit()
 
 
-@router.get("/{report_id}/access", response_model=List[ReportAccessOut])
+@router.get("/{report_id:int}/access", response_model=List[ReportAccessOut])
 async def list_report_access(
     db: DBSession,
     user: CurrentUser,
@@ -856,7 +1276,7 @@ async def list_report_access(
 ) -> List[ReportAccessOut]:
     report = await _get_accessible_report(db, user, report_id)
     if not report:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Отчет не найден")
     rows = (
         await db.execute(select(DPReportAccess).where(DPReportAccess.report_id == report_id))
     ).scalars().all()
@@ -867,7 +1287,7 @@ async def list_report_access(
 
 
 @router.post(
-    "/{report_id}/access",
+    "/{report_id:int}/access",
     response_model=ReportAccessOut,
     dependencies=[Depends(require_roles(UserRole.ADMIN))],
 )
@@ -879,10 +1299,10 @@ async def grant_report_access(
 ) -> ReportAccessOut:
     report = await db.get(DPReport, report_id)
     if not report or report.is_deleted:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Отчет не найден")
     target_user = await db.get(User, payload.user_id)
     if not target_user:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Пользователь не найден")
     access = (
         await db.execute(
             select(DPReportAccess).where(
@@ -908,7 +1328,7 @@ async def grant_report_access(
 
 
 @router.delete(
-    "/{report_id}/access/{user_id}",
+    "/{report_id:int}/access/{user_id:int}",
     status_code=status.HTTP_204_NO_CONTENT,
     dependencies=[Depends(require_roles(UserRole.ADMIN))],
 )

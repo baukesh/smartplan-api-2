@@ -117,7 +117,7 @@ def _parse_page_size(page_size: str) -> int | None:
     if normalized not in PAGE_SIZE_MAP:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="page_size must be one of: 10, 50, 100, all",
+            detail="Параметр page_size должен быть одним из: 10, 50, 100, all",
         )
     return PAGE_SIZE_MAP[normalized]
 
@@ -148,7 +148,7 @@ def _parse_float_filters(
         except Exception as exc:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"{field_name} must contain numeric values",
+                detail=f"Параметр {field_name} должен содержать числовые значения",
             ) from exc
     return parsed or None
 
@@ -207,7 +207,7 @@ async def _list_aggregated_orders(
             if normalized is None:
                 raise HTTPException(
                     status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                    detail=f"Unsupported status value: {raw_status}",
+                    detail=f"Неподдерживаемое значение status: {raw_status}",
                 )
             normalized_status_filters.add(normalized)
     if parsed_date_from:
@@ -409,13 +409,13 @@ async def update_order_statuses(
     if not payload.updates:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="updates cannot be empty",
+            detail="Список updates не может быть пустым",
         )
     invalid = [u.status for u in payload.updates if normalize_order_status(u.status) is None]
     if invalid:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=f"Unsupported status values: {sorted(set(invalid))}",
+            detail=f"Неподдерживаемые значения status: {sorted(set(invalid))}",
         )
 
     updated = 0
@@ -475,11 +475,11 @@ async def get_order_details(
         stmt = stmt.where(PlacedOrder.owner_user_id == user.id)
     order_rows = (await db.execute(stmt)).scalars().all()
     if not order_rows:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Заказ не найден")
 
     owner_user_id = order_rows[0].owner_user_id
     products = {
-        p.sku_id: p
+        str(p.sku_code).strip(): p
         for p in (
             await db.execute(select(Product).where(Product.owner_user_id == owner_user_id))
         ).scalars().all()
@@ -489,17 +489,18 @@ async def get_order_details(
     ).scalars().all()
     prices_by_sku: dict[str, list[PriceList]] = {}
     for price in prices:
-        prices_by_sku.setdefault(str(price.sku_id), []).append(price)
-    for sku_id in prices_by_sku:
-        prices_by_sku[sku_id].sort(key=lambda x: x.date)
+        prices_by_sku.setdefault(str(price.sku_code or "").strip(), []).append(price)
+    for sku_code_key in prices_by_sku:
+        prices_by_sku[sku_code_key].sort(key=lambda x: x.date)
 
     items: list[OrderDetailsRow] = []
     total_amount = 0.0
     for row in order_rows:
-        prod = products.get(row.sku_id)
+        sku_code_key = str(row.sku_code or "").strip()
+        prod = products.get(sku_code_key)
         if not prod:
             continue
-        sorted_prices = prices_by_sku.get(str(row.sku_id), [])
+        sorted_prices = prices_by_sku.get(sku_code_key, [])
         closest_price = None
         earliest_price = sorted_prices[0] if sorted_prices else None
         for p in sorted_prices:
@@ -652,7 +653,7 @@ async def patch_order_details(
         stmt = stmt.where(PlacedOrder.owner_user_id == user.id)
     order_rows = (await db.execute(stmt)).scalars().all()
     if not order_rows:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Order not found")
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Заказ не найден")
 
     owner_user_id = order_rows[0].owner_user_id
     target_order_id = (
@@ -670,7 +671,7 @@ async def patch_order_details(
         if (await db.execute(exists_stmt)).first():
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail=f"Order '{target_order_id}' already exists",
+                detail=f"Заказ '{target_order_id}' уже существует",
             )
 
     values: dict = {}
@@ -683,7 +684,7 @@ async def patch_order_details(
     if not values:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="No fields to update",
+            detail="Не переданы поля для обновления",
         )
 
     upd = update(PlacedOrder).where(PlacedOrder.order_id == normalized_source_order_id)

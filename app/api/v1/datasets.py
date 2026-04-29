@@ -19,8 +19,7 @@ router = APIRouter(prefix="/datasets", tags=["datasets"])
 
 
 class AssortmentRow(BaseModel):
-    sku_id: str
-    sku_code: str | None = None
+    sku_code: str
     mother_sku: str | None = None
     barcode: str | None = None
     sku_name: str
@@ -43,7 +42,7 @@ class AssortmentRow(BaseModel):
 
 class BranchStockNormRow(BaseModel):
     branch_name: str
-    sku_id: str
+    sku_code: str
     current_stock: float | None = None
     stock_norm: float | None = None
 
@@ -51,7 +50,7 @@ class BranchStockNormRow(BaseModel):
 
 
 class PriceListRow(BaseModel):
-    sku_id: str
+    sku_code: str
     date: date
     invoice_price: float | None = None
     dsp: float | None = None
@@ -60,7 +59,8 @@ class PriceListRow(BaseModel):
 
 
 class HistoricalSalesMonthlyRow(BaseModel):
-    sku_id: str
+    sku_code: str
+    hub_name: str | None = None
     branch_name: str
     date: date
     fact_quantity_in_mc: float | None = None
@@ -72,7 +72,7 @@ class HistoricalSalesMonthlyRow(BaseModel):
 
 class PlacedOrderRow(BaseModel):
     order_id: str
-    sku_id: str
+    sku_code: str
     order_name: str | None = None
     creation_date: date
     receival_date: date | None = None
@@ -114,7 +114,7 @@ async def get_branch_stock_norm_dataset(
     return [
         BranchStockNormRow(
             branch_name=branch_map.get((r.owner_user_id, r.branch_id), r.branch_id),
-            sku_id=r.sku_id,
+            sku_code=str(r.sku_code or ""),
             current_stock=r.current_stock,
             stock_norm=r.stock_norm,
         )
@@ -150,7 +150,8 @@ async def get_historical_sales_monthly_dataset(
     branch_map = {(b.owner_user_id, b.branch_id): b.branch_name for b in branches}
     return [
         HistoricalSalesMonthlyRow(
-            sku_id=r.sku_id,
+            sku_code=str(r.sku_code or ""),
+            hub_name=str(r.hub_name or ""),
             branch_name=branch_map.get((r.owner_user_id, r.branch_id), r.branch_id),
             date=r.date,
             fact_quantity_in_mc=r.fact_quantity_in_mc,
@@ -165,10 +166,24 @@ async def get_historical_sales_monthly_dataset(
 async def get_placed_orders_dataset(
     db: DBSession,
     user: CurrentUser,
-) -> list[PlacedOrder]:
+) -> list[PlacedOrderRow]:
     stmt = select(PlacedOrder)
     if not is_admin(user):
         stmt = stmt.where(PlacedOrder.owner_user_id == user.id)
-    result = await db.execute(stmt)
-    return list(result.scalars().all())
+    rows = (await db.execute(stmt)).scalars().all()
+    return [
+        PlacedOrderRow(
+            order_id=r.order_id,
+            sku_code=str(r.sku_code or ""),
+            order_name=r.order_name,
+            creation_date=r.creation_date,
+            receival_date=r.receival_date,
+            quantity_in_mc=r.quantity_in_mc,
+            gross_weight_kg=r.gross_weight_kg,
+            volume_cbm=r.volume_cbm,
+            amount_kzt=r.amount_kzt,
+            status=r.status,
+        )
+        for r in rows
+    ]
 

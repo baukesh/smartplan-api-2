@@ -52,15 +52,28 @@ class CategorySummaryRow(BaseModel):
 class TopSkuShareRow(BaseModel):
     sku_name: str
     share_of_stock: float
-    health_index_deviation: float
+    health_index_deviation: int
 
 
 class TopSkuShareResponse(BaseModel):
     items: list[TopSkuShareRow]
 
 
+class OutOfStockRow(BaseModel):
+    sku_name: str
+    share_of_stock: float
+    health_index_deviation: int
+    average_historical_sales: float
+
+
+class OutOfStockResponse(BaseModel):
+    items: list[OutOfStockRow]
+
+
 class InventoryHealthFilterOptionsResponse(BaseModel):
     branch_names: list[str]
+    min_date: str | None = None
+    max_date: str | None = None
 
 
 class HealthIndexInformationResponse(BaseModel):
@@ -69,8 +82,14 @@ class HealthIndexInformationResponse(BaseModel):
     critical: str
 
 
+class HealthIndexDeviationInformationResponse(BaseModel):
+    overstock_logic: str
+    understock_logic: str
+    out_of_stock_logic: str
+    notes: str
+
+
 class _SkuMetrics(BaseModel):
-    sku_id: str
     sku_code: str
     sku_name: str
     sales_qty: float
@@ -82,6 +101,8 @@ class _SkuMetrics(BaseModel):
     share_percent: float
     health_index: float
     abc_category: str
+    average_historical_sales: float
+    status: str | None = None
 
 
 def _parse_page_size(page_size: str) -> int | None:
@@ -89,7 +110,7 @@ def _parse_page_size(page_size: str) -> int | None:
     if normalized not in PAGE_SIZE_MAP:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="page_size must be one of: 10, 50, 100, all",
+            detail="Параметр page_size должен быть одним из: 10, 50, 100, all",
         )
     return PAGE_SIZE_MAP[normalized]
 
@@ -99,7 +120,7 @@ def _normalize_view_type(view_type: str) -> str:
     if v not in {"dsp", "cases"}:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="view_type must be either 'DSP' or 'Cases'",
+            detail="Параметр view_type должен быть одним из: DSP или Cases",
         )
     return v
 
@@ -195,6 +216,16 @@ async def get_inventory_health_filter_options(
 ) -> InventoryHealthFilterOptionsResponse:
     d_from, d_to = _resolve_date_window(period=period, date_from=date_from, date_to=date_to)
 
+    date_range_stmt = select(
+        func.min(HistoricalSalesMonthly.date),
+        func.max(HistoricalSalesMonthly.date),
+    )
+    if not is_admin(user):
+        date_range_stmt = date_range_stmt.where(HistoricalSalesMonthly.owner_user_id == user.id)
+    min_hist_date, max_hist_date = (await db.execute(date_range_stmt)).one()
+    min_date = min_hist_date.strftime("%Y-%m") if min_hist_date else None
+    max_date = max_hist_date.strftime("%Y-%m") if max_hist_date else None
+
     hs_stmt = select(HistoricalSalesMonthly.branch_id)
     if not is_admin(user):
         hs_stmt = hs_stmt.where(HistoricalSalesMonthly.owner_user_id == user.id)
@@ -205,7 +236,11 @@ async def get_inventory_health_filter_options(
     branch_ids = {str(row[0]) for row in (await db.execute(hs_stmt)).all()}
 
     if not branch_ids:
-        return InventoryHealthFilterOptionsResponse(branch_names=[])
+        return InventoryHealthFilterOptionsResponse(
+            branch_names=[],
+            min_date=min_date,
+            max_date=max_date,
+        )
 
     b_stmt = select(Branch)
     if not is_admin(user):
@@ -218,7 +253,11 @@ async def get_inventory_health_filter_options(
             if b.branch_id in branch_ids and str(b.branch_name).strip()
         }
     )
-    return InventoryHealthFilterOptionsResponse(branch_names=names)
+    return InventoryHealthFilterOptionsResponse(
+        branch_names=names,
+        min_date=min_date,
+        max_date=max_date,
+    )
 
 
 async def _compute_inventory_metrics(
@@ -270,7 +309,7 @@ async def _compute_inventory_metrics(
         ):
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="Please select only past dates available in historical_sales_monthly",
+                detail="Выберите только прошедшие даты, доступные в historical_sales_monthly",
             )
 
     hs_stmt = select(HistoricalSalesMonthly)
@@ -290,7 +329,7 @@ async def _compute_inventory_metrics(
     if not is_admin(user):
         product_stmt = product_stmt.where(Product.owner_user_id == user.id)
     products = (await db.execute(product_stmt)).scalars().all()
-    product_map = {(p.owner_user_id, p.sku_id): p for p in products}
+    product_map = {(p.owner_user_id, str(p.sku_code).strip()): p for p in products}
 
     price_stmt = select(PriceList)
     if not is_admin(user):
@@ -298,13 +337,14 @@ async def _compute_inventory_metrics(
     prices = (await db.execute(price_stmt)).scalars().all()
     prices_by_key: dict[tuple[int, str], list[PriceList]] = {}
     for p in prices:
-        prices_by_key.setdefault((p.owner_user_id, p.sku_id), []).append(p)
+        prices_by_key.setdefault((p.owner_user_id, str(p.sku_code).strip()), []).append(p)
     for k in prices_by_key:
         prices_by_key[k].sort(key=lambda x: x.date)
 
-    agg: dict[tuple[int, str], dict[str, float | str]] = {}
+    agg: dict[tuple[int, str], dict[str, float | str | int | None]] = {}
+    month_buckets_by_sku: dict[tuple[int, str], set[str]] = {}
     for r in hs_rows:
-        key = (r.owner_user_id, r.sku_id)
+        key = (r.owner_user_id, str(r.sku_code or "").strip())
         p = product_map.get(key)
         if not p:
             continue
@@ -326,9 +366,10 @@ async def _compute_inventory_metrics(
         bucket = agg.setdefault(
             key,
             {
-                "sku_id": r.sku_id,
+                "owner_user_id": int(p.owner_user_id),
                 "sku_code": p.sku_code,
                 "sku_name": p.sku_name,
+                "status": str(p.status or "").strip().lower(),
                 "sales_qty": 0.0,
                 "sales_dsp": 0.0,
                 "stock": 0.0,
@@ -339,6 +380,7 @@ async def _compute_inventory_metrics(
         bucket["sales_dsp"] = float(bucket["sales_dsp"]) + sales_dsp
         bucket["stock"] = float(bucket["stock"]) + stock
         bucket["stock_dsp"] = float(bucket["stock_dsp"]) + stock_dsp
+        month_buckets_by_sku.setdefault(key, set()).add(r.date.replace(day=1).isoformat())
 
     if not agg:
         return []
@@ -367,9 +409,11 @@ async def _compute_inventory_metrics(
             else ((float(v["stock"]) / total_stock) if total_stock > 0 else 0.0)
         )
         health = (share_stock / share_business) * 100.0 if share_business > 0 else 0.0
+        sku_key = (int(v.get("owner_user_id", 0) or 0), str(v["sku_code"]))
+        month_count = len(month_buckets_by_sku.get(sku_key, set()))
+        avg_hist_sales = (float(v["sales_qty"]) / float(month_count)) if month_count > 0 else 0.0
         interim.append(
             {
-                "sku_id": str(v["sku_id"]),
                 "sku_code": str(v["sku_code"]),
                 "sku_name": str(v["sku_name"]),
                 "sales_qty": float(v["sales_qty"]),
@@ -381,6 +425,8 @@ async def _compute_inventory_metrics(
                 "share_percent": share_business * 100.0,
                 "health_index": health,
                 "abc_share_business": abc_share_business,
+                "average_historical_sales": avg_hist_sales,
+                "status": v.get("status"),
             }
         )
 
@@ -438,7 +484,7 @@ def _build_category_summary(
     )
 
     return CategorySummaryRow(
-        abc_category=category,
+        abc_category=f"Категория {category}",
         view_type=metric,
         number_of_skus=number_of_skus,
         percent_of_skus=round(percent_of_skus, 1),
@@ -514,11 +560,6 @@ async def get_inventory_health_table(
         )
         for m in metrics
     ]
-    filter_options = InventoryHealthFilterOptions(
-        sku_code=sorted({str(r.sku_code).strip() for r in table if str(r.sku_code).strip()}),
-        sku_name=sorted({str(r.sku_name).strip() for r in table if str(r.sku_name).strip()}),
-        abc_category=sorted({str(r.abc_category).strip() for r in table if str(r.abc_category).strip()}),
-    )
     filtered_table = table
     if sku_code:
         sku_code_values = {str(v).strip() for v in sku_code if str(v).strip()}
@@ -537,6 +578,14 @@ async def get_inventory_health_table(
         filtered_table = [
             r for r in filtered_table if str(r.abc_category).strip().upper() in abc_values
         ]
+
+    filter_options = InventoryHealthFilterOptions(
+        sku_code=sorted({str(r.sku_code).strip() for r in filtered_table if str(r.sku_code).strip()}),
+        sku_name=sorted({str(r.sku_name).strip() for r in filtered_table if str(r.sku_name).strip()}),
+        abc_category=sorted(
+            {str(r.abc_category).strip() for r in filtered_table if str(r.abc_category).strip()}
+        ),
+    )
 
     items, total_items, total_pages = _paginate(filtered_table, page=page, page_size=page_size)
     return InventoryHealthTableResponse(
@@ -641,15 +690,51 @@ def _top_issue_rows(metrics: list[_SkuMetrics], issue_type: str, top_n: int) -> 
         chosen = [m for m in metrics if abs(m.health_index) < 1e-9]
 
     chosen = sorted(chosen, key=lambda m: (_deviation(m), m.share_stock), reverse=True)
+    raw_deviations = [_deviation(m) for m in chosen]
+    max_deviation = max(raw_deviations) if raw_deviations else 0.0
+    min_deviation = min(raw_deviations) if raw_deviations else 0.0
+
+    def _scaled_deviation(raw: float) -> int:
+        if max_deviation <= 200.0:
+            return int(raw)
+        if max_deviation <= min_deviation:
+            return 200
+        scaled = (raw - min_deviation) / (max_deviation - min_deviation) * 200.0
+        return int(round(max(0.0, min(200.0, scaled))))
 
     sliced = chosen[: max(top_n, 0)]
     return [
         TopSkuShareRow(
             sku_name=m.sku_name,
             share_of_stock=round((m.stock / total_stock * 100.0) if total_stock > 0 else 0.0, 1),
-            health_index_deviation=round(_deviation(m), 2),
+            health_index_deviation=_scaled_deviation(_deviation(m)),
         )
         for m in sliced
+    ]
+
+
+def _out_of_stock_rows(metrics: list[_SkuMetrics], top_n: int) -> list[OutOfStockRow]:
+    total_stock = sum(m.stock for m in metrics)
+    active_zero_stock = [
+        m
+        for m in metrics
+        if abs(m.health_index) < 1e-9 and str(m.status or "").strip().lower() == "активный"
+    ]
+    active_zero_stock = sorted(
+        active_zero_stock,
+        key=lambda m: (m.average_historical_sales, m.share_stock),
+        reverse=True,
+    )
+    sliced = active_zero_stock[: max(top_n, 0)]
+    return [
+        OutOfStockRow(
+            sku_name=m.sku_name,
+            share_of_stock=share_of_stock,
+            health_index_deviation=0,
+            average_historical_sales=share_of_stock,
+        )
+        for m in sliced
+        for share_of_stock in [round((m.stock / total_stock * 100.0) if total_stock > 0 else 0.0, 1)]
     ]
 
 
@@ -701,7 +786,7 @@ async def get_understock(
     return TopSkuShareResponse(items=_top_issue_rows(metrics, "understock", top_n))
 
 
-@router.get("/out-of-stock", response_model=TopSkuShareResponse)
+@router.get("/out-of-stock", response_model=OutOfStockResponse)
 async def get_out_of_stock(
     db: DBSession,
     user: CurrentUser,
@@ -712,7 +797,7 @@ async def get_out_of_stock(
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
     top_n: int = Query(5, ge=1),
-) -> TopSkuShareResponse:
+) -> OutOfStockResponse:
     metrics = await _compute_inventory_metrics(
         db,
         user,
@@ -722,7 +807,7 @@ async def get_out_of_stock(
         date_from,
         date_to,
     )
-    return TopSkuShareResponse(items=_top_issue_rows(metrics, "out-of-stock", top_n))
+    return OutOfStockResponse(items=_out_of_stock_rows(metrics, top_n))
 
 
 @router.get("/health-index-information-icon", response_model=HealthIndexInformationResponse)
@@ -733,7 +818,41 @@ async def get_health_index_information_icon(
     _ = user
     return HealthIndexInformationResponse(
         healthy="90-110",
-        normal="70-90 or 110-130",
-        critical="less than 70 or greater than 130",
+        normal="70-90 или 110-130",
+        critical="меньше 70 или больше 130",
+    )
+
+
+@router.get(
+    "/health-index-deviation-information-icon/",
+    response_model=HealthIndexDeviationInformationResponse,
+    include_in_schema=False,
+)
+@router.get(
+    "/health-index-deviation-information-icon",
+    response_model=HealthIndexDeviationInformationResponse,
+)
+async def get_health_index_deviation_information_icon(
+    user: CurrentUser,
+) -> HealthIndexDeviationInformationResponse:
+    # Authenticated endpoint for frontend info icon tooltip content.
+    _ = user
+    return HealthIndexDeviationInformationResponse(
+        overstock_logic=(
+            "Избыток показывает товары, у которых запаса больше, чем обычно нужно для текущего "
+            "уровня продаж. Чем выше значение, тем сильнее товар перегружает склад."
+        ),
+        understock_logic=(
+            "Недостаток показывает товары, у которых запаса меньше, чем нужно для текущего "
+            "уровня продаж. Чем выше значение, тем выше риск нехватки товара."
+        ),
+        out_of_stock_logic=(
+            "Нет в наличии показывает активные товары, по которым сейчас нет доступного запаса. "
+            "Список помогает быстро увидеть позиции, которые могут требовать пополнения в первую очередь."
+        ),
+        notes=(
+            "Показатели помогают сравнить товары между собой и выделить самые важные проблемы "
+            "с запасами для принятия решений."
+        ),
     )
 

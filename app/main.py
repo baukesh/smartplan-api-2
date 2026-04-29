@@ -166,6 +166,162 @@ async def _ensure_owner_columns(conn) -> None:
         )
 
 
+async def _ensure_sku_code_columns_and_backfill(conn) -> None:
+    tables_with_sku = [
+        "product_branch",
+        "price_list",
+        "historical_sales_monthly",
+        "placed_orders",
+        "forecast_sales_monthly",
+        "forecast_orders",
+        "inventory_health",
+        "dp_report",
+        "distribution_sku_adjustments",
+        "forecast_inference_cache",
+    ]
+    for table_name in tables_with_sku:
+        if not await _column_exists(conn, table_name, "sku_code"):
+            await conn.execute(text(f"ALTER TABLE {table_name} ADD COLUMN sku_code VARCHAR(128)"))
+        await conn.execute(
+            text(
+                f"""
+                UPDATE {table_name}
+                SET sku_code = (
+                    SELECT p.sku_code
+                    FROM product p
+                    WHERE p.owner_user_id = {table_name}.owner_user_id
+                      AND p.sku_id = {table_name}.sku_id
+                    LIMIT 1
+                )
+                WHERE (sku_code IS NULL OR sku_code = '')
+                  AND sku_id IS NOT NULL
+                """
+            )
+        )
+        await conn.execute(
+            text(
+                f"CREATE INDEX IF NOT EXISTS ix_{table_name}_sku_code ON {table_name} (sku_code)"
+            )
+        )
+    await conn.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_product_owner_user_id_sku_code ON product (owner_user_id, sku_code)")
+    )
+
+
+async def _ensure_hub_name_on_historical_sales(conn) -> None:
+    if not await _column_exists(conn, "historical_sales_monthly", "hub_name"):
+        await conn.execute(text("ALTER TABLE historical_sales_monthly ADD COLUMN hub_name VARCHAR(255)"))
+    await conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_historical_sales_monthly_hub_name ON historical_sales_monthly (hub_name)"
+        )
+    )
+
+    # Existing rows with branch data but no hub mapping are linked to KZ-HUB.
+    await conn.execute(
+        text(
+            """
+            UPDATE historical_sales_monthly
+            SET hub_name = 'KZ-HUB'
+            WHERE (hub_name IS NULL OR TRIM(hub_name) = '')
+              AND branch_id IS NOT NULL
+              AND TRIM(branch_id) != ''
+            """
+        )
+    )
+
+    # Insert latest-date hub snapshot rows for existing users if they do not exist.
+    await conn.execute(
+        text(
+            """
+            INSERT INTO historical_sales_monthly (
+                sku_id,
+                sku_code,
+                hub_name,
+                date,
+                branch_id,
+                fact_quantity_in_mc,
+                fact_gross_weight_kg,
+                fact_volume_cbm,
+                fact_amount_kzt,
+                target_quantity_in_mc,
+                target_gross_weight_kg,
+                target_volume_cbm,
+                target_amount_kzt,
+                past_available_stock,
+                owner_user_id,
+                created_at,
+                updated_at
+            )
+            SELECT
+                hs.sku_id,
+                hs.sku_code,
+                'KZ-HUB' AS hub_name,
+                max_dates.max_date AS date,
+                '' AS branch_id,
+                0.0 AS fact_quantity_in_mc,
+                0.0 AS fact_gross_weight_kg,
+                0.0 AS fact_volume_cbm,
+                0.0 AS fact_amount_kzt,
+                0.0 AS target_quantity_in_mc,
+                0.0 AS target_gross_weight_kg,
+                0.0 AS target_volume_cbm,
+                0.0 AS target_amount_kzt,
+                SUM(COALESCE(hs.past_available_stock, 0.0)) AS past_available_stock,
+                hs.owner_user_id,
+                CURRENT_TIMESTAMP AS created_at,
+                CURRENT_TIMESTAMP AS updated_at
+            FROM historical_sales_monthly hs
+            JOIN (
+                SELECT owner_user_id, MAX(date) AS max_date
+                FROM historical_sales_monthly
+                GROUP BY owner_user_id
+            ) max_dates
+              ON max_dates.owner_user_id = hs.owner_user_id
+             AND hs.date = max_dates.max_date
+            WHERE hs.branch_id IS NOT NULL
+              AND TRIM(hs.branch_id) != ''
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM historical_sales_monthly h2
+                  WHERE h2.owner_user_id = hs.owner_user_id
+                    AND h2.date = max_dates.max_date
+                    AND COALESCE(TRIM(h2.hub_name), '') = 'KZ-HUB'
+                    AND COALESCE(TRIM(h2.branch_id), '') = ''
+                    AND COALESCE(TRIM(h2.sku_code), '') = COALESCE(TRIM(hs.sku_code), '')
+              )
+            GROUP BY hs.owner_user_id, hs.sku_id, hs.sku_code, max_dates.max_date
+            """
+        )
+    )
+
+
+async def _ensure_inventory_health_sku_code_column(conn) -> None:
+    # Safety net: some legacy SQLite rebuild paths recreated inventory_health
+    # without sku_code. Ensure column/index exist and backfill from product.
+    if not await _column_exists(conn, "inventory_health", "sku_code"):
+        await conn.execute(text("ALTER TABLE inventory_health ADD COLUMN sku_code VARCHAR(128)"))
+    await conn.execute(
+        text("CREATE INDEX IF NOT EXISTS ix_inventory_health_sku_code ON inventory_health (sku_code)")
+    )
+    await conn.execute(
+        text(
+            """
+            UPDATE inventory_health
+            SET sku_code = (
+                SELECT p.sku_code
+                FROM product p
+                WHERE p.owner_user_id = inventory_health.owner_user_id
+                  AND p.sku_id = inventory_health.sku_id
+                LIMIT 1
+            )
+            WHERE (sku_code IS NULL OR sku_code = '')
+              AND sku_id IS NOT NULL
+            """
+        )
+    )
+
+
 async def _ensure_placed_orders_author_column(conn) -> None:
     if await _column_exists(conn, "placed_orders", "author"):
         return
@@ -396,6 +552,8 @@ async def lifespan(app: FastAPI):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await _ensure_owner_columns(conn)
+        await _ensure_sku_code_columns_and_backfill(conn)
+        await _ensure_hub_name_on_historical_sales(conn)
         await _ensure_placed_orders_author_column(conn)
         await _ensure_dp_reports_columns(conn)
         await _ensure_product_status_russian(conn)
@@ -404,6 +562,7 @@ async def lifespan(app: FastAPI):
         if conn.dialect.name == "sqlite":
             await _ensure_product_owner_unique_sqlite(conn)
             await _ensure_numeric_health_index_columns_sqlite(conn)
+        await _ensure_inventory_health_sku_code_column(conn)
     yield
 
 

@@ -57,6 +57,7 @@ def parse_product_filter(value: object | None) -> dict:
     if value is None:
         return {
             "sku_codes": [],
+            "sku_names": [],
             "brands": [],
             "categories": [],
             "sub_categories": [],
@@ -73,6 +74,7 @@ def parse_product_filter(value: object | None) -> dict:
         source = {}
     return {
         "sku_codes": list(source.get("sku_codes", []) or []),
+        "sku_names": list(source.get("sku_names", []) or []),
         "brands": list(source.get("brands", []) or []),
         "categories": list(source.get("categories", []) or []),
         "sub_categories": list(source.get("sub_categories", []) or []),
@@ -111,7 +113,7 @@ async def get_current_planning_month(db: AsyncSession, owner_user_id: int) -> da
     if row is None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Cannot derive planning month without historical sales data",
+            detail="Невозможно определить planning_month без данных historical_sales_monthly",
         )
     return _add_months(_month_start(row), 1)
 
@@ -124,27 +126,7 @@ def validate_period_window(planning_month: date, date_from: date, date_to: date)
     if date_from > date_to:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="date_from cannot be greater than date_to",
-        )
-    if date_from > planning_month:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="date_from cannot be greater than planning_month",
-        )
-    if date_to < planning_month:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="date_to cannot be less than planning_month",
-        )
-    if date_from < _add_months(planning_month, -12):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="date_from is outside max historical window (12 months)",
-        )
-    if date_to > _add_months(planning_month, 11):
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="date_to is outside max forecast window (12 months)",
+            detail="Параметр date_from не может быть больше date_to",
         )
 
 
@@ -153,7 +135,7 @@ def validate_view_type(view_type: str) -> str:
     if normalized not in VALID_VIEW_TYPES:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="view_type must be one of: DSP, Cases, Gross weight",
+            detail="Параметр view_type должен быть одним из: DSP, Cases, Gross weight",
         )
     return normalized
 
@@ -179,12 +161,15 @@ def _matches_filters(
         if normalize_branch_lookup(branch_name) not in normalized_filter:
             return False
     sku_codes = {v for v in product_filter.get("sku_codes", []) if v}
+    sku_names = {v for v in product_filter.get("sku_names", []) if v}
     brands = {v for v in product_filter.get("brands", []) if v}
     categories = {v for v in product_filter.get("categories", []) if v}
     sub_categories = {v for v in product_filter.get("sub_categories", []) if v}
     sublines = {v for v in product_filter.get("sublines", []) if v}
 
     if sku_codes and product.sku_code not in sku_codes:
+        return False
+    if sku_names and product.sku_name not in sku_names:
         return False
     if brands and product.brand not in brands:
         return False
@@ -204,7 +189,7 @@ async def _load_owner_maps(db: AsyncSession, owner_user_id: int) -> tuple[dict[s
     branches = (
         await db.execute(select(Branch).where(Branch.owner_user_id == owner_user_id))
     ).scalars().all()
-    product_map = {p.sku_id: p for p in products}
+    product_map = {str(p.sku_code).strip(): p for p in products}
     branch_name_by_id = {b.branch_id: b.branch_name for b in branches}
     return product_map, branch_name_by_id
 
@@ -255,12 +240,12 @@ async def build_report_tables(
     ).scalars().all()
     prices_by_sku: dict[str, list[PriceList]] = defaultdict(list)
     for row in price_rows:
-        prices_by_sku[str(row.sku_id)].append(row)
-    for sku_id in prices_by_sku:
-        prices_by_sku[sku_id].sort(key=lambda x: x.date)
+        prices_by_sku[str(row.sku_code or "").strip()].append(row)
+    for sku_code in prices_by_sku:
+        prices_by_sku[sku_code].sort(key=lambda x: x.date)
 
-    def _closest_dsp(sku_id: str, target_month: date) -> float:
-        prices = prices_by_sku.get(str(sku_id), [])
+    def _closest_dsp(sku_code: str, target_month: date) -> float:
+        prices = prices_by_sku.get(str(sku_code), [])
         best: PriceList | None = None
         for p in prices:
             p_month = _month_start(p.date)
@@ -283,7 +268,8 @@ async def build_report_tables(
     for r in hist_rows:
         if r.date >= ctx.planning_month:
             continue
-        product = product_map.get(r.sku_id)
+        sku_code = str(r.sku_code or "").strip()
+        product = product_map.get(sku_code)
         if not product:
             continue
         branch_name = branch_name_by_id.get(r.branch_id, r.branch_id)
@@ -304,7 +290,7 @@ async def build_report_tables(
         fact_amount = float(r.fact_amount_kzt or 0.0)
         target_amount = float(r.target_amount_kzt or 0.0)
         if abs(fact_amount) < 1e-9 or abs(target_amount) < 1e-9:
-            dsp = _closest_dsp(r.sku_id, _month_start(r.date))
+            dsp = _closest_dsp(sku_code, _month_start(r.date))
             pieces = float(product.pieces_in_master_carton or 0.0)
             if abs(fact_amount) < 1e-9:
                 fact_amount = fact_qty * pieces * dsp
@@ -322,10 +308,11 @@ async def build_report_tables(
                 "target_volume_cbm": 0.0,
                 "target_amount_kzt": 0.0,
                 "past_available_stock": 0.0,
+                "past_available_stock_gross_weight_kg": 0.0,
                 "past_available_stock_amount_kzt": 0.0,
             }
         bucket = hist_buckets[key]
-        dsp = _closest_dsp(r.sku_id, _month_start(r.date))
+        dsp = _closest_dsp(sku_code, _month_start(r.date))
         stock_mc = float(r.past_available_stock or 0.0)
         bucket["fact_quantity_in_mc"] += fact_qty
         bucket["fact_gross_weight_kg"] += float(r.fact_gross_weight_kg or 0.0)
@@ -336,6 +323,7 @@ async def build_report_tables(
         bucket["target_volume_cbm"] += float(r.target_volume_cbm or 0.0)
         bucket["target_amount_kzt"] += target_amount
         bucket["past_available_stock"] += stock_mc
+        bucket["past_available_stock_gross_weight_kg"] += stock_mc * float(product.master_carton_gross_weight_kg or 0.0)
         bucket["past_available_stock_amount_kzt"] += stock_mc * float(product.pieces_in_master_carton or 0.0) * dsp
 
     historical_table = _aggregate_period_totals(
@@ -350,6 +338,7 @@ async def build_report_tables(
             "target_volume_cbm",
             "target_amount_kzt",
             "past_available_stock",
+            "past_available_stock_gross_weight_kg",
             "past_available_stock_amount_kzt",
         ],
     )
@@ -368,12 +357,11 @@ async def build_report_tables(
     for r in fc_rows:
         if r.date < ctx.planning_month:
             continue
-        product = product_map.get(r.sku_id)
+        sku_code = str(r.sku_code or "").strip()
+        product = product_map.get(sku_code)
         if not product:
             continue
         branch_name = branch_name_by_id.get(r.branch_id, r.branch_id)
-        if not _matches_filters(product, branch_name, ctx.product_filter, ctx.branch_filter):
-            continue
         atomic_rows.append(
             {
                 "period": _month_start(r.date).isoformat(),
@@ -383,6 +371,7 @@ async def build_report_tables(
                 "sub_category": product.sub_category,
                 "subline": product.sub_line,
                 "sku_name": product.sku_name,
+                "_product_obj": product,
                 "baseline_forecast_gross_weight_kg": float(r.baseline_forecast_gross_weight_kg or 0.0),
                 "baseline_forecast_volume_cbm": float(r.baseline_forecast_volume_cbm or 0.0),
                 "baseline_forecast_amount_kzt": float(r.baseline_forecast_amount_kzt or 0.0),
@@ -396,11 +385,16 @@ async def build_report_tables(
                 "adjusted_forecast_volume_cbm": float(r.adjusted_forecast_volume_cbm) if r.adjusted_forecast_volume_cbm is not None else float(r.baseline_forecast_volume_cbm or 0.0),
                 "adjusted_forecast_amount_kzt": float(r.adjusted_forecast_amount_kzt) if r.adjusted_forecast_amount_kzt is not None else float(r.baseline_forecast_amount_kzt or 0.0),
                 "future_available_stock": float(r.future_available_stock or 0.0),
+                "future_available_stock_gross_weight_kg": (
+                    float(r.future_available_stock or 0.0)
+                    * float(product.master_carton_gross_weight_kg or 0.0)
+                ),
                 "future_available_stock_amount_kzt": (
                     float(r.future_available_stock or 0.0)
                     * float(product.pieces_in_master_carton or 0.0)
-                    * _closest_dsp(r.sku_id, _month_start(r.date))
+                    * _closest_dsp(sku_code, _month_start(r.date))
                 ),
+                "_applied_override_metrics": set(),
             }
         )
 
@@ -445,13 +439,52 @@ async def build_report_tables(
                 for r in matched:
                     share = float(r[baseline_metric]) / baseline_sum
                     r[adjusted_metric] = float(ov.value) * share
+                    r["_applied_override_metrics"].add(adjusted_metric)
             else:
                 even_share = float(ov.value) / len(matched)
                 for r in matched:
                     r[adjusted_metric] = even_share
+                    r["_applied_override_metrics"].add(adjusted_metric)
+
+    for r in atomic_rows:
+        applied_metrics: set[str] = r.get("_applied_override_metrics", set())
+        if "adjusted_forecast_quantity_in_mc" not in applied_metrics:
+            continue
+
+        # Cases override must propagate to DSP/weight/volume unless those metrics
+        # were explicitly overridden by their own patch calls.
+        product = r["_product_obj"]
+        period_date = date.fromisoformat(str(r["period"]))
+        adjusted_qty = float(r.get("adjusted_forecast_quantity_in_mc") or 0.0)
+        pieces = float(product.pieces_in_master_carton or 0.0)
+        dsp = _closest_dsp(str(product.sku_code or "").strip(), _month_start(period_date))
+
+        if "adjusted_forecast_amount_kzt" not in applied_metrics:
+            r["adjusted_forecast_amount_kzt"] = adjusted_qty * pieces * dsp
+        if "adjusted_forecast_gross_weight_kg" not in applied_metrics:
+            r["adjusted_forecast_gross_weight_kg"] = adjusted_qty * float(
+                product.master_carton_gross_weight_kg or 0.0
+            )
+        if "adjusted_forecast_volume_cbm" not in applied_metrics:
+            r["adjusted_forecast_volume_cbm"] = adjusted_qty * float(
+                product.master_carton_volume_cbm or 0.0
+            )
+
+    # Apply transient/saved filters only after override distribution so filtered views
+    # receive their proportional adjusted share instead of full override totals.
+    filtered_atomic_rows = [
+        r
+        for r in atomic_rows
+        if _matches_filters(
+            r["_product_obj"],
+            str(r["branch_name"]),
+            ctx.product_filter,
+            ctx.branch_filter,
+        )
+    ]
 
     forecast_buckets: dict[tuple, dict] = {}
-    for r in atomic_rows:
+    for r in filtered_atomic_rows:
         key = _key_tuple(r)
         if key not in forecast_buckets:
             forecast_buckets[key] = {
@@ -471,6 +504,7 @@ async def build_report_tables(
                 "adjusted_forecast_volume_cbm": 0.0,
                 "adjusted_forecast_amount_kzt": 0.0,
                 "future_available_stock": 0.0,
+                "future_available_stock_gross_weight_kg": 0.0,
                 "future_available_stock_amount_kzt": 0.0,
             }
         b = forecast_buckets[key]
@@ -484,6 +518,7 @@ async def build_report_tables(
             "adjusted_forecast_volume_cbm",
             "adjusted_forecast_amount_kzt",
             "future_available_stock",
+            "future_available_stock_gross_weight_kg",
             "future_available_stock_amount_kzt",
         ]:
             b[metric] += float(r[metric] or 0.0)
@@ -500,6 +535,7 @@ async def build_report_tables(
             "adjusted_forecast_volume_cbm",
             "adjusted_forecast_amount_kzt",
             "future_available_stock",
+            "future_available_stock_gross_weight_kg",
             "future_available_stock_amount_kzt",
         ],
     )
@@ -527,8 +563,8 @@ async def build_reporting_context(
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=(
-                    "DSP mode is unavailable until price-list is uploaded. "
-                    "Please upload price-list first."
+                    "Режим DSP недоступен, пока не загружен файл price-list. "
+                    "Сначала загрузите price-list."
                 ),
             )
     resolved_planning = planning_month or await get_current_planning_month(db, owner_user_id)
@@ -566,15 +602,83 @@ async def replace_report_overrides(
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=(
-                    "Unsupported metric_type. Allowed values: DSP, Cases, Gross Weight"
+                    "Неподдерживаемый metric_type. Допустимые значения: DSP, Cases, Gross Weight"
                 ),
             )
         period_value = ov.get("period")
         if not isinstance(period_value, date):
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="Override period must be a valid date",
+                detail="Период override должен быть корректной датой",
             )
+        inserts.append(
+            DPReportForecastOverride(
+                report_id=report_id,
+                owner_user_id=owner_user_id,
+                period=_month_start(period_value),
+                metric_type=metric,
+                branch_name=ov.get("branch_name"),
+                brand=ov.get("brand"),
+                category=ov.get("category"),
+                sub_category=ov.get("sub_category"),
+                subline=ov.get("subline"),
+                sku_name=ov.get("sku_name"),
+                adjustment_reason=ov.get("adjustment_reason"),
+                value=float(ov.get("value", 0.0)),
+            )
+        )
+    if inserts:
+        db.add_all(inserts)
+
+
+def _override_scope_filters(model, override: dict, metric: str, period_value: date) -> list:
+    scope_fields = ["branch_name", "brand", "category", "sub_category", "subline", "sku_name"]
+    filters = [
+        model.report_id == int(override["report_id"]),
+        model.owner_user_id == int(override["owner_user_id"]),
+        model.period == _month_start(period_value),
+        model.metric_type == metric,
+    ]
+    for field_name in scope_fields:
+        field = getattr(model, field_name)
+        value = override.get(field_name)
+        filters.append(field.is_(None) if value is None else field == value)
+    return filters
+
+
+async def upsert_report_overrides(
+    db: AsyncSession,
+    report_id: int,
+    owner_user_id: int,
+    overrides: list[dict],
+) -> None:
+    inserts: list[DPReportForecastOverride] = []
+    for ov in overrides:
+        metric_input = str(ov.get("metric_type", "")).strip()
+        metric = normalize_override_metric(metric_input)
+        if metric is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    "Неподдерживаемый metric_type. Допустимые значения: DSP, Cases, Gross Weight"
+                ),
+            )
+        period_value = ov.get("period")
+        if not isinstance(period_value, date):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Период override должен быть корректной датой",
+            )
+        scoped_override = {
+            **ov,
+            "report_id": report_id,
+            "owner_user_id": owner_user_id,
+        }
+        await db.execute(
+            delete(DPReportForecastOverride).where(
+                *_override_scope_filters(DPReportForecastOverride, scoped_override, metric, period_value)
+            )
+        )
         inserts.append(
             DPReportForecastOverride(
                 report_id=report_id,

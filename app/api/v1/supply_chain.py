@@ -58,6 +58,7 @@ class SupplyChainAdjustRequest(BaseModel):
 class SupplyChainSummary(BaseModel):
     period: str
     total_sum: float
+    total_quantity: int
     total_gross_weight: float
     total_volume: float
 
@@ -82,7 +83,7 @@ def _period_to_date(period: str) -> date:
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="period must be in YYYY-MM format",
+            detail="Параметр period должен быть в формате YYYY-MM",
         ) from exc
 
 
@@ -91,7 +92,7 @@ def _parse_page_size(page_size: str) -> int | None:
     if normalized not in PAGE_SIZE_MAP:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="page_size must be one of: 10, 50, 100, all",
+            detail="Параметр page_size должен быть одним из: 10, 50, 100, all",
         )
     return PAGE_SIZE_MAP[normalized]
 
@@ -117,7 +118,7 @@ async def _resolve_period(db: DBSession, user: CurrentUser, period: str | None) 
     if max_hist_date is None:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Cannot derive default period without historical_sales_monthly data",
+            detail="Невозможно определить период по умолчанию без данных historical_sales_monthly",
         )
     if max_hist_date.month == 12:
         return date(max_hist_date.year + 1, 1, 1)
@@ -188,14 +189,18 @@ async def _load_supply_rows(
         ]
     if source:
         products = [p for p in products if source_matches(source, p.source)]
-    product_by_sku = {p.sku_id: p for p in products}
-    fo_rows = (await db.execute(fo_stmt.order_by(ForecastOrders.sku_id))).scalars().all()
-    fo_by_sku = {r.sku_id: r for r in fo_rows if r.sku_id in product_by_sku}
+    product_by_sku = {str(p.sku_code).strip(): p for p in products}
+    fo_rows = (await db.execute(fo_stmt.order_by(ForecastOrders.sku_code))).scalars().all()
+    fo_by_sku = {
+        str(r.sku_code or "").strip(): r
+        for r in fo_rows
+        if str(r.sku_code or "").strip() in product_by_sku
+    }
 
     rows = [
         SupplyChainRow(
-            sku_code=product_by_sku[r.sku_id].sku_code,
-            sku_name=product_by_sku[r.sku_id].sku_name,
+            sku_code=product_by_sku[str(r.sku_code or "").strip()].sku_code,
+            sku_name=product_by_sku[str(r.sku_code or "").strip()].sku_name,
             month_prior_available_stock=float(r.month_prior_available_stock),
             average_l3m_quantity_in_mc=_qty_int(r.average_l3m_quantity_in_mc),
             average_f3m_quantity_in_mc=_qty_int(r.average_f3m_quantity_in_mc),
@@ -207,7 +212,7 @@ async def _load_supply_rows(
             ),
         )
         for r in fo_rows
-        if r.sku_id in product_by_sku
+        if str(r.sku_code or "").strip() in product_by_sku
     ]
     rows.sort(key=lambda x: x.sku_code)
     return rows, product_by_sku, fo_by_sku
@@ -229,14 +234,14 @@ async def _compute_supply_totals(
     prices = (await db.execute(price_stmt)).scalars().all()
     prices_by_sku: dict[str, list[PriceList]] = {}
     for p in prices:
-        prices_by_sku.setdefault(p.sku_id, []).append(p)
+        prices_by_sku.setdefault(str(p.sku_code or "").strip(), []).append(p)
 
     total_sum = 0.0
     total_quantity = 0
     total_gross_weight = 0.0
     total_volume = 0.0
-    for sku_id, fo in fo_by_sku.items():
-        product = product_by_sku.get(sku_id)
+    for sku_code, fo in fo_by_sku.items():
+        product = product_by_sku.get(sku_code)
         if not product:
             continue
         quantity = (
@@ -244,7 +249,7 @@ async def _compute_supply_totals(
             if fo.adjusted_quantity_in_mc is not None
             else _qty_int(fo.recommended_quantity_in_mc)
         )
-        dsp = _closest_dsp_for_period(prices_by_sku.get(sku_id, []), period_date)
+        dsp = _closest_dsp_for_period(prices_by_sku.get(sku_code, []), period_date)
         total_quantity += quantity
         total_sum += quantity * float(product.pieces_in_master_carton) * dsp
         total_gross_weight += quantity * float(product.master_carton_gross_weight_kg)
@@ -300,9 +305,9 @@ async def get_supply_chain_filter_options(
             fo_stmt = fo_stmt.where(ForecastOrders.owner_user_id == user.id)
         forecast_rows = (await db.execute(fo_stmt)).scalars().all()
         if forecast_rows:
-            sku_ids = {r.sku_id for r in forecast_rows}
-            if sku_ids:
-                period_products = [p for p in products if p.sku_id in sku_ids]
+            sku_codes = {str(r.sku_code or "").strip() for r in forecast_rows}
+            if sku_codes:
+                period_products = [p for p in products if str(p.sku_code).strip() in sku_codes]
                 categories = sorted(
                     {
                         str(p.category).strip()
@@ -355,9 +360,9 @@ async def get_supply_chain_view(
         ]
 
     if sku_code or sku_name:
-        allowed_sku_ids = {
-            sku_id
-            for sku_id, product in product_by_sku.items()
+        allowed_sku_codes = {
+            sku_code_key
+            for sku_code_key, product in product_by_sku.items()
             if any(
                 str(r.sku_code).strip() == str(product.sku_code).strip()
                 and str(r.sku_name).strip() == str(product.sku_name).strip()
@@ -365,12 +370,14 @@ async def get_supply_chain_view(
             )
         }
         product_by_sku_for_totals = {
-            sku_id: product
-            for sku_id, product in product_by_sku.items()
-            if sku_id in allowed_sku_ids
+            sku_code_key: product
+            for sku_code_key, product in product_by_sku.items()
+            if sku_code_key in allowed_sku_codes
         }
         fo_by_sku_for_totals = {
-            sku_id: row for sku_id, row in fo_by_sku.items() if sku_id in allowed_sku_ids
+            sku_code_key: row
+            for sku_code_key, row in fo_by_sku.items()
+            if sku_code_key in allowed_sku_codes
         }
     else:
         product_by_sku_for_totals = product_by_sku
@@ -410,14 +417,14 @@ async def update_adjusted_quantities(
     if not payload.updates:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="updates cannot be empty",
+            detail="Список updates не может быть пустым",
         )
     if not period and not date_from and not date_to:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(
-                "period (or date_from/date_to) is required for PATCH /supply-chain "
-                "to avoid updating a different planning month than intended"
+                "Для PATCH /supply-chain требуется period (или date_from/date_to), "
+                "чтобы не обновить другой месяц планирования"
             ),
         )
     period_date = await _resolve_period_from_args(db, user, period, date_from, date_to)
@@ -426,20 +433,22 @@ async def update_adjusted_quantities(
     if not is_admin(user):
         p_stmt = p_stmt.where(Product.owner_user_id == user.id)
     products = (await db.execute(p_stmt)).scalars().all()
-    sku_id_by_code: dict[tuple[int, str], str] = {(p.owner_user_id, p.sku_code): p.sku_id for p in products}
-    owners = sorted({k[0] for k in sku_id_by_code.keys()})
+    sku_code_by_owner: dict[tuple[int, str], str] = {
+        (p.owner_user_id, str(p.sku_code).strip()): str(p.sku_code).strip() for p in products
+    }
+    owners = sorted({k[0] for k in sku_code_by_owner.keys()})
 
     updated = 0
     for row in payload.updates:
         for owner_id in owners:
-            sku_id = sku_id_by_code.get((owner_id, row.sku_code))
-            if not sku_id:
+            normalized_sku_code = sku_code_by_owner.get((owner_id, str(row.sku_code).strip()))
+            if not normalized_sku_code:
                 continue
             stmt = (
                 update(ForecastOrders)
                 .where(
                     ForecastOrders.owner_user_id == owner_id,
-                    ForecastOrders.sku_id == sku_id,
+                    ForecastOrders.sku_code == normalized_sku_code,
                     ForecastOrders.date == period_date,
                 )
                 .values(
@@ -447,7 +456,8 @@ async def update_adjusted_quantities(
                         int(row.adjusted_quantity_in_mc)
                         if row.adjusted_quantity_in_mc is not None
                         else None
-                    )
+                    ),
+                    sku_code=row.sku_code,
                 )
             )
             result = await db.execute(stmt)
@@ -513,10 +523,37 @@ async def get_supply_chain_summary(
     date_to: str | None = Query(None),
     category: str | None = Query(None),
     source: str | None = Query(None),
+    sku_code: list[str] | None = Query(None),
+    sku_name: list[str] | None = Query(None),
 ) -> SupplyChainSummary:
     period_date = await _resolve_period_from_args(db, user, period, date_from, date_to)
-    _, product_by_sku, fo_by_sku = await _load_supply_rows(db, user, period_date, category, source)
-    total_sum, _, total_gross_weight, total_volume = await _compute_supply_totals(
+    rows, product_by_sku, fo_by_sku = await _load_supply_rows(db, user, period_date, category, source)
+    filtered_rows = rows
+    if sku_code:
+        sku_code_values = {str(v).strip() for v in sku_code if str(v).strip()}
+        filtered_rows = [
+            r for r in filtered_rows if str(r.sku_code).strip() in sku_code_values
+        ]
+    if sku_name:
+        sku_name_values = {str(v).strip() for v in sku_name if str(v).strip()}
+        filtered_rows = [
+            r for r in filtered_rows if str(r.sku_name).strip() in sku_name_values
+        ]
+
+    if sku_code or sku_name:
+        allowed_sku_codes = {str(r.sku_code).strip() for r in filtered_rows}
+        product_by_sku = {
+            sku_code_key: product
+            for sku_code_key, product in product_by_sku.items()
+            if sku_code_key in allowed_sku_codes
+        }
+        fo_by_sku = {
+            sku_code_key: row
+            for sku_code_key, row in fo_by_sku.items()
+            if sku_code_key in allowed_sku_codes
+        }
+
+    total_sum, total_quantity, total_gross_weight, total_volume = await _compute_supply_totals(
         db=db,
         user=user,
         period_date=period_date,
@@ -527,6 +564,7 @@ async def get_supply_chain_summary(
     return SupplyChainSummary(
         period=period_date.strftime("%Y-%m"),
         total_sum=total_sum,
+        total_quantity=total_quantity,
         total_gross_weight=total_gross_weight,
         total_volume=total_volume,
     )

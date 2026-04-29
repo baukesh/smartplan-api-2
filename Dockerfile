@@ -11,6 +11,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+COPY tmp_uploads/upload_files_templates ./tmp_uploads/upload_files_templates
 
 ENV PORT=8000
 

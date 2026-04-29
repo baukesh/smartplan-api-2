@@ -54,7 +54,7 @@ def require_roles(*roles: UserRole):
         if user.role not in roles:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=f"Required roles: {[r.value for r in roles]}",
+                detail=f"Требуются роли: {[r.value for r in roles]}",
             )
         return user
 

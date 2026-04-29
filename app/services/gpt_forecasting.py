@@ -173,7 +173,7 @@ async def _call_openai_forecast(
 
 async def forecast_baseline_quantities_in_mc(
     *,
-    sku_id: str,
+    sku_code: str,
     branch_id: str,
     forecast_months: list[date],
     history: list[dict],
@@ -221,7 +221,7 @@ async def forecast_baseline_quantities_in_mc(
         },
         "forecast_months": month_list,
         "context": {
-            "sku_id": sku_id,
+            "sku_code": sku_code,
             "branch_id": branch_id,
             "current_stock_in_mc": current_stock,
             "stock_norm_days": stock_norm_days,

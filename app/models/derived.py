@@ -11,6 +11,7 @@ class ForecastSalesMonthly(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
     sku_id: Mapped[str] = mapped_column(String(64), index=True)
+    sku_code: Mapped[str | None] = mapped_column(String(128), index=True)
     branch_id: Mapped[str] = mapped_column(String(64), index=True)
     date: Mapped[date] = mapped_column(Date, index=True)
     baseline_forecast_quantity_in_mc: Mapped[float] = mapped_column(Float)
@@ -30,6 +31,7 @@ class ForecastOrders(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
     sku_id: Mapped[str] = mapped_column(String(64), index=True)
+    sku_code: Mapped[str | None] = mapped_column(String(128), index=True)
     date: Mapped[date] = mapped_column(Date, index=True)
     month_prior_available_stock: Mapped[float] = mapped_column(Float)
     average_l3m_quantity_in_mc: Mapped[float] = mapped_column(Float)
@@ -44,6 +46,7 @@ class InventoryHealth(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
     sku_id: Mapped[str] = mapped_column(String(64), index=True)
+    sku_code: Mapped[str | None] = mapped_column(String(128), index=True)
     branch_id: Mapped[str] = mapped_column(String(64), index=True)
     date: Mapped[date] = mapped_column(Date, index=True)
     sales_quantity_in_mc: Mapped[float] = mapped_column(Float)
@@ -86,6 +89,7 @@ class DPReportMart(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
     sku_id: Mapped[str] = mapped_column(String(64), index=True)
+    sku_code: Mapped[str | None] = mapped_column(String(128), index=True)
     date: Mapped[date] = mapped_column(Date, index=True)
     branch_id: Mapped[str] = mapped_column(String(64), index=True)
     fact_quantity_in_mc: Mapped[float | None] = mapped_column(Float)
@@ -132,6 +136,16 @@ class DistributionBranchAdjustment(Base, TimestampMixin):
     owner_user_id: Mapped[int] = mapped_column(index=True)
 
 
+class DistributionBranchAmountAdjustment(Base, TimestampMixin):
+    __tablename__ = "distribution_branch_amount_adjustments"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    planning_date: Mapped[date] = mapped_column(Date, index=True)
+    branch_id: Mapped[str] = mapped_column(String(64), index=True)
+    adjusted_amount_kzt_per_branch: Mapped[float] = mapped_column(Float)
+    owner_user_id: Mapped[int] = mapped_column(index=True)
+
+
 class DistributionSkuAdjustment(Base, TimestampMixin):
     __tablename__ = "distribution_sku_adjustments"
 
@@ -139,6 +153,7 @@ class DistributionSkuAdjustment(Base, TimestampMixin):
     planning_date: Mapped[date] = mapped_column(Date, index=True)
     branch_id: Mapped[str] = mapped_column(String(64), index=True)
     sku_id: Mapped[str] = mapped_column(String(64), index=True)
+    sku_code: Mapped[str | None] = mapped_column(String(128), index=True)
     adjusted_quantity_in_mc: Mapped[float] = mapped_column(Float)
     owner_user_id: Mapped[int] = mapped_column(index=True)
 
@@ -149,6 +164,7 @@ class ForecastInferenceCache(Base, TimestampMixin):
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
     owner_user_id: Mapped[int] = mapped_column(index=True)
     sku_id: Mapped[str] = mapped_column(String(64), index=True)
+    sku_code: Mapped[str | None] = mapped_column(String(128), index=True)
     branch_id: Mapped[str] = mapped_column(String(64), index=True)
     model_name: Mapped[str] = mapped_column(String(128), index=True)
     schema_version: Mapped[str] = mapped_column(String(32), index=True)

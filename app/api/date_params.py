@@ -38,6 +38,6 @@ def parse_query_date(
 
     raise HTTPException(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        detail=f"{field_name} must be in YYYY-MM or YYYY-MM-DD format",
+        detail=f"Параметр {field_name} должен быть в формате YYYY-MM или YYYY-MM-DD",
     )
 
