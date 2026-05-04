@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import date
 from statistics import pstdev
@@ -26,6 +27,16 @@ def _fallback_average(history: list[dict]) -> float:
     if not tail:
         return 0.0
     return sum(tail) / len(tail)
+
+
+def _stable_noise_factor(seed: str) -> float:
+    digest = hashlib.sha256(seed.encode("utf-8")).hexdigest()
+    raw = int(digest[:8], 16) / 0xFFFFFFFF
+    return (raw * 2.0) - 1.0
+
+
+def _clamp(value: float, low: float, high: float) -> float:
+    return min(max(value, low), high)
 
 
 def _extract_json_text(content: str) -> str:
@@ -109,6 +120,61 @@ def _derive_features(history: list[dict]) -> dict:
         "seasonality_index_by_month": seasonality_index_by_month,
         "anti_flat_expected": anti_flat_expected,
     }
+
+
+def forecast_fast_baseline_quantities_in_mc(
+    *,
+    sku_code: str,
+    branch_id: str,
+    forecast_months: list[date],
+    history: list[dict],
+) -> list[float]:
+    """
+    Fast deterministic baseline for immediate UI readiness.
+    GPT refinement can replace these values later.
+    """
+    if not forecast_months:
+        return []
+
+    values = _history_values(history)
+    if not values:
+        return [0.0 for _ in forecast_months]
+
+    features = _derive_features(history)
+    last_3_avg = float(features.get("last_3_avg") or 0.0)
+    last_6_avg = float(features.get("last_6_avg") or 0.0)
+    last_12_avg = float(features.get("last_12_avg") or 0.0)
+    base = (0.6 * last_6_avg) + (0.4 * last_3_avg)
+    if base <= 0:
+        base = last_6_avg or last_3_avg or last_12_avg or _fallback_average(history)
+
+    trend_slope = float(features.get("trend_slope_6m") or 0.0)
+    if base > 0:
+        trend_slope = _clamp(trend_slope, -0.08 * base, 0.08 * base)
+
+    seasonality = features.get("seasonality_index_by_month") or {}
+    volatility = float(features.get("volatility_cv_12m") or 0.0)
+    anti_flat = bool(features.get("anti_flat_expected"))
+    noise_amplitude = _clamp(volatility * 0.08, 0.01, 0.04) if anti_flat and base > 0 else 0.0
+
+    result: list[float] = []
+    for idx, forecast_month in enumerate(forecast_months):
+        trend_adjusted = base + (trend_slope * (idx + 1))
+        if base > 0:
+            trend_adjusted = _clamp(trend_adjusted, 0.0, base * 1.35)
+
+        month_key = f"{forecast_month.month:02d}"
+        seasonal_index = float(seasonality.get(month_key, 1.0) or 1.0)
+        seasonal_index = _clamp(seasonal_index, 0.8, 1.2)
+        value = trend_adjusted * seasonal_index
+
+        if noise_amplitude > 0:
+            seed = f"{sku_code}|{branch_id}|{forecast_month.isoformat()}"
+            value *= 1.0 + (_stable_noise_factor(seed) * noise_amplitude)
+
+        result.append(max(value, 0.0))
+
+    return result
 
 
 def _validate_response_months(

@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import time
+from typing import Callable
 
 from sqlalchemy import delete, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,7 +28,10 @@ from app.models.derived import (
     ForecastSalesMonthly,
     InventoryHealth,
 )
-from app.services.gpt_forecasting import forecast_baseline_quantities_in_mc
+from app.services.gpt_forecasting import (
+    forecast_baseline_quantities_in_mc,
+    forecast_fast_baseline_quantities_in_mc,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +64,11 @@ def _prev_month(d: date) -> date:
     return date(d.year, d.month - 1, 1)
 
 
+def _month_start(d: date | datetime) -> date:
+    value = d.date() if isinstance(d, datetime) else d
+    return date(value.year, value.month, 1)
+
+
 def _round2(v: float | None) -> float | None:
     if v is None:
         return None
@@ -83,6 +92,55 @@ def _avg_last_n(values: list[float], n: int = 6) -> float:
         return 0.0
     tail = values[-n:] if len(values) >= n else values
     return sum(tail) / len(tail) if tail else 0.0
+
+
+def _aggregate_order_arrivals_by_sku_month(
+    placed_orders: list[PlacedOrder],
+) -> dict[tuple[str, date], float]:
+    arrivals: dict[tuple[str, date], float] = defaultdict(float)
+    for order in placed_orders:
+        sku_code = str(order.sku_code or order.sku_id or "").strip()
+        if not sku_code:
+            continue
+        arrivals[(sku_code, _month_start(order.receival_date))] += float(
+            order.quantity_in_mc or 0.0
+        )
+    return arrivals
+
+
+def _allocate_order_arrivals_by_branch(
+    *,
+    job_payloads: list[dict],
+    baseline_series_by_key: dict[tuple[str, str], list[float]],
+    arrivals_by_sku_month: dict[tuple[str, date], float],
+) -> dict[tuple[str, str, date], float]:
+    demand_rows_by_sku_month: dict[tuple[str, date], list[tuple[str, float]]] = defaultdict(list)
+
+    for job in job_payloads:
+        sku_code = str(job["sku_code"]).strip()
+        branch_id = str(job["branch_id"]).strip()
+        baseline_series = baseline_series_by_key.get((sku_code, branch_id), [])
+        for idx, forecast_date in enumerate(job["forecast_months"]):
+            month = _month_start(forecast_date)
+            if arrivals_by_sku_month.get((sku_code, month), 0.0) <= 0:
+                continue
+            demand = float(baseline_series[idx]) if idx < len(baseline_series) else 0.0
+            demand_rows_by_sku_month[(sku_code, month)].append((branch_id, max(demand, 0.0)))
+
+    allocations: dict[tuple[str, str, date], float] = defaultdict(float)
+    for (sku_code, month), branch_demands in demand_rows_by_sku_month.items():
+        incoming_qty = float(arrivals_by_sku_month.get((sku_code, month), 0.0) or 0.0)
+        if incoming_qty <= 0 or not branch_demands:
+            continue
+        total_demand = sum(demand for _branch_id, demand in branch_demands)
+        if total_demand > 0:
+            for branch_id, demand in branch_demands:
+                allocations[(sku_code, branch_id, month)] += incoming_qty * demand / total_demand
+        else:
+            even_share = incoming_qty / len(branch_demands)
+            for branch_id, _demand in branch_demands:
+                allocations[(sku_code, branch_id, month)] += even_share
+    return allocations
 
 
 def _normalize_changed_keys(
@@ -114,8 +172,11 @@ async def refresh_forecast_sales_monthly(
     db: AsyncSession,
     owner_user_id: int | None = None,
     changed_keys: list[tuple[str, str]] | None = None,
+    forecast_source: str = "gpt",
 ) -> dict[str, int]:
     changed_keys = _normalize_changed_keys(changed_keys)
+    if forecast_source not in {"fast", "gpt"}:
+        raise ValueError("forecast_source must be either 'fast' or 'gpt'")
     products = {
         str(p.sku_code).strip(): p
         for p in (
@@ -272,7 +333,7 @@ async def refresh_forecast_sales_monthly(
     cache_ttl = timedelta(hours=max(int(settings.FORECAST_CACHE_TTL_HOURS or 1), 1))
 
     cache_rows_by_hash: dict[str, ForecastInferenceCache] = {}
-    if settings.PERSISTENT_FORECAST_CACHE_ENABLED and job_payloads:
+    if forecast_source == "gpt" and settings.PERSISTENT_FORECAST_CACHE_ENABLED and job_payloads:
         cache_keys = [str(job["cache_key"]) for job in job_payloads]
         cache_rows = (
             await db.execute(
@@ -290,6 +351,15 @@ async def refresh_forecast_sales_monthly(
 
     async def _get_baseline_series(job: dict) -> list[float]:
         nonlocal gpt_attempted, gpt_fallbacks, cache_hits
+        if forecast_source == "fast":
+            gpt_fallbacks += 1
+            return forecast_fast_baseline_quantities_in_mc(
+                sku_code=job["sku_code"],
+                branch_id=job["branch_id"],
+                forecast_months=job["forecast_months"],
+                history=job["history_context"],
+            )
+
         history_values = [
             float(x.get("fact_quantity_in_mc") or 0.0)
             for x in job["history_context"]
@@ -348,7 +418,7 @@ async def refresh_forecast_sales_monthly(
         for idx, job in enumerate(job_payloads):
             baseline_series_by_key[(job["sku_code"], job["branch_id"])] = series_results[idx]
 
-    if settings.PERSISTENT_FORECAST_CACHE_ENABLED and cache_upserts:
+    if forecast_source == "gpt" and settings.PERSISTENT_FORECAST_CACHE_ENABLED and cache_upserts:
         for payload_hash, (sku_id, sku_code, branch_id, series) in cache_upserts.items():
             cache_row = cache_rows_by_hash.get(payload_hash)
             if cache_row is None:
@@ -370,6 +440,13 @@ async def refresh_forecast_sales_monthly(
                 cache_row.expires_at = now_utc + cache_ttl
         cache_writes = len(cache_upserts)
 
+    arrivals_by_sku_month = _aggregate_order_arrivals_by_sku_month(placed_orders)
+    arrival_allocations = _allocate_order_arrivals_by_branch(
+        job_payloads=job_payloads,
+        baseline_series_by_key=baseline_series_by_key,
+        arrivals_by_sku_month=arrivals_by_sku_month,
+    )
+
     for job in job_payloads:
         sku_code = job["sku_code"]
         branch_id = job["branch_id"]
@@ -388,7 +465,10 @@ async def refresh_forecast_sales_monthly(
                 baseline_amount = (
                     baseline_qty * product.pieces_in_master_carton * closest_dsp.dsp
                 )
-            future_stock = max(prev_stock - baseline_qty, 0.0)
+            allocated_arrival_qty = float(
+                arrival_allocations.get((sku_code, branch_id, _month_start(forecast_date)), 0.0)
+            )
+            future_stock = max(prev_stock + allocated_arrival_qty - baseline_qty, 0.0)
             to_insert.append(
                 ForecastSalesMonthly(
                     sku_id=product.sku_id,
@@ -416,8 +496,9 @@ async def refresh_forecast_sales_monthly(
     db.add_all(to_insert)
     await db.commit()
     logger.info(
-        "refresh_forecast_sales_monthly done owner=%s series=%s gpt_attempted=%s fallback=%s cache_hits=%s cache_writes=%s incremental=%s",
+        "refresh_forecast_sales_monthly done owner=%s source=%s series=%s gpt_attempted=%s fallback=%s cache_hits=%s cache_writes=%s incremental=%s",
         owner_user_id,
+        forecast_source,
         len(job_payloads),
         gpt_attempted,
         gpt_fallbacks,
@@ -431,6 +512,7 @@ async def refresh_forecast_sales_monthly(
         "gpt_fallbacks": gpt_fallbacks,
         "cache_hits": cache_hits,
         "cache_writes": cache_writes,
+        "forecast_source": forecast_source,
     }
 
 
@@ -962,32 +1044,14 @@ async def refresh_dp_vertical(db: AsyncSession, owner_user_id: int | None = None
     await refresh_dp_report_mart(db, owner_user_id=owner_user_id)
 
 
-async def refresh_all_materialized(
+async def _refresh_downstream_materialized(
     db: AsyncSession,
-    owner_user_id: int | None = None,
-    changed_keys: list[tuple[str, str]] | None = None,
+    *,
+    owner_user_id: int | None,
+    changed_skus: list[str] | None,
+    use_incremental: bool,
+    stage_group: str,
 ) -> None:
-    changed_keys = _normalize_changed_keys(changed_keys)
-    changed_skus = (
-        sorted({sku_code for sku_code, _branch_id in changed_keys}) if changed_keys else None
-    )
-    use_incremental = bool(
-        settings.INCREMENTAL_REFRESH_ENABLED and changed_keys and len(changed_keys) > 0
-    )
-
-    stage_start = time.perf_counter()
-    forecast_stats = await refresh_forecast_sales_monthly(
-        db,
-        owner_user_id=owner_user_id,
-        changed_keys=changed_keys if use_incremental else None,
-    )
-    logger.info(
-        "refresh_all_materialized stage=forecast_sales owner=%s elapsed_ms=%s incremental=%s",
-        owner_user_id,
-        round((time.perf_counter() - stage_start) * 1000, 1),
-        use_incremental,
-    )
-
     stage_start = time.perf_counter()
     await refresh_dp_report_mart(
         db,
@@ -995,7 +1059,8 @@ async def refresh_all_materialized(
         changed_skus=changed_skus if use_incremental else None,
     )
     logger.info(
-        "refresh_all_materialized stage=dp_report owner=%s elapsed_ms=%s incremental=%s",
+        "refresh_all_materialized stage=%s.dp_report owner=%s elapsed_ms=%s incremental=%s",
+        stage_group,
         owner_user_id,
         round((time.perf_counter() - stage_start) * 1000, 1),
         use_incremental,
@@ -1008,7 +1073,8 @@ async def refresh_all_materialized(
         changed_skus=changed_skus if use_incremental else None,
     )
     logger.info(
-        "refresh_all_materialized stage=forecast_orders owner=%s elapsed_ms=%s incremental=%s",
+        "refresh_all_materialized stage=%s.forecast_orders owner=%s elapsed_ms=%s incremental=%s",
+        stage_group,
         owner_user_id,
         round((time.perf_counter() - stage_start) * 1000, 1),
         use_incremental,
@@ -1018,7 +1084,8 @@ async def refresh_all_materialized(
     stage_start = time.perf_counter()
     await refresh_inventory_health(db, owner_user_id=owner_user_id)
     logger.info(
-        "refresh_all_materialized stage=inventory_health owner=%s elapsed_ms=%s incremental=false",
+        "refresh_all_materialized stage=%s.inventory_health owner=%s elapsed_ms=%s incremental=false",
+        stage_group,
         owner_user_id,
         round((time.perf_counter() - stage_start) * 1000, 1),
     )
@@ -1026,18 +1093,97 @@ async def refresh_all_materialized(
     stage_start = time.perf_counter()
     await refresh_branch_distribution(db, owner_user_id=owner_user_id)
     logger.info(
-        "refresh_all_materialized stage=branch_distribution owner=%s elapsed_ms=%s incremental=false",
+        "refresh_all_materialized stage=%s.branch_distribution owner=%s elapsed_ms=%s incremental=false",
+        stage_group,
         owner_user_id,
         round((time.perf_counter() - stage_start) * 1000, 1),
     )
+
+
+async def refresh_all_materialized(
+    db: AsyncSession,
+    owner_user_id: int | None = None,
+    changed_keys: list[tuple[str, str]] | None = None,
+    stage_callback: Callable[[str], None] | None = None,
+) -> None:
+    changed_keys = _normalize_changed_keys(changed_keys)
+    changed_skus = (
+        sorted({sku_code for sku_code, _branch_id in changed_keys}) if changed_keys else None
+    )
+    use_incremental = bool(
+        settings.INCREMENTAL_REFRESH_ENABLED and changed_keys and len(changed_keys) > 0
+    )
+
+    refresh_start = time.perf_counter()
+
+    def _set_stage(stage: str) -> None:
+        if stage_callback is not None:
+            stage_callback(stage)
+
+    _set_stage("fast_baseline_forecast")
+    stage_start = time.perf_counter()
+    fast_forecast_stats = await refresh_forecast_sales_monthly(
+        db,
+        owner_user_id=owner_user_id,
+        changed_keys=changed_keys if use_incremental else None,
+        forecast_source="fast",
+    )
     logger.info(
-        "refresh_all_materialized completed owner=%s incremental=%s forecast_series=%s gpt_attempted=%s gpt_fallbacks=%s cache_hits=%s cache_writes=%s",
+        "refresh_all_materialized stage=fast_forecast_sales owner=%s elapsed_ms=%s incremental=%s",
+        owner_user_id,
+        round((time.perf_counter() - stage_start) * 1000, 1),
+        use_incremental,
+    )
+
+    await _refresh_downstream_materialized(
+        db,
+        owner_user_id=owner_user_id,
+        changed_skus=changed_skus,
+        use_incremental=use_incremental,
+        stage_group="fast",
+    )
+    baseline_ready_ms = round((time.perf_counter() - refresh_start) * 1000, 1)
+    _set_stage("baseline_ready_gpt_refining")
+    logger.info(
+        "refresh_all_materialized baseline_ready owner=%s elapsed_ms=%s forecast_series=%s",
+        owner_user_id,
+        baseline_ready_ms,
+        fast_forecast_stats.get("series_processed", 0),
+    )
+
+    _set_stage("gpt_refinement")
+    stage_start = time.perf_counter()
+    gpt_forecast_stats = await refresh_forecast_sales_monthly(
+        db,
+        owner_user_id=owner_user_id,
+        changed_keys=changed_keys if use_incremental else None,
+        forecast_source="gpt",
+    )
+    logger.info(
+        "refresh_all_materialized stage=gpt_forecast_sales owner=%s elapsed_ms=%s incremental=%s",
+        owner_user_id,
+        round((time.perf_counter() - stage_start) * 1000, 1),
+        use_incremental,
+    )
+
+    await _refresh_downstream_materialized(
+        db,
+        owner_user_id=owner_user_id,
+        changed_skus=changed_skus,
+        use_incremental=use_incremental,
+        stage_group="gpt",
+    )
+    logger.info(
+        "refresh_all_materialized completed owner=%s incremental=%s baseline_ready_ms=%s total_elapsed_ms=%s fast_series=%s gpt_series=%s gpt_attempted=%s gpt_fallbacks=%s cache_hits=%s cache_writes=%s",
         owner_user_id,
         use_incremental,
-        forecast_stats.get("series_processed", 0),
-        forecast_stats.get("gpt_attempted", 0),
-        forecast_stats.get("gpt_fallbacks", 0),
-        forecast_stats.get("cache_hits", 0),
-        forecast_stats.get("cache_writes", 0),
+        baseline_ready_ms,
+        round((time.perf_counter() - refresh_start) * 1000, 1),
+        fast_forecast_stats.get("series_processed", 0),
+        gpt_forecast_stats.get("series_processed", 0),
+        gpt_forecast_stats.get("gpt_attempted", 0),
+        gpt_forecast_stats.get("gpt_fallbacks", 0),
+        gpt_forecast_stats.get("cache_hits", 0),
+        gpt_forecast_stats.get("cache_writes", 0),
     )
 

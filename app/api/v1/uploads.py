@@ -344,6 +344,7 @@ async def _refresh_materialized_safe(db: AsyncSession, owner_user_id: int) -> st
             db,
             owner_user_id=owner_user_id,
             changed_keys=changed_keys,
+            stage_callback=lambda stage: _set_refresh_stage(owner_user_id, stage),
         )
         return None
     except Exception as exc:
@@ -356,12 +357,21 @@ async def _refresh_materialized_safe(db: AsyncSession, owner_user_id: int) -> st
         return str(exc)
 
 
+def _set_refresh_stage(owner_user_id: int, stage: str) -> None:
+    _refresh_status_by_owner[owner_user_id] = {
+        **_refresh_status_by_owner.get(owner_user_id, {}),
+        "in_progress": True,
+        "stage": stage,
+        "last_stage_updated_at": datetime.now(UTC).isoformat(),
+    }
+
+
 async def _refresh_materialized_background(owner_user_id: int) -> None:
     async with AsyncSessionLocal() as session:
         _refresh_status_by_owner[owner_user_id] = {
             **_refresh_status_by_owner.get(owner_user_id, {}),
             "in_progress": True,
-            "stage": "materialized_refresh",
+            "stage": "fast_baseline_forecast",
             "last_started_at": datetime.now(UTC).isoformat(),
             "last_error": None,
         }
@@ -380,6 +390,9 @@ async def _refresh_materialized_background(owner_user_id: int) -> None:
             "stage": "idle" if error is None else "failed",
             "last_error": error,
             "last_completed_at": datetime.now(UTC).isoformat(),
+            "pending_changed_keys_count": 0 if error is None else len(
+                _pending_refresh_changed_keys.get(owner_user_id, set())
+            ),
         }
 
 
@@ -391,6 +404,24 @@ async def _debounced_materialized_refresh(owner_user_id: int) -> None:
         current = _pending_refresh_tasks.get(owner_user_id)
         if current is asyncio.current_task():
             _pending_refresh_tasks.pop(owner_user_id, None)
+
+
+async def _cancel_pending_refresh_for_upload(owner_user_id: int) -> None:
+    existing = _pending_refresh_tasks.get(owner_user_id)
+    if not existing or existing.done():
+        return
+    existing.cancel()
+    try:
+        await existing
+    except asyncio.CancelledError:
+        pass
+    _refresh_status_by_owner[owner_user_id] = {
+        **_refresh_status_by_owner.get(owner_user_id, {}),
+        "in_progress": False,
+        "stage": "cancelled_for_upload",
+        "last_error": None,
+        "last_completed_at": datetime.now(UTC).isoformat(),
+    }
 
 
 def _schedule_materialized_refresh(owner_user_id: int) -> None:
@@ -713,6 +744,7 @@ async def upload_assortment(
     file: UploadFile = File(...),
 ):
     owner_user_id = _owner_user_id(user)
+    await _cancel_pending_refresh_for_upload(owner_user_id)
     df = _load_excel(file)
     errors = _validate_assortment_columns(df)
     if errors:
@@ -764,6 +796,7 @@ async def upload_branch_stock_norm(
     file: UploadFile = File(...),
 ):
     owner_user_id = _owner_user_id(user)
+    await _cancel_pending_refresh_for_upload(owner_user_id)
     df = _load_excel(file)
     errors = _validate_branch_stock_norm_columns(df)
     if errors:
@@ -898,6 +931,7 @@ async def upload_price_list(
     file: UploadFile = File(...),
 ):
     owner_user_id = _owner_user_id(user)
+    await _cancel_pending_refresh_for_upload(owner_user_id)
     df = _load_excel(file)
     errors = _validate_price_list_columns(df)
     if errors:
@@ -997,6 +1031,7 @@ async def upload_historical_sales_monthly(
     file: UploadFile = File(...),
 ):
     owner_user_id = _owner_user_id(user)
+    await _cancel_pending_refresh_for_upload(owner_user_id)
     df = _load_excel(file)
     errors = _validate_historical_sales_columns(df)
     if errors:
@@ -1265,6 +1300,7 @@ async def upload_placed_orders(
     file: UploadFile = File(...),
 ):
     owner_user_id = _owner_user_id(user)
+    await _cancel_pending_refresh_for_upload(owner_user_id)
     df = _load_excel(file)
     errors = _validate_placed_orders_columns(df)
     if errors:
