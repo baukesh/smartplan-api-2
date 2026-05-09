@@ -33,6 +33,7 @@ router = APIRouter(prefix="/uploads", tags=["uploads"])
 logger = logging.getLogger(__name__)
 UPLOAD_WRITE_LOCK = asyncio.Lock()
 REFRESH_DEBOUNCE_SECONDS = 2
+REFRESH_CANCEL_TIMEOUT_SECONDS = 10
 _pending_refresh_tasks: dict[int, asyncio.Task] = {}
 _pending_refresh_changed_keys: dict[int, set[tuple[str, str]]] = {}
 _refresh_status_by_owner: dict[int, dict] = {}
@@ -57,6 +58,42 @@ def _row_error(row: int, field: str, message: str, error_type: str = "validation
         "field": field,
         "message": message,
     }
+
+
+def _summarize_row_errors(row_errors: list[dict], max_sample_rows: int = 20) -> list[dict]:
+    """
+    Collapse identical row-level validation errors so the UI does not show the
+    same message hundreds of times for bulk uploads.
+    """
+    grouped: dict[tuple[str, str, str], dict] = {}
+    for error in row_errors:
+        error_type = str(error.get("type", "validation_error"))
+        field = str(error.get("field", ""))
+        message = str(error.get("message", ""))
+        key = (error_type, field, message)
+        grouped_error = grouped.setdefault(
+            key,
+            {
+                "type": error_type,
+                "field": field,
+                "message": message,
+                "row": error.get("row"),
+                "rows": [],
+                "row_count": 0,
+            },
+        )
+        grouped_error["row_count"] = int(grouped_error["row_count"]) + 1
+        row = error.get("row")
+        if row is not None and len(grouped_error["rows"]) < max_sample_rows:
+            grouped_error["rows"].append(int(row))
+
+    summarized: list[dict] = []
+    for error in grouped.values():
+        if int(error["row_count"]) == 1:
+            error.pop("rows", None)
+            error.pop("row_count", None)
+        summarized.append(error)
+    return summarized
 
 
 def _owner_user_id(user: CurrentUser) -> int:
@@ -347,6 +384,9 @@ async def _refresh_materialized_safe(db: AsyncSession, owner_user_id: int) -> st
             stage_callback=lambda stage: _set_refresh_stage(owner_user_id, stage),
         )
         return None
+    except asyncio.CancelledError:
+        await db.rollback()
+        raise
     except Exception as exc:
         # Keep upload successful because base rows are already committed.
         logger.exception(
@@ -375,7 +415,20 @@ async def _refresh_materialized_background(owner_user_id: int) -> None:
             "last_started_at": datetime.now(UTC).isoformat(),
             "last_error": None,
         }
-        error = await _refresh_materialized_safe(session, owner_user_id=owner_user_id)
+        try:
+            error = await _refresh_materialized_safe(session, owner_user_id=owner_user_id)
+        except asyncio.CancelledError:
+            _refresh_status_by_owner[owner_user_id] = {
+                **_refresh_status_by_owner.get(owner_user_id, {}),
+                "in_progress": False,
+                "stage": "cancelled_for_upload",
+                "last_error": None,
+                "last_completed_at": datetime.now(UTC).isoformat(),
+                "pending_changed_keys_count": len(
+                    _pending_refresh_changed_keys.get(owner_user_id, set())
+                ),
+            }
+            raise
         if error:
             logger.warning(
                 "Background materialized refresh failed for owner_user_id=%s: %s",
@@ -411,10 +464,24 @@ async def _cancel_pending_refresh_for_upload(owner_user_id: int) -> None:
     if not existing or existing.done():
         return
     existing.cancel()
-    try:
-        await existing
-    except asyncio.CancelledError:
-        pass
+    done, _pending = await asyncio.wait({existing}, timeout=REFRESH_CANCEL_TIMEOUT_SECONDS)
+    if existing in done:
+        try:
+            await existing
+        except asyncio.CancelledError:
+            pass
+    else:
+        _refresh_status_by_owner[owner_user_id] = {
+            **_refresh_status_by_owner.get(owner_user_id, {}),
+            "in_progress": True,
+            "stage": "cancel_timeout_for_upload",
+            "last_error": "Предыдущий пересчет данных все еще завершается. Повторите загрузку через несколько секунд.",
+            "last_completed_at": datetime.now(UTC).isoformat(),
+        }
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Предыдущий пересчет данных все еще завершается. Повторите загрузку через несколько секунд.",
+        )
     _refresh_status_by_owner[owner_user_id] = {
         **_refresh_status_by_owner.get(owner_user_id, {}),
         "in_progress": False,
@@ -443,6 +510,10 @@ def _schedule_materialized_refresh(owner_user_id: int) -> None:
 
 
 def get_refresh_status(owner_user_id: int) -> dict:
+    bucket_count = len(_pending_refresh_changed_keys.get(owner_user_id, set()))
+    stored_pending = int(
+        _refresh_status_by_owner.get(owner_user_id, {}).get("pending_changed_keys_count", 0)
+    )
     return {
         "in_progress": bool(
             _refresh_status_by_owner.get(owner_user_id, {}).get("in_progress", False)
@@ -458,11 +529,7 @@ def get_refresh_status(owner_user_id: int) -> dict:
         "last_scheduled_at": _refresh_status_by_owner.get(owner_user_id, {}).get(
             "last_scheduled_at"
         ),
-        "pending_changed_keys_count": int(
-            _refresh_status_by_owner.get(owner_user_id, {}).get(
-                "pending_changed_keys_count", 0
-            )
-        ),
+        "pending_changed_keys_count": max(bucket_count, stored_pending),
     }
 
 
@@ -500,6 +567,18 @@ def _accumulate_changed_keys(owner_user_id: int, changed_keys: list[tuple[str, s
         b = str(branch_id).strip()
         if s and b:
             bucket.add((s, b))
+
+
+def _defer_materialized_refresh_until_placed_orders(owner_user_id: int) -> None:
+    """Record pending keys but defer heavy pipelines until `/uploads/placed-orders`."""
+    _refresh_status_by_owner[owner_user_id] = {
+        **_refresh_status_by_owner.get(owner_user_id, {}),
+        "in_progress": False,
+        "stage": "pending_placed_orders_upload",
+        "pending_changed_keys_count": len(
+            _pending_refresh_changed_keys.get(owner_user_id, set())
+        ),
+    }
 
 
 async def _resolve_branch_ids(
@@ -768,7 +847,10 @@ async def upload_assortment(
         r["source"] = normalize_source_value(r.get("source"))
         r["owner_user_id"] = owner_user_id
     if row_errors:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=row_errors)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=_summarize_row_errors(row_errors),
+        )
     count = await _upsert_records_by_key(
         db,
         Product,
@@ -782,10 +864,10 @@ async def upload_assortment(
         sku_codes=[str(r.get("sku_code", "")) for r in records],
     )
     _accumulate_changed_keys(owner_user_id, changed_keys)
-    _schedule_materialized_refresh(owner_user_id)
+    _defer_materialized_refresh_until_placed_orders(owner_user_id)
     return {
         "rows_inserted": count,
-        "refresh_status": "scheduled",
+        "refresh_status": "pending_placed_orders_upload",
     }
 
 
@@ -846,7 +928,10 @@ async def upload_branch_stock_norm(
                     )
                 )
     if row_errors:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=row_errors)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=_summarize_row_errors(row_errors),
+        )
     branch_map = await _resolve_branch_ids(
         db,
         owner_user_id=owner_user_id,
@@ -904,7 +989,10 @@ async def upload_branch_stock_norm(
         r["stock_norm"] = float(r["stock_norm"])
         r["owner_user_id"] = owner_user_id
     if row_errors:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=row_errors)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=_summarize_row_errors(row_errors),
+        )
     changed_keys = [
         (str(r.get("sku_code", "")).strip(), str(r.get("branch_id", "")).strip())
         for r in records
@@ -917,10 +1005,10 @@ async def upload_branch_stock_norm(
         owner_user_id=owner_user_id,
         key_fields=["sku_code", "branch_id"],
     )
-    _schedule_materialized_refresh(owner_user_id)
+    _defer_materialized_refresh_until_placed_orders(owner_user_id)
     return {
         "rows_inserted": count,
-        "refresh_status": "scheduled",
+        "refresh_status": "pending_placed_orders_upload",
     }
 
 
@@ -1003,7 +1091,10 @@ async def upload_price_list(
             }
         )
     if row_errors:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=row_errors)
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=_summarize_row_errors(row_errors),
+        )
     count = await _upsert_records_by_key(
         db,
         PriceList,
@@ -1017,10 +1108,10 @@ async def upload_price_list(
         sku_codes=[str(r.get("sku_code", "")) for r in records],
     )
     _accumulate_changed_keys(owner_user_id, changed_keys)
-    _schedule_materialized_refresh(owner_user_id)
+    _defer_materialized_refresh_until_placed_orders(owner_user_id)
     return {
         "rows_inserted": count,
-        "refresh_status": "scheduled",
+        "refresh_status": "pending_placed_orders_upload",
     }
 
 
@@ -1271,7 +1362,7 @@ async def upload_historical_sales_monthly(
     if row_errors:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=row_errors,
+            detail=_summarize_row_errors(row_errors),
         )
 
     count = await _upsert_records_by_key(
@@ -1286,10 +1377,10 @@ async def upload_historical_sales_monthly(
         for r in prepared
     ]
     _accumulate_changed_keys(owner_user_id, changed_keys)
-    _schedule_materialized_refresh(owner_user_id)
+    _defer_materialized_refresh_until_placed_orders(owner_user_id)
     return {
         "rows_inserted": count,
-        "refresh_status": "scheduled",
+        "refresh_status": "pending_placed_orders_upload",
     }
 
 
@@ -1424,7 +1515,7 @@ async def upload_placed_orders(
     if row_errors:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=row_errors,
+            detail=_summarize_row_errors(row_errors),
         )
 
     count = await _upsert_records_by_key(

@@ -11,6 +11,7 @@ from app.api.v1.inventory_health import (
     _build_category_summary,
     _compute_inventory_metrics,
     _merge_branch_filters,
+    _metric_sales_value,
 )
 from app.models.data_uploads import Branch, HistoricalSalesMonthly, PriceList, Product
 from app.models.derived import ForecastSalesMonthly
@@ -145,6 +146,7 @@ class HistoricalPlotPoint(BaseModel):
     total_fact_value: float
     total_target_value: float
     total_past_available_stock: float
+    total_past_hub_stock: float = 0.0
 
 
 class ForecastPlotPoint(BaseModel):
@@ -152,6 +154,7 @@ class ForecastPlotPoint(BaseModel):
     total_baseline_forecast_value: float
     total_adjusted_forecast_value: float
     total_future_available_stock: float
+    total_future_hub_stock: float = 0.0
 
 
 class DashboardPlotDataResponse(BaseModel):
@@ -163,12 +166,24 @@ class DashboardPlotDataResponse(BaseModel):
 
 def _normalize_dashboard_view_type(view_type: str) -> str:
     normalized = (view_type or "").strip().lower()
-    if normalized not in {"dsp", "cases"}:
+    if normalized not in {"dsp", "invoice price", "cases"}:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Параметр view_type должен быть одним из: DSP или Cases",
+            detail="Параметр view_type должен быть одним из: DSP, Invoice price или Cases",
         )
     return normalized
+
+
+def _price_value_for_view(price: PriceList | None, view_type: str) -> float:
+    if price is None:
+        return 0.0
+    if view_type == "invoice price":
+        return float(price.invoice_price or 0.0)
+    return float(price.dsp or 0.0)
+
+
+def _is_amount_view(view_type: str) -> bool:
+    return view_type in {"dsp", "invoice price"}
 
 
 async def _inventory_issue_overview(
@@ -199,12 +214,8 @@ async def _inventory_issue_overview(
         filtered = [m for m in metrics if 0.0 < m.health_index < 100.0]
     else:
         filtered = [m for m in metrics if abs(m.health_index) < 1e-9]
-    if normalized_view_type == "dsp":
-        total_value = sum(m.sales_dsp for m in filtered)
-        all_value = sum(m.sales_dsp for m in metrics)
-    else:
-        total_value = sum(m.sales_qty for m in filtered)
-        all_value = sum(m.sales_qty for m in metrics)
+    total_value = sum(_metric_sales_value(normalized_view_type, m) for m in filtered)
+    all_value = sum(_metric_sales_value(normalized_view_type, m) for m in metrics)
     share = (total_value / all_value * 100.0) if all_value > 0 else 0.0
     return InventoryIssueOverviewResponse(
         view_type=normalized_view_type,
@@ -307,7 +318,7 @@ def _safe_percent_int(actual: float, target: float) -> int:
 async def get_sku_sales_overview(
     db: DBSession,
     user: CurrentUser,
-    view_type: str = Query("DSP", description="DSP or Cases"),
+    view_type: str = Query("DSP", description="DSP, Invoice price or Cases"),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
     top_n: int = Query(10, ge=1),
@@ -337,7 +348,7 @@ async def get_sku_sales_overview(
         product_name_by_key[key] = str(p.sku_name or "").strip()
         product_pieces_by_key[key] = float(p.pieces_in_master_carton or 0.0)
 
-    if normalized_view_type == "dsp":
+    if _is_amount_view(normalized_view_type):
         price_stmt = _scope_stmt(select(PriceList), PriceList, user)
         prices = (await db.execute(price_stmt)).scalars().all()
         for p in prices:
@@ -346,7 +357,7 @@ async def get_sku_sales_overview(
         for key in prices_by_key:
             prices_by_key[key].sort(key=lambda x: x.date)
 
-    def _dsp_for_key_on_or_before(key: tuple[int, str], point_date: date) -> float:
+    def _price_for_key_on_or_before(key: tuple[int, str], point_date: date) -> float:
         series = prices_by_key.get(key, [])
         if not series:
             return 0.0
@@ -356,7 +367,7 @@ async def get_sku_sales_overview(
                 selected = p
         if selected is None:
             selected = series[-1]
-        return float(selected.dsp or 0.0)
+        return _price_value_for_view(selected, normalized_view_type)
 
     sku_perf: dict[tuple[int, str], dict[str, float]] = {}
 
@@ -378,15 +389,23 @@ async def get_sku_sales_overview(
                 continue
             sku_key = (int(row.owner_user_id), sku_code_value)
             bucket = sku_perf.setdefault(sku_key, {"fact": 0.0, "target": 0.0})
-            if normalized_view_type == "dsp":
+            if _is_amount_view(normalized_view_type):
                 pieces = product_pieces_by_key.get(sku_key, 0.0)
-                dsp = _dsp_for_key_on_or_before(sku_key, row.date)
-                fact_amount = float(row.fact_amount_kzt or 0.0)
-                target_amount = float(row.target_amount_kzt or 0.0)
-                if abs(fact_amount) < 1e-9 and pieces > 0 and dsp > 0:
-                    fact_amount = float(row.fact_quantity_in_mc or 0.0) * pieces * dsp
-                if abs(target_amount) < 1e-9 and pieces > 0 and dsp > 0:
-                    target_amount = float(row.target_quantity_in_mc or 0.0) * pieces * dsp
+                price_value = _price_for_key_on_or_before(sku_key, row.date)
+                fact_amount = (
+                    float(row.fact_amount_kzt or 0.0)
+                    if normalized_view_type == "dsp"
+                    else float(row.fact_quantity_in_mc or 0.0) * pieces * price_value
+                )
+                target_amount = (
+                    float(row.target_amount_kzt or 0.0)
+                    if normalized_view_type == "dsp"
+                    else float(row.target_quantity_in_mc or 0.0) * pieces * price_value
+                )
+                if normalized_view_type == "dsp" and abs(fact_amount) < 1e-9 and pieces > 0 and price_value > 0:
+                    fact_amount = float(row.fact_quantity_in_mc or 0.0) * pieces * price_value
+                if normalized_view_type == "dsp" and abs(target_amount) < 1e-9 and pieces > 0 and price_value > 0:
+                    target_amount = float(row.target_quantity_in_mc or 0.0) * pieces * price_value
                 bucket["fact"] += fact_amount
                 bucket["target"] += target_amount
             else:
@@ -411,25 +430,31 @@ async def get_sku_sales_overview(
                 continue
             sku_key = (int(row.owner_user_id), sku_code_value)
             bucket = sku_perf.setdefault(sku_key, {"fact": 0.0, "target": 0.0})
-            if normalized_view_type == "dsp":
+            if _is_amount_view(normalized_view_type):
                 pieces = product_pieces_by_key.get(sku_key, 0.0)
-                dsp = _dsp_for_key_on_or_before(sku_key, row.date)
-                baseline_amount = float(row.baseline_forecast_amount_kzt or 0.0)
-                adjusted_amount = (
-                    float(row.adjusted_forecast_amount_kzt)
-                    if row.adjusted_forecast_amount_kzt is not None
-                    else baseline_amount
-                )
+                price_value = _price_for_key_on_or_before(sku_key, row.date)
                 baseline_qty = float(row.baseline_forecast_quantity_in_mc or 0.0)
                 adjusted_qty = (
                     float(row.adjusted_forecast_quantity_in_mc)
                     if row.adjusted_forecast_quantity_in_mc is not None
                     else baseline_qty
                 )
-                if abs(baseline_amount) < 1e-9 and pieces > 0 and dsp > 0:
-                    baseline_amount = baseline_qty * pieces * dsp
-                if abs(adjusted_amount) < 1e-9 and pieces > 0 and dsp > 0:
-                    adjusted_amount = adjusted_qty * pieces * dsp
+                baseline_amount = (
+                    float(row.baseline_forecast_amount_kzt or 0.0)
+                    if normalized_view_type == "dsp"
+                    else baseline_qty * pieces * price_value
+                )
+                adjusted_amount = (
+                    float(row.adjusted_forecast_amount_kzt)
+                    if normalized_view_type == "dsp" and row.adjusted_forecast_amount_kzt is not None
+                    else baseline_amount
+                    if normalized_view_type == "dsp"
+                    else adjusted_qty * pieces * price_value
+                )
+                if normalized_view_type == "dsp" and abs(baseline_amount) < 1e-9 and pieces > 0 and price_value > 0:
+                    baseline_amount = baseline_qty * pieces * price_value
+                if normalized_view_type == "dsp" and abs(adjusted_amount) < 1e-9 and pieces > 0 and price_value > 0:
+                    adjusted_amount = adjusted_qty * pieces * price_value
                 # For future periods: fact=baseline forecast, target=adjusted forecast.
                 bucket["fact"] += baseline_amount
                 bucket["target"] += adjusted_amount
@@ -457,7 +482,7 @@ async def get_sku_sales_overview(
 
     rows = sorted(
         rows,
-        key=lambda x: (x.sales_performance_per_sku, x.fact_value_per_sku, x.sku_name),
+        key=lambda x: (x.fact_value_per_sku, x.sales_performance_per_sku, x.sku_name),
         reverse=True,
     )
     return SkuSalesOverviewResponse(
@@ -475,7 +500,7 @@ async def get_sku_sales_overview(
 async def get_branch_sales_overview(
     db: DBSession,
     user: CurrentUser,
-    view_type: str = Query("DSP", description="DSP or Cases"),
+    view_type: str = Query("DSP", description="DSP, Invoice price or Cases"),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
     top_n: int = Query(5, ge=1),
@@ -496,7 +521,7 @@ async def get_branch_sales_overview(
 
     product_pieces_by_key: dict[tuple[int, str], float] = {}
     prices_by_key: dict[tuple[int, str], list[PriceList]] = {}
-    if normalized_view_type == "dsp":
+    if _is_amount_view(normalized_view_type):
         product_stmt = _scope_stmt(select(Product), Product, user)
         products = (await db.execute(product_stmt)).scalars().all()
         product_pieces_by_key = {
@@ -511,7 +536,7 @@ async def get_branch_sales_overview(
         for key in prices_by_key:
             prices_by_key[key].sort(key=lambda x: x.date)
 
-    def _dsp_for_key_on_or_before(key: tuple[int, str], point_date: date) -> float:
+    def _price_for_key_on_or_before(key: tuple[int, str], point_date: date) -> float:
         series = prices_by_key.get(key, [])
         if not series:
             return 0.0
@@ -521,7 +546,7 @@ async def get_branch_sales_overview(
                 selected = p
         if selected is None:
             selected = series[-1]
-        return float(selected.dsp or 0.0)
+        return _price_value_for_view(selected, normalized_view_type)
 
     branch_perf: dict[tuple[int, str], dict[str, float]] = {}
 
@@ -543,16 +568,24 @@ async def get_branch_sales_overview(
                 continue
             branch_key = (int(row.owner_user_id), branch_id_value)
             bucket = branch_perf.setdefault(branch_key, {"fact": 0.0, "target": 0.0})
-            if normalized_view_type == "dsp":
+            if _is_amount_view(normalized_view_type):
                 tuple_key = (int(row.owner_user_id), str(row.sku_code or "").strip())
                 pieces = product_pieces_by_key.get(tuple_key, 0.0)
-                dsp = _dsp_for_key_on_or_before(tuple_key, row.date)
-                fact_amount = float(row.fact_amount_kzt or 0.0)
-                target_amount = float(row.target_amount_kzt or 0.0)
-                if abs(fact_amount) < 1e-9 and pieces > 0 and dsp > 0:
-                    fact_amount = float(row.fact_quantity_in_mc or 0.0) * pieces * dsp
-                if abs(target_amount) < 1e-9 and pieces > 0 and dsp > 0:
-                    target_amount = float(row.target_quantity_in_mc or 0.0) * pieces * dsp
+                price_value = _price_for_key_on_or_before(tuple_key, row.date)
+                fact_amount = (
+                    float(row.fact_amount_kzt or 0.0)
+                    if normalized_view_type == "dsp"
+                    else float(row.fact_quantity_in_mc or 0.0) * pieces * price_value
+                )
+                target_amount = (
+                    float(row.target_amount_kzt or 0.0)
+                    if normalized_view_type == "dsp"
+                    else float(row.target_quantity_in_mc or 0.0) * pieces * price_value
+                )
+                if normalized_view_type == "dsp" and abs(fact_amount) < 1e-9 and pieces > 0 and price_value > 0:
+                    fact_amount = float(row.fact_quantity_in_mc or 0.0) * pieces * price_value
+                if normalized_view_type == "dsp" and abs(target_amount) < 1e-9 and pieces > 0 and price_value > 0:
+                    target_amount = float(row.target_quantity_in_mc or 0.0) * pieces * price_value
                 bucket["fact"] += fact_amount
                 bucket["target"] += target_amount
             else:
@@ -577,26 +610,32 @@ async def get_branch_sales_overview(
                 continue
             branch_key = (int(row.owner_user_id), branch_id_value)
             bucket = branch_perf.setdefault(branch_key, {"fact": 0.0, "target": 0.0})
-            if normalized_view_type == "dsp":
+            if _is_amount_view(normalized_view_type):
                 tuple_key = (int(row.owner_user_id), str(row.sku_code or "").strip())
                 pieces = product_pieces_by_key.get(tuple_key, 0.0)
-                dsp = _dsp_for_key_on_or_before(tuple_key, row.date)
-                baseline_amount = float(row.baseline_forecast_amount_kzt or 0.0)
-                adjusted_amount = (
-                    float(row.adjusted_forecast_amount_kzt)
-                    if row.adjusted_forecast_amount_kzt is not None
-                    else baseline_amount
-                )
+                price_value = _price_for_key_on_or_before(tuple_key, row.date)
                 baseline_qty = float(row.baseline_forecast_quantity_in_mc or 0.0)
                 adjusted_qty = (
                     float(row.adjusted_forecast_quantity_in_mc)
                     if row.adjusted_forecast_quantity_in_mc is not None
                     else baseline_qty
                 )
-                if abs(baseline_amount) < 1e-9 and pieces > 0 and dsp > 0:
-                    baseline_amount = baseline_qty * pieces * dsp
-                if abs(adjusted_amount) < 1e-9 and pieces > 0 and dsp > 0:
-                    adjusted_amount = adjusted_qty * pieces * dsp
+                baseline_amount = (
+                    float(row.baseline_forecast_amount_kzt or 0.0)
+                    if normalized_view_type == "dsp"
+                    else baseline_qty * pieces * price_value
+                )
+                adjusted_amount = (
+                    float(row.adjusted_forecast_amount_kzt)
+                    if normalized_view_type == "dsp" and row.adjusted_forecast_amount_kzt is not None
+                    else baseline_amount
+                    if normalized_view_type == "dsp"
+                    else adjusted_qty * pieces * price_value
+                )
+                if normalized_view_type == "dsp" and abs(baseline_amount) < 1e-9 and pieces > 0 and price_value > 0:
+                    baseline_amount = baseline_qty * pieces * price_value
+                if normalized_view_type == "dsp" and abs(adjusted_amount) < 1e-9 and pieces > 0 and price_value > 0:
+                    adjusted_amount = adjusted_qty * pieces * price_value
                 # For future periods: fact=baseline forecast, target=adjusted forecast.
                 bucket["fact"] += baseline_amount
                 bucket["target"] += adjusted_amount
@@ -651,16 +690,11 @@ async def get_branch_sales_overview(
 async def get_sales_overview(
     db: DBSession,
     user: CurrentUser,
-    view_type: str = Query("DSP", description="DSP or Cases"),
+    view_type: str = Query("DSP", description="DSP, Invoice price or Cases"),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
 ) -> SalesOverviewResponse:
-    normalized_view_type = view_type.strip().lower()
-    if normalized_view_type not in {"dsp", "cases"}:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Параметр view_type должен быть одним из: DSP или Cases",
-        )
+    normalized_view_type = _normalize_dashboard_view_type(view_type)
     resolved_from, resolved_to = await _resolve_last_year_period(db, user, date_from, date_to)
     if resolved_from is None or resolved_to is None:
         return SalesOverviewResponse(
@@ -690,7 +724,9 @@ async def get_sales_overview(
 
     # Keep DSP cards consistent with plot-data:
     # if historical amount columns are absent/zero, backfill from quantity * pieces * DSP.
-    if normalized_view_type == "dsp" and (abs(target_amount) < 1e-9 or abs(fact_amount) < 1e-9):
+    if _is_amount_view(normalized_view_type) and (
+        normalized_view_type == "invoice price" or abs(target_amount) < 1e-9 or abs(fact_amount) < 1e-9
+    ):
         hist_stmt = _scope_stmt(
             select(HistoricalSalesMonthly).where(
                 HistoricalSalesMonthly.date >= resolved_from,
@@ -717,7 +753,7 @@ async def get_sales_overview(
         for key in prices_by_key:
             prices_by_key[key].sort(key=lambda x: x.date)
 
-        def _dsp_for_key_on_or_before(key: tuple[int, str], point_date: date) -> float:
+        def _price_for_key_on_or_before(key: tuple[int, str], point_date: date) -> float:
             series = prices_by_key.get(key, [])
             if not series:
                 return 0.0
@@ -727,22 +763,22 @@ async def get_sales_overview(
                     selected = p
             if selected is None:
                 selected = series[-1]
-            return float(selected.dsp or 0.0)
+            return _price_value_for_view(selected, normalized_view_type)
 
         fallback_fact_amount = 0.0
         fallback_target_amount = 0.0
         for h in hist_rows:
             tuple_key = (int(h.owner_user_id), str(h.sku_code or "").strip())
             pieces = product_pieces_by_key.get(tuple_key, 0.0)
-            dsp = _dsp_for_key_on_or_before(tuple_key, h.date)
-            fallback_fact_amount += float(h.fact_quantity_in_mc or 0.0) * pieces * dsp
-            fallback_target_amount += float(h.target_quantity_in_mc or 0.0) * pieces * dsp
+            price_value = _price_for_key_on_or_before(tuple_key, h.date)
+            fallback_fact_amount += float(h.fact_quantity_in_mc or 0.0) * pieces * price_value
+            fallback_target_amount += float(h.target_quantity_in_mc or 0.0) * pieces * price_value
 
-        if abs(fact_amount) < 1e-9:
+        if normalized_view_type == "invoice price" or abs(fact_amount) < 1e-9:
             fact_amount = fallback_fact_amount
-        if abs(target_amount) < 1e-9:
+        if normalized_view_type == "invoice price" or abs(target_amount) < 1e-9:
             target_amount = fallback_target_amount
-    if normalized_view_type == "dsp":
+    if _is_amount_view(normalized_view_type):
         total_target_value = target_amount
         total_fact_value = fact_amount
     else:
@@ -761,7 +797,7 @@ async def get_sales_overview(
 async def get_dashboard_overstock(
     db: DBSession,
     user: CurrentUser,
-    view_type: str = Query("DSP", description="DSP or Cases"),
+    view_type: str = Query("DSP", description="DSP, Invoice price or Cases"),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
 ) -> OverstockOverviewResponse:
@@ -784,7 +820,7 @@ async def get_dashboard_overstock(
 async def get_dashboard_understock(
     db: DBSession,
     user: CurrentUser,
-    view_type: str = Query("DSP", description="DSP or Cases"),
+    view_type: str = Query("DSP", description="DSP, Invoice price or Cases"),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
 ) -> UnderstockOverviewResponse:
@@ -807,7 +843,7 @@ async def get_dashboard_understock(
 async def get_dashboard_out_of_stock(
     db: DBSession,
     user: CurrentUser,
-    view_type: str = Query("DSP", description="DSP or Cases"),
+    view_type: str = Query("DSP", description="DSP, Invoice price or Cases"),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
 ) -> OutOfStockOverviewResponse:
@@ -830,7 +866,7 @@ async def get_dashboard_out_of_stock(
 async def get_dashboard_category_a(
     db: DBSession,
     user: CurrentUser,
-    view_type: str = Query("DSP", description="DSP or Cases"),
+    view_type: str = Query("DSP", description="DSP, Invoice price or Cases"),
     branch_name: list[str] | None = Query(None),
     branch: list[str] | None = Query(None),
     referer: str | None = Header(default=None, alias="Referer"),
@@ -855,7 +891,7 @@ async def get_dashboard_category_a(
 async def get_dashboard_category_b(
     db: DBSession,
     user: CurrentUser,
-    view_type: str = Query("DSP", description="DSP or Cases"),
+    view_type: str = Query("DSP", description="DSP, Invoice price or Cases"),
     branch_name: list[str] | None = Query(None),
     branch: list[str] | None = Query(None),
     referer: str | None = Header(default=None, alias="Referer"),
@@ -880,7 +916,7 @@ async def get_dashboard_category_b(
 async def get_dashboard_category_c(
     db: DBSession,
     user: CurrentUser,
-    view_type: str = Query("DSP", description="DSP or Cases"),
+    view_type: str = Query("DSP", description="DSP, Invoice price or Cases"),
     branch_name: list[str] | None = Query(None),
     branch: list[str] | None = Query(None),
     referer: str | None = Header(default=None, alias="Referer"),
@@ -905,7 +941,7 @@ async def get_dashboard_category_c(
 async def get_stock_coverage(
     db: DBSession,
     user: CurrentUser,
-    view_type: str = Query("DSP", description="DSP or Cases"),
+    view_type: str = Query("DSP", description="DSP, Invoice price or Cases"),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
 ) -> StockCoverageResponse:
@@ -945,7 +981,7 @@ async def get_stock_coverage(
 async def get_plot_data(
     db: DBSession,
     user: CurrentUser,
-    view_type: str = Query("DSP", description="DSP or Cases"),
+    view_type: str = Query("DSP", description="DSP, Invoice price or Cases"),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
 ) -> DashboardPlotDataResponse:
@@ -956,16 +992,20 @@ async def get_plot_data(
     if resolved_from is None or resolved_to is None:
         return DashboardPlotDataResponse(view_type=normalized_view_type)
 
+    products_by_key: dict[tuple[int, str], Product] = {}
     product_pieces_by_key: dict[tuple[int, str], float] = {}
     prices_by_key: dict[tuple[int, str], list[PriceList]] = {}
-    if normalized_view_type == "dsp":
-        product_stmt = _scope_stmt(select(Product), Product, user)
-        products = (await db.execute(product_stmt)).scalars().all()
-        product_pieces_by_key = {
-            (int(p.owner_user_id), str(p.sku_code).strip()): float(p.pieces_in_master_carton or 0.0)
-            for p in products
-        }
-
+    product_stmt = _scope_stmt(select(Product), Product, user)
+    products = (await db.execute(product_stmt)).scalars().all()
+    products_by_key = {
+        (int(p.owner_user_id), str(p.sku_code).strip()): p
+        for p in products
+    }
+    product_pieces_by_key = {
+        key: float(product.pieces_in_master_carton or 0.0)
+        for key, product in products_by_key.items()
+    }
+    if _is_amount_view(normalized_view_type):
         price_stmt = _scope_stmt(select(PriceList), PriceList, user)
         prices = (await db.execute(price_stmt)).scalars().all()
         for p in prices:
@@ -974,7 +1014,7 @@ async def get_plot_data(
         for key in prices_by_key:
             prices_by_key[key].sort(key=lambda x: x.date)
 
-    def _dsp_for_key_on_or_before(key: tuple[int, str], point_date: date) -> float:
+    def _price_for_key_on_or_before(key: tuple[int, str], point_date: date) -> float:
         series = prices_by_key.get(key, [])
         if not series:
             return 0.0
@@ -984,7 +1024,31 @@ async def get_plot_data(
                 selected = p
         if selected is None:
             selected = series[-1]
-        return float(selected.dsp or 0.0)
+        return _price_value_for_view(selected, normalized_view_type)
+
+    def _report_price_for_key_on_or_before(key: tuple[int, str], point_date: date) -> float:
+        series = prices_by_key.get(key, [])
+        selected = None
+        for p in series:
+            if p.date <= point_date:
+                selected = p
+        return _price_value_for_view(selected, normalized_view_type)
+
+    def _stock_value_for_view(
+        *,
+        owner_user_id: int,
+        sku_code: str | None,
+        stock_mc: float,
+        point_date: date,
+    ) -> float:
+        key = (int(owner_user_id), str(sku_code or "").strip())
+        if key not in products_by_key:
+            return 0.0
+        if _is_amount_view(normalized_view_type):
+            pieces = product_pieces_by_key.get(key, 0.0)
+            price_value = _report_price_for_key_on_or_before(key, point_date)
+            return stock_mc * pieces * price_value
+        return stock_mc
 
     hist_stmt = _scope_stmt(
         select(HistoricalSalesMonthly).where(
@@ -1006,33 +1070,46 @@ async def get_plot_data(
                 "target_qty": 0.0,
                 "target_amount": 0.0,
                 "past_stock": 0.0,
+                "past_hub_stock": 0.0,
             },
         )
+        if not str(row.branch_id or "").strip():
+            b["past_hub_stock"] += _stock_value_for_view(
+                owner_user_id=int(row.owner_user_id),
+                sku_code=row.sku_code or row.sku_id,
+                stock_mc=float(row.past_available_stock or 0.0),
+                point_date=_month_start(row.date),
+            )
         b["fact_qty"] += float(row.fact_quantity_in_mc or 0.0)
-        b["fact_amount"] += float(row.fact_amount_kzt or 0.0)
+        b["fact_amount"] += float(row.fact_amount_kzt or 0.0) if normalized_view_type == "dsp" else 0.0
         b["target_qty"] += float(row.target_quantity_in_mc or 0.0)
-        b["target_amount"] += float(row.target_amount_kzt or 0.0)
-        if normalized_view_type == "dsp":
+        b["target_amount"] += float(row.target_amount_kzt or 0.0) if normalized_view_type == "dsp" else 0.0
+        if _is_amount_view(normalized_view_type):
             tuple_key = (int(row.owner_user_id), str(row.sku_code or "").strip())
             pieces = product_pieces_by_key.get(tuple_key, 0.0)
-            dsp = _dsp_for_key_on_or_before(tuple_key, row.date)
-            b["past_stock"] += float(row.past_available_stock or 0.0) * pieces * dsp
-            if abs(float(row.fact_amount_kzt or 0.0)) < 1e-9 and pieces > 0 and dsp > 0:
-                b["fact_amount"] += float(row.fact_quantity_in_mc or 0.0) * pieces * dsp
-            if abs(float(row.target_amount_kzt or 0.0)) < 1e-9 and pieces > 0 and dsp > 0:
-                b["target_amount"] += float(row.target_quantity_in_mc or 0.0) * pieces * dsp
+            price_value = _price_for_key_on_or_before(tuple_key, row.date)
+            b["past_stock"] += float(row.past_available_stock or 0.0) * pieces * price_value
+            if normalized_view_type == "invoice price" or (
+                abs(float(row.fact_amount_kzt or 0.0)) < 1e-9 and pieces > 0 and price_value > 0
+            ):
+                b["fact_amount"] += float(row.fact_quantity_in_mc or 0.0) * pieces * price_value
+            if normalized_view_type == "invoice price" or (
+                abs(float(row.target_amount_kzt or 0.0)) < 1e-9 and pieces > 0 and price_value > 0
+            ):
+                b["target_amount"] += float(row.target_quantity_in_mc or 0.0) * pieces * price_value
         else:
             b["past_stock"] += float(row.past_available_stock or 0.0)
     historical_data = [
         HistoricalPlotPoint(
             date=d,
             total_fact_value=round(v["fact_amount"], 2)
-            if normalized_view_type == "dsp"
+            if _is_amount_view(normalized_view_type)
             else round(v["fact_qty"], 2),
             total_target_value=round(v["target_amount"], 2)
-            if normalized_view_type == "dsp"
+            if _is_amount_view(normalized_view_type)
             else round(v["target_qty"], 2),
             total_past_available_stock=round(v["past_stock"], 2),
+            total_past_hub_stock=round(v["past_hub_stock"], 2),
         )
         for d, v in sorted(hist_buckets.items(), key=lambda x: x[0])
     ]
@@ -1061,6 +1138,25 @@ async def get_plot_data(
             user,
         )
         fc_rows = (await db.execute(fc_stmt)).scalars().all()
+        all_hist_stmt = _scope_stmt(select(HistoricalSalesMonthly), HistoricalSalesMonthly, user)
+        all_hist_rows = (await db.execute(all_hist_stmt)).scalars().all()
+        latest_hub_stock_by_hub_sku: dict[tuple[int, str, str], tuple[date, float]] = {}
+        for row in all_hist_rows:
+            if str(row.branch_id or "").strip():
+                continue
+            sku_code = str(row.sku_code or row.sku_id or "").strip()
+            hub_name = str(row.hub_name or "").strip()
+            if not sku_code or not hub_name:
+                continue
+            if (int(row.owner_user_id), sku_code) not in products_by_key:
+                continue
+            hub_key = (int(row.owner_user_id), hub_name, sku_code)
+            row_month = _month_start(row.date)
+            if hub_key not in latest_hub_stock_by_hub_sku or latest_hub_stock_by_hub_sku[hub_key][0] <= row_month:
+                latest_hub_stock_by_hub_sku[hub_key] = (
+                    row_month,
+                    float(row.past_available_stock or 0.0),
+                )
         fc_buckets: dict[date, dict[str, float]] = {}
         for row in fc_rows:
             key = _month_start(row.date)
@@ -1072,10 +1168,15 @@ async def get_plot_data(
                     "adjusted_qty": 0.0,
                     "adjusted_amount": 0.0,
                     "future_stock": 0.0,
+                    "future_hub_stock": 0.0,
                 },
             )
             baseline_qty = float(row.baseline_forecast_quantity_in_mc or 0.0)
-            baseline_amount = float(row.baseline_forecast_amount_kzt or 0.0)
+            baseline_amount = (
+                float(row.baseline_forecast_amount_kzt or 0.0)
+                if normalized_view_type == "dsp"
+                else 0.0
+            )
             adjusted_qty = (
                 float(row.adjusted_forecast_quantity_in_mc)
                 if row.adjusted_forecast_quantity_in_mc is not None
@@ -1083,34 +1184,48 @@ async def get_plot_data(
             )
             adjusted_amount = (
                 float(row.adjusted_forecast_amount_kzt)
-                if row.adjusted_forecast_amount_kzt is not None
+                if normalized_view_type == "dsp" and row.adjusted_forecast_amount_kzt is not None
                 else baseline_amount
             )
             b["baseline_qty"] += baseline_qty
             b["baseline_amount"] += baseline_amount
             b["adjusted_qty"] += adjusted_qty
             b["adjusted_amount"] += adjusted_amount
-            if normalized_view_type == "dsp":
+            if _is_amount_view(normalized_view_type):
                 tuple_key = (int(row.owner_user_id), str(row.sku_code or "").strip())
                 pieces = product_pieces_by_key.get(tuple_key, 0.0)
-                dsp = _dsp_for_key_on_or_before(tuple_key, row.date)
-                b["future_stock"] += float(row.future_available_stock or 0.0) * pieces * dsp
-                if abs(baseline_amount) < 1e-9 and pieces > 0 and dsp > 0:
-                    b["baseline_amount"] += baseline_qty * pieces * dsp
-                if abs(adjusted_amount) < 1e-9 and pieces > 0 and dsp > 0:
-                    b["adjusted_amount"] += adjusted_qty * pieces * dsp
+                price_value = _price_for_key_on_or_before(tuple_key, row.date)
+                b["future_stock"] += float(row.future_available_stock or 0.0) * pieces * price_value
+                if normalized_view_type == "invoice price" or (
+                    abs(baseline_amount) < 1e-9 and pieces > 0 and price_value > 0
+                ):
+                    b["baseline_amount"] += baseline_qty * pieces * price_value
+                if normalized_view_type == "invoice price" or (
+                    abs(adjusted_amount) < 1e-9 and pieces > 0 and price_value > 0
+                ):
+                    b["adjusted_amount"] += adjusted_qty * pieces * price_value
             else:
                 b["future_stock"] += float(row.future_available_stock or 0.0)
+        for period, bucket in fc_buckets.items():
+            for owner_user_id, _hub_name, sku_code in latest_hub_stock_by_hub_sku:
+                _stock_date, stock_mc = latest_hub_stock_by_hub_sku[(owner_user_id, _hub_name, sku_code)]
+                bucket["future_hub_stock"] += _stock_value_for_view(
+                    owner_user_id=owner_user_id,
+                    sku_code=sku_code,
+                    stock_mc=stock_mc,
+                    point_date=period,
+                )
         forecast_data = [
             ForecastPlotPoint(
                 date=d,
                 total_baseline_forecast_value=round(v["baseline_amount"], 2)
-                if normalized_view_type == "dsp"
+                if _is_amount_view(normalized_view_type)
                 else round(v["baseline_qty"], 2),
                 total_adjusted_forecast_value=round(v["adjusted_amount"], 2)
-                if normalized_view_type == "dsp"
+                if _is_amount_view(normalized_view_type)
                 else round(v["adjusted_qty"], 2),
                 total_future_available_stock=round(v["future_stock"], 2),
+                total_future_hub_stock=round(v["future_hub_stock"], 2),
             )
             for d, v in sorted(fc_buckets.items(), key=lambda x: x[0])
         ]
@@ -1127,7 +1242,7 @@ async def get_plot_data(
 async def get_dashboard_overview_compat(
     db: DBSession,
     user: CurrentUser,
-    view_type: str = Query("DSP", description="DSP or Cases"),
+    view_type: str = Query("DSP", description="DSP, Invoice price or Cases"),
     date_from: str | None = Query(None),
     date_to: str | None = Query(None),
 ) -> SalesOverviewResponse:

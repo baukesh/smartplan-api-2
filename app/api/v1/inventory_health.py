@@ -94,8 +94,10 @@ class _SkuMetrics(BaseModel):
     sku_name: str
     sales_qty: float
     sales_dsp: float
+    sales_invoice_price: float
     stock: float
     stock_dsp: float
+    stock_invoice_price: float
     share_business: float
     share_stock: float
     share_percent: float
@@ -117,12 +119,28 @@ def _parse_page_size(page_size: str) -> int | None:
 
 def _normalize_view_type(view_type: str) -> str:
     v = view_type.strip().lower()
-    if v not in {"dsp", "cases"}:
+    if v not in {"dsp", "invoice price", "cases"}:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Параметр view_type должен быть одним из: DSP или Cases",
+            detail="Параметр view_type должен быть одним из: DSP, Invoice price или Cases",
         )
     return v
+
+
+def _metric_sales_value(metric: str, m: _SkuMetrics) -> float:
+    if metric == "dsp":
+        return m.sales_dsp
+    if metric == "invoice price":
+        return m.sales_invoice_price
+    return m.sales_qty
+
+
+def _metric_stock_value(metric: str, m: _SkuMetrics) -> float:
+    if metric == "dsp":
+        return m.stock_dsp
+    if metric == "invoice price":
+        return m.stock_invoice_price
+    return m.stock
 
 
 def _paginate(items: list, page: int, page_size: str) -> tuple[list, int, int]:
@@ -357,11 +375,14 @@ async def _compute_inventory_metrics(
         if chosen_price is None and price_candidates:
             chosen_price = price_candidates[0]
         dsp = float(chosen_price.dsp) if chosen_price is not None else 0.0
+        invoice_price = float(chosen_price.invoice_price) if chosen_price is not None else 0.0
 
         sales_qty = float(r.fact_quantity_in_mc or 0.0)
         sales_dsp = sales_qty * float(p.pieces_in_master_carton or 0.0) * dsp
+        sales_invoice_price = sales_qty * float(p.pieces_in_master_carton or 0.0) * invoice_price
         stock = float(r.past_available_stock or 0.0)
         stock_dsp = stock * float(p.pieces_in_master_carton or 0.0) * dsp
+        stock_invoice_price = stock * float(p.pieces_in_master_carton or 0.0) * invoice_price
 
         bucket = agg.setdefault(
             key,
@@ -372,14 +393,18 @@ async def _compute_inventory_metrics(
                 "status": str(p.status or "").strip().lower(),
                 "sales_qty": 0.0,
                 "sales_dsp": 0.0,
+                "sales_invoice_price": 0.0,
                 "stock": 0.0,
                 "stock_dsp": 0.0,
+                "stock_invoice_price": 0.0,
             },
         )
         bucket["sales_qty"] = float(bucket["sales_qty"]) + sales_qty
         bucket["sales_dsp"] = float(bucket["sales_dsp"]) + sales_dsp
+        bucket["sales_invoice_price"] = float(bucket["sales_invoice_price"]) + sales_invoice_price
         bucket["stock"] = float(bucket["stock"]) + stock
         bucket["stock_dsp"] = float(bucket["stock_dsp"]) + stock_dsp
+        bucket["stock_invoice_price"] = float(bucket["stock_invoice_price"]) + stock_invoice_price
         month_buckets_by_sku.setdefault(key, set()).add(r.date.replace(day=1).isoformat())
 
     if not agg:
@@ -387,16 +412,30 @@ async def _compute_inventory_metrics(
 
     total_sales_qty = sum(float(v["sales_qty"]) for v in agg.values())
     total_sales_dsp = sum(float(v["sales_dsp"]) for v in agg.values())
-    total_sales_business = total_sales_dsp if metric == "dsp" else total_sales_qty
+    total_sales_invoice_price = sum(float(v["sales_invoice_price"]) for v in agg.values())
+    total_sales_business = (
+        total_sales_dsp
+        if metric == "dsp"
+        else total_sales_invoice_price
+        if metric == "invoice price"
+        else total_sales_qty
+    )
     # A/B/C segmentation must remain stable across view_type and always be DSP-driven.
     # Fallback to quantity share only when DSP total is zero to avoid degenerate buckets.
     abc_total_sales = total_sales_dsp if total_sales_dsp > 0 else total_sales_qty
     total_stock = sum(float(v["stock"]) for v in agg.values())
     total_stock_dsp = sum(float(v["stock_dsp"]) for v in agg.values())
+    total_stock_invoice_price = sum(float(v["stock_invoice_price"]) for v in agg.values())
 
     interim: list[dict] = []
     for v in agg.values():
-        sales_value = float(v["sales_dsp"]) if metric == "dsp" else float(v["sales_qty"])
+        sales_value = (
+            float(v["sales_dsp"])
+            if metric == "dsp"
+            else float(v["sales_invoice_price"])
+            if metric == "invoice price"
+            else float(v["sales_qty"])
+        )
         share_business = sales_value / total_sales_business if total_sales_business > 0 else 0.0
         abc_share_business = (
             float(v["sales_dsp"]) / abc_total_sales
@@ -406,6 +445,8 @@ async def _compute_inventory_metrics(
         share_stock = (
             (float(v["stock_dsp"]) / total_stock_dsp)
             if metric == "dsp" and total_stock_dsp > 0
+            else (float(v["stock_invoice_price"]) / total_stock_invoice_price)
+            if metric == "invoice price" and total_stock_invoice_price > 0
             else ((float(v["stock"]) / total_stock) if total_stock > 0 else 0.0)
         )
         health = (share_stock / share_business) * 100.0 if share_business > 0 else 0.0
@@ -418,8 +459,10 @@ async def _compute_inventory_metrics(
                 "sku_name": str(v["sku_name"]),
                 "sales_qty": float(v["sales_qty"]),
                 "sales_dsp": float(v["sales_dsp"]),
+                "sales_invoice_price": float(v["sales_invoice_price"]),
                 "stock": float(v["stock"]),
                 "stock_dsp": float(v["stock_dsp"]),
+                "stock_invoice_price": float(v["stock_invoice_price"]),
                 "share_business": share_business,
                 "share_stock": share_stock,
                 "share_percent": share_business * 100.0,
@@ -452,9 +495,7 @@ def _build_category_summary(
 ) -> CategorySummaryRow:
     metric = _normalize_view_type(view_type)
     total_skus = len(metrics)
-    total_sales_value_all = (
-        sum(m.sales_dsp for m in metrics) if metric == "dsp" else sum(m.sales_qty for m in metrics)
-    )
+    total_sales_value_all = sum(_metric_sales_value(metric, m) for m in metrics)
     # share_of_stock must be cases-based regardless of selected metric view.
     stock_base = stock_share_metrics if stock_share_metrics is not None else metrics
     total_stock = sum(m.stock for m in stock_base)
@@ -462,11 +503,7 @@ def _build_category_summary(
     filtered_stock = [m for m in stock_base if m.abc_category == category]
 
     number_of_skus = len(filtered)
-    category_sales_value = (
-        sum(m.sales_dsp for m in filtered)
-        if metric == "dsp"
-        else sum(m.sales_qty for m in filtered)
-    )
+    category_sales_value = sum(_metric_sales_value(metric, m) for m in filtered)
     category_stock = sum(m.stock for m in filtered_stock)
 
     percent_of_skus = (number_of_skus / total_skus * 100.0) if total_skus > 0 else 0.0
@@ -528,7 +565,7 @@ async def _build_category_summary_cases_stock(
 async def get_inventory_health_table(
     db: DBSession,
     user: CurrentUser,
-    view_type: str = Query("DSP", description="DSP or Cases"),
+    view_type: str = Query("DSP", description="DSP, Invoice price or Cases"),
     branch_name: list[str] | None = Query(None),
     branch: list[str] | None = Query(None),
     sku_code: list[str] | None = Query(None),
@@ -554,7 +591,7 @@ async def get_inventory_health_table(
             sku_code=m.sku_code,
             sku_name=m.sku_name,
             abc_category=m.abc_category,
-            sales_value=round(m.sales_dsp if _normalize_view_type(view_type) == "dsp" else m.sales_qty, 2),
+            sales_value=round(_metric_sales_value(_normalize_view_type(view_type), m), 2),
             share_percent=round(m.share_percent, 2),
             health_index=int(round(m.health_index)),
         )
@@ -600,7 +637,7 @@ async def get_inventory_health_table(
 async def get_category_a(
     db: DBSession,
     user: CurrentUser,
-    view_type: str = Query("DSP", description="DSP or Cases"),
+    view_type: str = Query("DSP", description="DSP, Invoice price or Cases"),
     branch_name: list[str] | None = Query(None),
     branch: list[str] | None = Query(None),
     referer: str | None = Header(default=None, alias="Referer"),
@@ -627,7 +664,7 @@ async def get_category_a(
 async def get_category_b(
     db: DBSession,
     user: CurrentUser,
-    view_type: str = Query("DSP", description="DSP or Cases"),
+    view_type: str = Query("DSP", description="DSP, Invoice price or Cases"),
     branch_name: list[str] | None = Query(None),
     branch: list[str] | None = Query(None),
     referer: str | None = Header(default=None, alias="Referer"),
@@ -654,7 +691,7 @@ async def get_category_b(
 async def get_category_c(
     db: DBSession,
     user: CurrentUser,
-    view_type: str = Query("DSP", description="DSP or Cases"),
+    view_type: str = Query("DSP", description="DSP, Invoice price or Cases"),
     branch_name: list[str] | None = Query(None),
     branch: list[str] | None = Query(None),
     referer: str | None = Header(default=None, alias="Referer"),
@@ -742,7 +779,7 @@ def _out_of_stock_rows(metrics: list[_SkuMetrics], top_n: int) -> list[OutOfStoc
 async def get_overstock(
     db: DBSession,
     user: CurrentUser,
-    view_type: str = Query("DSP", description="DSP or Cases"),
+    view_type: str = Query("DSP", description="DSP, Invoice price or Cases"),
     branch_name: list[str] | None = Query(None),
     branch: list[str] | None = Query(None),
     period: str | None = Query(None),
@@ -766,7 +803,7 @@ async def get_overstock(
 async def get_understock(
     db: DBSession,
     user: CurrentUser,
-    view_type: str = Query("DSP", description="DSP or Cases"),
+    view_type: str = Query("DSP", description="DSP, Invoice price or Cases"),
     branch_name: list[str] | None = Query(None),
     branch: list[str] | None = Query(None),
     period: str | None = Query(None),
@@ -790,7 +827,7 @@ async def get_understock(
 async def get_out_of_stock(
     db: DBSession,
     user: CurrentUser,
-    view_type: str = Query("DSP", description="DSP or Cases"),
+    view_type: str = Query("DSP", description="DSP, Invoice price or Cases"),
     branch_name: list[str] | None = Query(None),
     branch: list[str] | None = Query(None),
     period: str | None = Query(None),

@@ -7,6 +7,11 @@ from sqlalchemy import and_, select, update
 
 from app.api.date_params import parse_query_date
 from app.api.deps import CurrentUser, DBSession, is_admin
+from app.api.v1.uploads import (
+    _accumulate_changed_keys,
+    _expand_changed_keys,
+    _schedule_materialized_refresh,
+)
 from app.core.order_status import (
     ORDER_STATUS_OPTIONS,
     ORDER_STATUS_OPTIONS_ORDERED,
@@ -694,5 +699,13 @@ async def patch_order_details(
     await db.commit()
 
     await refresh_orders_aggregated(db, owner_user_id=owner_user_id)
+    if payload.receival_date is not None:
+        changed_keys = await _expand_changed_keys(
+            db,
+            owner_user_id=owner_user_id,
+            sku_codes=[str(row.sku_code or row.sku_id or "") for row in order_rows],
+        )
+        _accumulate_changed_keys(owner_user_id, changed_keys)
+        _schedule_materialized_refresh(owner_user_id)
     return {"rows_updated": int(result.rowcount or 0)}
 

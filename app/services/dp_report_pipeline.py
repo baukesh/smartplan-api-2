@@ -81,6 +81,10 @@ def _round_qty(v: float | None) -> int:
     return int(round(float(v)))
 
 
+def _is_exit_sku_status(value: str | None) -> bool:
+    return str(value or "").strip().lower() == "на вывод"
+
+
 def _as_aware_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
@@ -268,8 +272,6 @@ async def refresh_forecast_sales_monthly(
             {
                 "date": r.date.isoformat(),
                 "fact_quantity_in_mc": float(r.fact_quantity_in_mc or 0.0),
-                "target_quantity_in_mc": float(r.target_quantity_in_mc or 0.0),
-                "past_available_stock": float(r.past_available_stock or 0.0),
             }
             for r in rows
         ]
@@ -288,15 +290,7 @@ async def refresh_forecast_sales_monthly(
             "branch_id": branch_id,
             "forecast_months": [d.isoformat() for d in forecast_months],
             "history_context": history_context[-24:],
-            "orders_context": orders_context[-24:],
-            "current_stock": round(float(branch_stock.get((sku_code, branch_id), 0.0)), 6),
-            "stock_norm_days": round(
-                float(
-                    stock_norm_by_key.get((sku_code, branch_id), product.general_stock_norm_days)
-                    or 0.0
-                ),
-                6,
-            ),
+            "forecast_prompt_version": "historical_sales_only_v3",
             "model": settings.OPENAI_FORECAST_MODEL,
             "schema_version": settings.FORECAST_CACHE_SCHEMA_VERSION,
         }
@@ -351,6 +345,9 @@ async def refresh_forecast_sales_monthly(
 
     async def _get_baseline_series(job: dict) -> list[float]:
         nonlocal gpt_attempted, gpt_fallbacks, cache_hits
+        product = job["product"]
+        if _is_exit_sku_status(product.status):
+            return [0.0 for _ in job["forecast_months"]]
         if forecast_source == "fast":
             gpt_fallbacks += 1
             return forecast_fast_baseline_quantities_in_mc(
@@ -457,30 +454,31 @@ async def refresh_forecast_sales_monthly(
 
         for idx, forecast_date in enumerate(forecast_months):
             baseline_qty = float(baseline_series[idx]) if idx < len(baseline_series) else 0.0
+            rounded_baseline_qty = float(_round_qty(baseline_qty))
             closest_dsp = _closest_price_on_or_before(
                 prices_by_sku.get(sku_code, []), forecast_date
             )
             baseline_amount = None
             if closest_dsp is not None:
                 baseline_amount = (
-                    baseline_qty * product.pieces_in_master_carton * closest_dsp.dsp
+                    rounded_baseline_qty * product.pieces_in_master_carton * closest_dsp.dsp
                 )
             allocated_arrival_qty = float(
                 arrival_allocations.get((sku_code, branch_id, _month_start(forecast_date)), 0.0)
             )
-            future_stock = max(prev_stock + allocated_arrival_qty - baseline_qty, 0.0)
+            future_stock = max(prev_stock + allocated_arrival_qty - rounded_baseline_qty, 0.0)
             to_insert.append(
                 ForecastSalesMonthly(
                     sku_id=product.sku_id,
                     sku_code=sku_code,
                     branch_id=branch_id,
                     date=forecast_date,
-                    baseline_forecast_quantity_in_mc=float(_round_qty(baseline_qty)),
+                    baseline_forecast_quantity_in_mc=rounded_baseline_qty,
                     baseline_forecast_gross_weight_kg=(
-                        _round2(baseline_qty * product.master_carton_gross_weight_kg)
+                        _round2(rounded_baseline_qty * product.master_carton_gross_weight_kg)
                     ),
                     baseline_forecast_volume_cbm=(
-                        _round2(baseline_qty * product.master_carton_volume_cbm)
+                        _round2(rounded_baseline_qty * product.master_carton_volume_cbm)
                     ),
                     baseline_forecast_amount_kzt=_round2(baseline_amount),
                     adjusted_forecast_quantity_in_mc=None,
@@ -629,8 +627,13 @@ async def refresh_forecast_orders(
     if changed_skus:
         hs_stmt = hs_stmt.where(HistoricalSalesMonthly.sku_code.in_(changed_skus))
     hist_rows = (await db.execute(hs_stmt)).scalars().all()
+    po_stmt = select(PlacedOrder).where(PlacedOrder.owner_user_id == owner_user_id)
+    if changed_skus:
+        po_stmt = po_stmt.where(PlacedOrder.sku_code.in_(changed_skus))
+    placed_orders = (await db.execute(po_stmt)).scalars().all()
 
     pb_norm = {(str(r.sku_code or "").strip(), r.branch_id): float(r.stock_norm) for r in pb_rows}
+    arrivals_by_sku_month = _aggregate_order_arrivals_by_sku_month(placed_orders)
 
     by_sku_date_branch: dict[str, dict[date, dict[str, ForecastSalesMonthly]]] = defaultdict(
         lambda: defaultdict(dict)
@@ -672,6 +675,8 @@ async def refresh_forecast_orders(
                 month_prior_stock = sum(
                     r.future_available_stock for r in date_map[prev_d].values()
                 )
+            current_month_arrival = float(arrivals_by_sku_month.get((sku_code, d), 0.0) or 0.0)
+            month_prior_stock += current_month_arrival
 
             f3_slice = dates[idx : idx + 3]
 
@@ -689,24 +694,63 @@ async def refresh_forecast_orders(
                     l3_vals.append(float(fc_total))
                     continue
                 l3_vals.append(0.0)
-            f3_vals: list[float] = []
+            f3_month_totals: list[float] = []
+            branch_f3_vals: dict[str, list[float]] = defaultdict(list)
             for dd in f3_slice:
-                f3_vals.extend(
-                    [r.baseline_forecast_quantity_in_mc for r in date_map[dd].values()]
-                )
+                month_total = 0.0
+                for branch_id, row in date_map[dd].items():
+                    qty = float(
+                        row.adjusted_forecast_quantity_in_mc
+                        if row.adjusted_forecast_quantity_in_mc is not None
+                        else row.baseline_forecast_quantity_in_mc
+                        or 0.0
+                    )
+                    month_total += qty
+                    branch_f3_vals[branch_id].append(qty)
+                f3_month_totals.append(month_total)
             avg_l3 = sum(l3_vals) / len(l3_vals) if l3_vals else 0.0
-            avg_f3 = sum(f3_vals) / len(f3_vals) if f3_vals else 0.0
+            avg_f3 = sum(f3_month_totals) / len(f3_month_totals) if f3_month_totals else 0.0
 
             rec_total = 0.0
             prev_branch_rows = date_map.get(prev_d, {})
+            current_branch_rows = date_map.get(d, {})
+            current_month_arrival_by_branch: dict[str, float] = {}
+            if current_month_arrival > 0 and current_branch_rows:
+                branch_demands = {
+                    branch_id: float(
+                        row.adjusted_forecast_quantity_in_mc
+                        if row.adjusted_forecast_quantity_in_mc is not None
+                        else row.baseline_forecast_quantity_in_mc
+                        or 0.0
+                    )
+                    for branch_id, row in current_branch_rows.items()
+                }
+                total_branch_demand = sum(max(v, 0.0) for v in branch_demands.values())
+                if total_branch_demand > 0:
+                    current_month_arrival_by_branch = {
+                        branch_id: current_month_arrival * max(demand, 0.0) / total_branch_demand
+                        for branch_id, demand in branch_demands.items()
+                    }
+                else:
+                    even_share = current_month_arrival / len(current_branch_rows)
+                    current_month_arrival_by_branch = {
+                        branch_id: even_share for branch_id in current_branch_rows
+                    }
             for branch_id in date_map[d].keys():
                 prior_stock_b = (
                     prev_branch_rows[branch_id].future_available_stock
                     if branch_id in prev_branch_rows
                     else 0.0
                 )
+                prior_stock_b += current_month_arrival_by_branch.get(branch_id, 0.0)
                 stock_norm = pb_norm.get((sku_code, branch_id), 0.0)
-                needed = stock_norm * (avg_f3 / 30.0)
+                branch_vals = branch_f3_vals.get(branch_id, [])
+                branch_avg_f3 = (
+                    sum(branch_vals) / len(branch_vals)
+                    if branch_vals
+                    else 0.0
+                )
+                needed = stock_norm * (branch_avg_f3 / 30.0)
                 rec_total += max(needed - prior_stock_b, 0.0)
 
             sku_id = next(iter(date_map[d].values())).sku_id if date_map[d] else ""
@@ -1143,13 +1187,26 @@ async def refresh_all_materialized(
         stage_group="fast",
     )
     baseline_ready_ms = round((time.perf_counter() - refresh_start) * 1000, 1)
-    _set_stage("baseline_ready_gpt_refining")
+    _set_stage(
+        "baseline_ready_gpt_refining"
+        if settings.FORECAST_GPT_REFINEMENT_ENABLED
+        else "statistical_baseline_ready"
+    )
     logger.info(
         "refresh_all_materialized baseline_ready owner=%s elapsed_ms=%s forecast_series=%s",
         owner_user_id,
         baseline_ready_ms,
         fast_forecast_stats.get("series_processed", 0),
     )
+    if not settings.FORECAST_GPT_REFINEMENT_ENABLED:
+        logger.info(
+            "refresh_all_materialized completed owner=%s incremental=%s total_elapsed_ms=%s statistical_series=%s gpt_refinement_enabled=false",
+            owner_user_id,
+            use_incremental,
+            round((time.perf_counter() - refresh_start) * 1000, 1),
+            fast_forecast_stats.get("series_processed", 0),
+        )
+        return
 
     _set_stage("gpt_refinement")
     stage_start = time.perf_counter()

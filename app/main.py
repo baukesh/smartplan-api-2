@@ -230,70 +230,8 @@ async def _ensure_hub_name_on_historical_sales(conn) -> None:
         )
     )
 
-    # Insert latest-date hub snapshot rows for existing users if they do not exist.
-    await conn.execute(
-        text(
-            """
-            INSERT INTO historical_sales_monthly (
-                sku_id,
-                sku_code,
-                hub_name,
-                date,
-                branch_id,
-                fact_quantity_in_mc,
-                fact_gross_weight_kg,
-                fact_volume_cbm,
-                fact_amount_kzt,
-                target_quantity_in_mc,
-                target_gross_weight_kg,
-                target_volume_cbm,
-                target_amount_kzt,
-                past_available_stock,
-                owner_user_id,
-                created_at,
-                updated_at
-            )
-            SELECT
-                hs.sku_id,
-                hs.sku_code,
-                'KZ-HUB' AS hub_name,
-                max_dates.max_date AS date,
-                '' AS branch_id,
-                0.0 AS fact_quantity_in_mc,
-                0.0 AS fact_gross_weight_kg,
-                0.0 AS fact_volume_cbm,
-                0.0 AS fact_amount_kzt,
-                0.0 AS target_quantity_in_mc,
-                0.0 AS target_gross_weight_kg,
-                0.0 AS target_volume_cbm,
-                0.0 AS target_amount_kzt,
-                SUM(COALESCE(hs.past_available_stock, 0.0)) AS past_available_stock,
-                hs.owner_user_id,
-                CURRENT_TIMESTAMP AS created_at,
-                CURRENT_TIMESTAMP AS updated_at
-            FROM historical_sales_monthly hs
-            JOIN (
-                SELECT owner_user_id, MAX(date) AS max_date
-                FROM historical_sales_monthly
-                GROUP BY owner_user_id
-            ) max_dates
-              ON max_dates.owner_user_id = hs.owner_user_id
-             AND hs.date = max_dates.max_date
-            WHERE hs.branch_id IS NOT NULL
-              AND TRIM(hs.branch_id) != ''
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM historical_sales_monthly h2
-                  WHERE h2.owner_user_id = hs.owner_user_id
-                    AND h2.date = max_dates.max_date
-                    AND COALESCE(TRIM(h2.hub_name), '') = 'KZ-HUB'
-                    AND COALESCE(TRIM(h2.branch_id), '') = ''
-                    AND COALESCE(TRIM(h2.sku_code), '') = COALESCE(TRIM(hs.sku_code), '')
-              )
-            GROUP BY hs.owner_user_id, hs.sku_id, hs.sku_code, max_dates.max_date
-            """
-        )
-    )
+    # Removed: INSERT of synthetic hub-only rows with hub_name='KZ-HUB' at latest date.
+    # Those rows were not from user uploads; real templates already carry hub_name.
 
 
 async def _ensure_inventory_health_sku_code_column(conn) -> None:

@@ -13,12 +13,16 @@ from app.models.derived import ForecastSalesMonthly
 from app.models.reporting import DPReport, DPReportAccess, DPReportForecastOverride
 from app.models.user import User, UserRole
 from app.services.reporting_service import (
+    build_branch_filter_options,
     build_report_tables,
+    build_hub_filter_options,
     build_reporting_context,
+    build_sku_status_filter_options,
     default_period_for_planning,
     get_current_planning_month,
     normalize_override_metric,
     parse_branch_filter,
+    parse_hub_filter,
     parse_product_filter,
     replace_report_overrides,
     report_card_payload,
@@ -36,6 +40,7 @@ class ProductFilterPayload(BaseModel):
     categories: list[str] = Field(default_factory=list)
     sub_categories: list[str] = Field(default_factory=list)
     sublines: list[str] = Field(default_factory=list)
+    sku_statuses: list[str] = Field(default_factory=list)
 
 
 class ForecastAdjustmentPayload(BaseModel):
@@ -56,6 +61,8 @@ class ReportCard(BaseModel):
     report_name: str
     product_filter: ProductFilterPayload
     branch_filter: list[str]
+    hub_filter: list[str] = Field(default_factory=list)
+    sku_status_filter: list[str] = Field(default_factory=list)
     view_type: str
     date_from: date
     date_to: date
@@ -68,6 +75,7 @@ class HistoricalProjectedRow(BaseModel):
     fact_value: float
     target_value: float
     past_available_stock: float
+    past_hub_stock: float = 0.0
 
     model_config = {"extra": "allow"}
 
@@ -77,6 +85,7 @@ class ForecastProjectedRow(BaseModel):
     baseline_forecast_value: float
     adjusted_forecast_value: float
     future_available_stock: float
+    future_hub_stock: float = 0.0
 
     model_config = {"extra": "allow"}
 
@@ -92,6 +101,7 @@ class HistoricalDetailedRow(BaseModel):
     target_volume_cbm: float
     target_amount_kzt: float
     past_available_stock: float
+    past_hub_stock: float = 0.0
 
     model_config = {"extra": "allow"}
 
@@ -107,6 +117,7 @@ class ForecastDetailedRow(BaseModel):
     adjusted_forecast_volume_cbm: float
     adjusted_forecast_amount_kzt: float
     future_available_stock: float
+    future_hub_stock: float = 0.0
 
     model_config = {"extra": "allow"}
 
@@ -157,6 +168,7 @@ class HistoricalTableCreateRow(BaseModel):
     fact_value: float
     target_value: float
     past_available_stock: float
+    past_hub_stock: float = 0.0
 
     model_config = {"extra": "allow"}
 
@@ -166,6 +178,7 @@ class ForecastTableCreateRow(BaseModel):
     baseline_forecast_value: float
     adjusted_forecast_value: float
     future_available_stock: float
+    future_hub_stock: float = 0.0
     adjustment_reason: str | None = None
 
     model_config = {"extra": "allow"}
@@ -210,8 +223,12 @@ def _view_metric_suffix(view_type: str) -> str:
     normalized = (view_type or "").strip().lower()
     if normalized == "dsp":
         return "amount_kzt"
+    if normalized == "invoice price":
+        return "invoice_amount_kzt"
     if normalized == "gross weight":
         return "gross_weight_kg"
+    if normalized == "net weight":
+        return "net_weight_kg"
     return "quantity_in_mc"
 
 
@@ -230,16 +247,46 @@ def _project_tables_for_view_type(
     historical_stock_key = (
         "past_available_stock_amount_kzt"
         if normalized_view == "dsp"
+        else "past_available_stock_invoice_amount_kzt"
+        if normalized_view == "invoice price"
         else "past_available_stock_gross_weight_kg"
         if normalized_view == "gross weight"
+        else "past_available_stock_net_weight_kg"
+        if normalized_view == "net weight"
         else "past_available_stock"
+    )
+    historical_hub_stock_key = (
+        "past_hub_stock_amount_kzt"
+        if normalized_view == "dsp"
+        else "past_hub_stock_invoice_amount_kzt"
+        if normalized_view == "invoice price"
+        else "past_hub_stock_gross_weight_kg"
+        if normalized_view == "gross weight"
+        else "past_hub_stock_net_weight_kg"
+        if normalized_view == "net weight"
+        else "past_hub_stock"
     )
     forecast_stock_key = (
         "future_available_stock_amount_kzt"
         if normalized_view == "dsp"
+        else "future_available_stock_invoice_amount_kzt"
+        if normalized_view == "invoice price"
         else "future_available_stock_gross_weight_kg"
         if normalized_view == "gross weight"
+        else "future_available_stock_net_weight_kg"
+        if normalized_view == "net weight"
         else "future_available_stock"
+    )
+    forecast_hub_stock_key = (
+        "future_hub_stock_amount_kzt"
+        if normalized_view == "dsp"
+        else "future_hub_stock_invoice_amount_kzt"
+        if normalized_view == "invoice price"
+        else "future_hub_stock_gross_weight_kg"
+        if normalized_view == "gross weight"
+        else "future_hub_stock_net_weight_kg"
+        if normalized_view == "net weight"
+        else "future_hub_stock"
     )
 
     projected_historical: list[dict] = []
@@ -250,6 +297,7 @@ def _project_tables_for_view_type(
                 "fact_value": round(float(row.get(fact_key, 0.0) or 0.0), 2),
                 "target_value": round(float(row.get(target_key, 0.0) or 0.0), 2),
                 "past_available_stock": round(float(row.get(historical_stock_key, 0.0) or 0.0), 2),
+                "past_hub_stock": round(float(row.get(historical_hub_stock_key, 0.0) or 0.0), 2),
             }
         )
 
@@ -263,6 +311,7 @@ def _project_tables_for_view_type(
                     float(row.get(adjusted_key, row.get(baseline_key, 0.0)) or 0.0), 2
                 ),
                 "future_available_stock": round(float(row.get(forecast_stock_key, 0.0) or 0.0), 2),
+                "future_hub_stock": round(float(row.get(forecast_hub_stock_key, 0.0) or 0.0), 2),
             }
         )
 
@@ -285,20 +334,6 @@ def _visible_reports_stmt(user: User) -> Select:
 async def _get_accessible_report(db: DBSession, user: User, report_id: int) -> DPReport | None:
     result = await db.execute(_visible_reports_stmt(user).where(DPReport.id == report_id))
     return result.scalar_one_or_none()
-
-
-async def _branch_options_for_owner(db: DBSession, owner_user_id: int) -> list[str]:
-    branch_rows = (
-        await db.execute(
-            select(Branch.branch_name).where(Branch.owner_user_id == owner_user_id)
-        )
-    ).all()
-    values = {
-        str(localize_branch_name(name) or name).strip()
-        for (name,) in branch_rows
-        if name is not None and str(name).strip()
-    }
-    return sorted(values)
 
 
 def _clean_list(values: list[str] | None) -> list[str]:
@@ -446,6 +481,7 @@ def _matches_applied_filters(product: Product, branch_name_value: str, product_f
     categories = {str(v).strip() for v in (product_filter.get("categories") or []) if str(v).strip()}
     sub_categories = {str(v).strip() for v in (product_filter.get("sub_categories") or []) if str(v).strip()}
     sublines = {str(v).strip() for v in (product_filter.get("sublines") or []) if str(v).strip()}
+    sku_statuses = {str(v).strip() for v in (product_filter.get("sku_statuses") or []) if str(v).strip()}
     if sku_codes and str(product.sku_code or "").strip() not in sku_codes:
         return False
     if sku_names and str(product.sku_name or "").strip() not in sku_names:
@@ -458,7 +494,16 @@ def _matches_applied_filters(product: Product, branch_name_value: str, product_f
         return False
     if sublines and str(product.sub_line or "").strip() not in sublines:
         return False
+    if sku_statuses and str(product.status or "").strip() not in sku_statuses:
+        return False
     return True
+
+
+def _matches_hub_filter(hub_name_value: str | None, hub_filter: list[str]) -> bool:
+    if not hub_filter:
+        return True
+    normalized = {str(v).strip() for v in hub_filter if str(v).strip()}
+    return str(hub_name_value or "").strip() in normalized
 
 
 def _fill_projected_historical_months(rows: list[dict], start_month: date, end_month: date) -> list[dict]:
@@ -473,6 +518,7 @@ def _fill_projected_historical_months(rows: list[dict], start_month: date, end_m
                 "fact_value": 0.0,
                 "target_value": 0.0,
                 "past_available_stock": 0.0,
+                "past_hub_stock": 0.0,
             }
         out.append(row)
     return out
@@ -490,6 +536,7 @@ def _fill_projected_forecast_months(rows: list[dict], start_month: date, end_mon
                 "baseline_forecast_value": 0.0,
                 "adjusted_forecast_value": 0.0,
                 "future_available_stock": 0.0,
+                "future_hub_stock": 0.0,
             }
         out.append(row)
     return out
@@ -500,6 +547,7 @@ async def _compute_min_max_dates(
     owner_user_id: int,
     product_filter: dict,
     branch_filter: list[str],
+    hub_filter: list[str],
 ) -> tuple[date | None, date | None, date | None]:
     products = (
         await db.execute(select(Product).where(Product.owner_user_id == owner_user_id))
@@ -509,6 +557,8 @@ async def _compute_min_max_dates(
         await db.execute(select(Branch).where(Branch.owner_user_id == owner_user_id))
     ).scalars().all()
     branch_by_id = {str(b.branch_id).strip(): str(b.branch_name) for b in branches}
+    latest_branch_hub_by_sku_branch: dict[tuple[str, str], tuple[date, str]] = {}
+    latest_branch_hub_by_branch: dict[str, tuple[date, str]] = {}
 
     hist_rows = (
         await db.execute(
@@ -526,12 +576,31 @@ async def _compute_min_max_dates(
     max_forecast: date | None = None
 
     for r in hist_rows:
+        branch_id = str(r.branch_id or "").strip()
+        if not branch_id:
+            continue
+        hub_name = str(r.hub_name or "").strip() or "KZ-HUB"
+        sku_code = str(r.sku_code or r.sku_id or "").strip()
+        sku_branch_key = (sku_code, branch_id)
+        if sku_code and (
+            sku_branch_key not in latest_branch_hub_by_sku_branch
+            or latest_branch_hub_by_sku_branch[sku_branch_key][0] <= r.date
+        ):
+            latest_branch_hub_by_sku_branch[sku_branch_key] = (r.date, hub_name)
+        if branch_id not in latest_branch_hub_by_branch or latest_branch_hub_by_branch[branch_id][0] <= r.date:
+            latest_branch_hub_by_branch[branch_id] = (r.date, hub_name)
+
+    for r in hist_rows:
+        if not str(r.branch_id or "").strip():
+            continue
         sku_code = str(r.sku_code or "").strip()
         product = product_by_code.get(sku_code)
         if product is None:
             continue
         branch_name_value = branch_by_id.get(str(r.branch_id).strip(), str(r.branch_id).strip())
         if not _matches_applied_filters(product, branch_name_value, product_filter, branch_filter):
+            continue
+        if not _matches_hub_filter(str(r.hub_name or "").strip() or "KZ-HUB", hub_filter):
             continue
         m = _month_start(r.date)
         min_hist = m if min_hist is None else min(min_hist, m)
@@ -542,8 +611,16 @@ async def _compute_min_max_dates(
         product = product_by_code.get(sku_code)
         if product is None:
             continue
-        branch_name_value = branch_by_id.get(str(r.branch_id).strip(), str(r.branch_id).strip())
+        branch_id = str(r.branch_id).strip()
+        branch_name_value = branch_by_id.get(branch_id, branch_id)
         if not _matches_applied_filters(product, branch_name_value, product_filter, branch_filter):
+            continue
+        hub_name = (
+            latest_branch_hub_by_sku_branch.get((sku_code, branch_id), (r.date, ""))[1]
+            or latest_branch_hub_by_branch.get(branch_id, (r.date, ""))[1]
+            or "KZ-HUB"
+        )
+        if not _matches_hub_filter(hub_name, hub_filter):
             continue
         m = _month_start(r.date)
         max_forecast = m if max_forecast is None else max(max_forecast, m)
@@ -561,8 +638,10 @@ def _effective_filters_from_overrides(
     category: list[str] | None,
     sub_category: list[str] | None,
     subline: list[str] | None,
+    sku_status: list[str] | None,
     branch_name: list[str] | None,
-) -> tuple[dict, list[str]]:
+    hub_name: list[str] | None = None,
+) -> tuple[dict, list[str], list[str]]:
     saved_branch_fallback = list(saved_branch_filter or saved_product_filter.get("branch_filter", []) or [])
     product_filter = {
         "sku_codes": list(saved_product_filter.get("sku_codes", []) or []),
@@ -571,6 +650,7 @@ def _effective_filters_from_overrides(
         "categories": list(saved_product_filter.get("categories", []) or []),
         "sub_categories": list(saved_product_filter.get("sub_categories", []) or []),
         "sublines": list(saved_product_filter.get("sublines", []) or []),
+        "sku_statuses": list(saved_product_filter.get("sku_statuses", []) or []),
     }
     if sku_code is not None:
         product_filter["sku_codes"] = _clean_list(sku_code)
@@ -584,6 +664,8 @@ def _effective_filters_from_overrides(
         product_filter["sub_categories"] = _clean_list(sub_category)
     if subline is not None:
         product_filter["sublines"] = _clean_list(subline)
+    if sku_status is not None:
+        product_filter["sku_statuses"] = _clean_list(sku_status)
 
     if branch_name is None:
         effective_branch_filter = [
@@ -593,7 +675,8 @@ def _effective_filters_from_overrides(
         effective_branch_filter = [
             str(localize_branch_name(v) or v) for v in _clean_list(branch_name)
         ]
-    return product_filter, effective_branch_filter
+    effective_hub_filter = parse_hub_filter(hub_name)
+    return product_filter, effective_branch_filter, effective_hub_filter
 
 
 async def _build_report_detail(
@@ -609,7 +692,9 @@ async def _build_report_detail(
     category: list[str] | None = None,
     sub_category: list[str] | None = None,
     subline: list[str] | None = None,
+    sku_status: list[str] | None = None,
     branch_name: list[str] | None = None,
+    hub_name: list[str] | None = None,
     project_by_view_type: bool = False,
     ignore_saved_product_filter: bool = False,
     ignore_saved_branch_filter: bool = False,
@@ -621,7 +706,7 @@ async def _build_report_detail(
         else parse_product_filter(report.product_filter_json or report.product_filter)
     )
     saved_branch_filter = [] if ignore_saved_branch_filter else parse_branch_filter(report.branch_filter_json or report.branch_filter)
-    effective_product_filter, effective_branch_filter = _effective_filters_from_overrides(
+    effective_product_filter, effective_branch_filter, effective_hub_filter = _effective_filters_from_overrides(
         saved_product_filter=saved_product_filter,
         saved_branch_filter=saved_branch_filter,
         sku_code=sku_code,
@@ -630,7 +715,9 @@ async def _build_report_detail(
         category=category,
         sub_category=sub_category,
         subline=subline,
+        sku_status=sku_status,
         branch_name=branch_name,
+        hub_name=hub_name,
     )
     ctx = await build_reporting_context(
         db=db,
@@ -638,6 +725,7 @@ async def _build_report_detail(
         view_type=view_type_override or report.view_type,
         product_filter=effective_product_filter,
         branch_filter=effective_branch_filter,
+        hub_filter=effective_hub_filter,
         planning_month=_resolve_report_planning_month(report),
         date_from=date_from_override or report.date_from,
         date_to=date_to_override or report.date_to,
@@ -660,6 +748,7 @@ async def _build_report_detail(
         owner_user_id=owner_user_id,
         product_filter=ctx.product_filter,
         branch_filter=ctx.branch_filter,
+        hub_filter=ctx.hub_filter,
     )
 
     if max_available_month is not None:
@@ -683,14 +772,32 @@ async def _build_report_detail(
             forecast_table = []
 
     card = report_card_payload(report)
-    branch_options = await _branch_options_for_owner(db, owner_user_id)
-    response_branch_filter = list(ctx.branch_filter or branch_options)
+    branch_options = await build_branch_filter_options(
+        db=db,
+        owner_user_id=owner_user_id,
+        product_filter=ctx.product_filter,
+        hub_filter=ctx.hub_filter,
+    )
+    hub_options = await build_hub_filter_options(
+        db=db,
+        owner_user_id=owner_user_id,
+        product_filter=ctx.product_filter,
+    )
+    sku_status_options = await build_sku_status_filter_options(
+        db=db,
+        owner_user_id=owner_user_id,
+        product_filter=ctx.product_filter,
+        branch_filter=ctx.branch_filter,
+        hub_filter=ctx.hub_filter,
+    )
     return {
         "report": {
             "report_id": card["report_id"],
             "report_name": card["report_name"],
             "product_filter": ProductFilterPayload(**ctx.product_filter),
-            "branch_filter": response_branch_filter,
+            "branch_filter": branch_options,
+            "hub_filter": hub_options,
+            "sku_status_filter": sku_status_options,
             "view_type": ctx.view_type,
             "date_from": ctx.date_from,
             "date_to": ctx.date_to,
@@ -784,13 +891,15 @@ async def get_new_report_template(
     category: list[str] | None = Query(default=None),
     sub_category: list[str] | None = Query(default=None),
     subline: list[str] | None = Query(default=None),
+    sku_status: list[str] | None = Query(default=None),
     branch_name: list[str] | None = Query(default=None),
+    hub_name: list[str] | None = Query(default=None),
 ) -> ReportDetailProjectedResponse:
     planning_month = await get_current_planning_month(db, user.id)
     default_from, default_to = default_period_for_planning(planning_month)
     parsed_date_from = parse_query_date(date_from, field_name="date_from")
     parsed_date_to = parse_query_date(date_to, field_name="date_to", end_of_month=True)
-    effective_product_filter, effective_branch_filter = _effective_filters_from_overrides(
+    effective_product_filter, effective_branch_filter, effective_hub_filter = _effective_filters_from_overrides(
         saved_product_filter={},
         saved_branch_filter=[],
         sku_code=sku_code,
@@ -799,7 +908,9 @@ async def get_new_report_template(
         category=category,
         sub_category=sub_category,
         subline=subline,
+        sku_status=sku_status,
         branch_name=branch_name,
+        hub_name=hub_name,
     )
     ctx = await build_reporting_context(
         db=db,
@@ -807,6 +918,7 @@ async def get_new_report_template(
         view_type=view_type or "cases",
         product_filter=effective_product_filter,
         branch_filter=effective_branch_filter,
+        hub_filter=effective_hub_filter,
         planning_month=planning_month,
         date_from=parsed_date_from or default_from,
         date_to=parsed_date_to or default_to,
@@ -827,7 +939,24 @@ async def get_new_report_template(
             report_id=0,
             report_name="New Demand Planning Report",
             product_filter=ProductFilterPayload(**ctx.product_filter),
-            branch_filter=list(ctx.branch_filter or await _branch_options_for_owner(db, user.id)),
+            branch_filter=await build_branch_filter_options(
+                db=db,
+                owner_user_id=user.id,
+                product_filter=ctx.product_filter,
+                hub_filter=ctx.hub_filter,
+            ),
+            hub_filter=await build_hub_filter_options(
+                db=db,
+                owner_user_id=user.id,
+                product_filter=ctx.product_filter,
+            ),
+            sku_status_filter=await build_sku_status_filter_options(
+                db=db,
+                owner_user_id=user.id,
+                product_filter=ctx.product_filter,
+                branch_filter=ctx.branch_filter,
+                hub_filter=ctx.hub_filter,
+            ),
             view_type=ctx.view_type,
             date_from=ctx.date_from,
             date_to=ctx.date_to,
@@ -854,11 +983,13 @@ async def create_report(
     category: list[str] | None = Query(default=None),
     sub_category: list[str] | None = Query(default=None),
     subline: list[str] | None = Query(default=None),
+    sku_status: list[str] | None = Query(default=None),
     branch_name: list[str] | None = Query(default=None),
+    hub_name: list[str] | None = Query(default=None),
 ) -> ReportDetailProjectedResponse:
     parsed_date_from = parse_query_date(date_from, field_name="date_from")
     parsed_date_to = parse_query_date(date_to, field_name="date_to", end_of_month=True)
-    effective_product_filter, effective_branch_filter = _effective_filters_from_overrides(
+    effective_product_filter, effective_branch_filter, effective_hub_filter = _effective_filters_from_overrides(
         saved_product_filter={},
         saved_branch_filter=[],
         sku_code=sku_code,
@@ -867,7 +998,9 @@ async def create_report(
         category=category,
         sub_category=sub_category,
         subline=subline,
+        sku_status=sku_status,
         branch_name=branch_name,
+        hub_name=hub_name,
     )
 
     planning_month = await get_current_planning_month(db, user.id)
@@ -877,6 +1010,7 @@ async def create_report(
         view_type=view_type or "cases",
         product_filter=effective_product_filter,
         branch_filter=effective_branch_filter,
+        hub_filter=effective_hub_filter,
         planning_month=planning_month,
         date_from=parsed_date_from,
         date_to=parsed_date_to,
@@ -984,7 +1118,24 @@ async def preview_report(
             report_id=preview_report_id or 0,
             report_name=report_name,
             product_filter=ProductFilterPayload(**ctx.product_filter),
-            branch_filter=list(ctx.branch_filter or await _branch_options_for_owner(db, owner_user_id)),
+            branch_filter=await build_branch_filter_options(
+                db=db,
+                owner_user_id=owner_user_id,
+                product_filter=ctx.product_filter,
+                hub_filter=ctx.hub_filter,
+            ),
+            hub_filter=await build_hub_filter_options(
+                db=db,
+                owner_user_id=owner_user_id,
+                product_filter=ctx.product_filter,
+            ),
+            sku_status_filter=await build_sku_status_filter_options(
+                db=db,
+                owner_user_id=owner_user_id,
+                product_filter=ctx.product_filter,
+                branch_filter=ctx.branch_filter,
+                hub_filter=ctx.hub_filter,
+            ),
             view_type=ctx.view_type,
             date_from=ctx.date_from,
             date_to=ctx.date_to,
@@ -1003,7 +1154,7 @@ async def get_report(
     report_id: int,
     view_type: str | None = Query(
         default=None,
-        description="Transient projection filter for this GET only. Values: DSP, Cases, Gross weight.",
+        description="Transient projection filter for this GET only. Values: DSP, Invoice price, Cases, Gross weight, Net weight.",
     ),
     date_from: str | None = Query(default=None),
     date_to: str | None = Query(default=None),
@@ -1013,7 +1164,9 @@ async def get_report(
     category: list[str] | None = Query(default=None),
     sub_category: list[str] | None = Query(default=None),
     subline: list[str] | None = Query(default=None),
+    sku_status: list[str] | None = Query(default=None),
     branch_name: list[str] | None = Query(default=None),
+    hub_name: list[str] | None = Query(default=None),
 ) -> ReportDetailProjectedResponse:
     parsed_date_from = parse_query_date(date_from, field_name="date_from")
     parsed_date_to = parse_query_date(date_to, field_name="date_to", end_of_month=True)
@@ -1032,7 +1185,9 @@ async def get_report(
         category=category,
         sub_category=sub_category,
         subline=subline,
+        sku_status=sku_status,
         branch_name=branch_name,
+        hub_name=hub_name,
         project_by_view_type=True,
         ignore_saved_product_filter=True,
         ignore_saved_branch_filter=True,
@@ -1048,7 +1203,7 @@ async def get_report_override(
     report_id: int = Query(...),
     view_type: str | None = Query(
         default=None,
-        description="Transient projection filter for this GET only. Values: DSP, Cases, Gross weight.",
+        description="Transient projection filter for this GET only. Values: DSP, Invoice price, Cases, Gross weight, Net weight.",
     ),
     date_from: str | None = Query(default=None),
     date_to: str | None = Query(default=None),
@@ -1086,6 +1241,20 @@ async def get_report_override(
         ignore_saved_branch_filter=True,
     )
 
+    _, effective_branch_filter, _ = _effective_filters_from_overrides(
+        saved_product_filter={},
+        saved_branch_filter=[],
+        sku_code=sku_code,
+        sku_name=sku_name,
+        brand=brand,
+        category=category,
+        sub_category=sub_category,
+        subline=merged_subline or None,
+        sku_status=None,
+        branch_name=branch_name,
+        hub_name=None,
+    )
+
     metric_type = normalize_override_metric(payload_out["report"]["view_type"]) or ""
     effective_filter_obj = payload_out["report"]["product_filter"]
     effective_filter = (
@@ -1093,7 +1262,7 @@ async def get_report_override(
         if hasattr(effective_filter_obj, "model_dump")
         else dict(effective_filter_obj or {})
     )
-    branch_filter = payload_out["report"]["branch_filter"]
+    branch_names_scope = {str(v).strip() for v in effective_branch_filter if str(v).strip()}
     effective_sku_names = {
         str(v).strip() for v in (effective_filter.get("sku_names") or []) if str(v).strip()
     }
@@ -1118,7 +1287,7 @@ async def get_report_override(
         for row in override_rows
         if _matches_override_scope(
             row,
-            branch_names={str(v).strip() for v in branch_filter if str(v).strip()},
+            branch_names=branch_names_scope,
             brands={str(v).strip() for v in (effective_filter.get("brands") or []) if str(v).strip()},
             categories={str(v).strip() for v in (effective_filter.get("categories") or []) if str(v).strip()},
             sub_categories={str(v).strip() for v in (effective_filter.get("sub_categories") or []) if str(v).strip()},
@@ -1164,6 +1333,7 @@ async def update_report(
     category: list[str] | None = Query(default=None),
     sub_category: list[str] | None = Query(default=None),
     subline: list[str] | None = Query(default=None),
+    sku_status: list[str] | None = Query(default=None),
     branch_name: list[str] | None = Query(default=None),
 ) -> ReportDetailProjectedResponse:
     parsed_date_from = parse_query_date(date_from, field_name="date_from")
@@ -1175,7 +1345,7 @@ async def update_report(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Недостаточно прав")
     saved_product_filter = parse_product_filter(report.product_filter_json or report.product_filter)
     saved_branch_filter = parse_branch_filter(report.branch_filter_json or report.branch_filter)
-    effective_product_filter, effective_branch_filter = _effective_filters_from_overrides(
+    effective_product_filter, effective_branch_filter, effective_hub_filter = _effective_filters_from_overrides(
         saved_product_filter=saved_product_filter,
         saved_branch_filter=saved_branch_filter,
         sku_code=sku_code,
@@ -1184,6 +1354,7 @@ async def update_report(
         category=category,
         sub_category=sub_category,
         subline=subline,
+        sku_status=sku_status,
         branch_name=branch_name,
     )
 
@@ -1193,6 +1364,7 @@ async def update_report(
         view_type=view_type or report.view_type,
         product_filter=effective_product_filter,
         branch_filter=effective_branch_filter,
+        hub_filter=effective_hub_filter,
         planning_month=_resolve_report_planning_month(report),
         date_from=parsed_date_from or report.date_from,
         date_to=parsed_date_to or report.date_to,
@@ -1213,12 +1385,14 @@ async def update_report(
         normalized_metric = normalize_override_metric(effective_metric_type or "")
         if normalized_metric is None or str(effective_metric_type or "").strip().lower() not in {
             "dsp",
+            "invoice price",
             "cases",
             "gross weight",
+            "net weight",
         }:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="Параметр view_type должен быть передан в query (DSP, Cases, Gross Weight) или быть валидным в отчете",
+                detail="Параметр view_type должен быть передан в query (DSP, Invoice Price, Cases, Gross Weight, Net Weight) или быть валидным в отчете",
             )
         override_sku_name = await _resolve_override_sku_name(
             db=db,

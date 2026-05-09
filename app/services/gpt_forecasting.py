@@ -144,33 +144,57 @@ def forecast_fast_baseline_quantities_in_mc(
     last_3_avg = float(features.get("last_3_avg") or 0.0)
     last_6_avg = float(features.get("last_6_avg") or 0.0)
     last_12_avg = float(features.get("last_12_avg") or 0.0)
-    base = (0.6 * last_6_avg) + (0.4 * last_3_avg)
+    overall_avg = sum(values) / len(values)
+    base = (
+        (0.45 * last_6_avg)
+        + (0.30 * last_3_avg)
+        + (0.15 * last_12_avg)
+        + (0.10 * overall_avg)
+    )
     if base <= 0:
-        base = last_6_avg or last_3_avg or last_12_avg or _fallback_average(history)
+        base = last_6_avg or last_3_avg or last_12_avg or overall_avg or _fallback_average(history)
 
-    trend_slope = float(features.get("trend_slope_6m") or 0.0)
+    trend_slope_6m = float(features.get("trend_slope_6m") or 0.0)
+    tail3 = values[-3:] if len(values) >= 3 else values
+    trend_slope_3m = (tail3[-1] - tail3[0]) / (len(tail3) - 1) if len(tail3) >= 2 else 0.0
+    trend_slope = (0.6 * trend_slope_3m) + (0.4 * trend_slope_6m)
     if base > 0:
-        trend_slope = _clamp(trend_slope, -0.08 * base, 0.08 * base)
+        trend_slope = _clamp(trend_slope, -0.10 * base, 0.10 * base)
 
     seasonality = features.get("seasonality_index_by_month") or {}
     volatility = float(features.get("volatility_cv_12m") or 0.0)
     anti_flat = bool(features.get("anti_flat_expected"))
-    noise_amplitude = _clamp(volatility * 0.08, 0.01, 0.04) if anti_flat and base > 0 else 0.0
+    noise_amplitude = _clamp(volatility * 0.06, 0.01, 0.035) if anti_flat and base > 0 else 0.0
+    clear_decline = (
+        last_6_avg > 0
+        and last_3_avg < 0.75 * last_6_avg
+        and trend_slope_3m < -0.05 * last_6_avg
+    )
 
     result: list[float] = []
     for idx, forecast_month in enumerate(forecast_months):
         trend_adjusted = base + (trend_slope * (idx + 1))
         if base > 0:
-            trend_adjusted = _clamp(trend_adjusted, 0.0, base * 1.35)
+            trend_adjusted = _clamp(trend_adjusted, 0.0, base * 1.45)
 
         month_key = f"{forecast_month.month:02d}"
         seasonal_index = float(seasonality.get(month_key, 1.0) or 1.0)
-        seasonal_index = _clamp(seasonal_index, 0.8, 1.2)
+        seasonal_index = 1.0 + ((seasonal_index - 1.0) * 0.5)
+        seasonal_index = _clamp(seasonal_index, 0.9, 1.1)
         value = trend_adjusted * seasonal_index
 
         if noise_amplitude > 0:
             seed = f"{sku_code}|{branch_id}|{forecast_month.isoformat()}"
             value *= 1.0 + (_stable_noise_factor(seed) * noise_amplitude)
+
+        if last_6_avg > 0:
+            if clear_decline:
+                floor = max(0.70 * last_6_avg, 0.90 * last_3_avg)
+            else:
+                floor = 0.90 * last_6_avg
+            # Allow later months to respond gradually to trend while avoiding sudden cliffs.
+            floor *= max(0.85, 1.0 - (idx * 0.015))
+            value = max(value, floor)
 
         result.append(max(value, 0.0))
 
@@ -265,14 +289,22 @@ async def forecast_baseline_quantities_in_mc(
     user_payload = {
         "task": "Predict baseline monthly demand in master cartons (quantity_in_mc).",
         "methodology": [
-            "Start from a weighted base: 50% recent_6m average, 30% recent_3m trend-adjusted level, 20% annual-level with seasonality index.",
+            "Use only historical sales quantities from historical_monthly.fact_quantity_in_mc.",
+            "Treat last_6_avg as the primary demand anchor for active SKUs/branches.",
+            "Start from a weighted base: 70% recent_6m average, 20% recent_3m trend-adjusted level, 10% annual-level with seasonality index.",
             "Apply trend_slope_6m forward month by month as a gentle drift, not a jump.",
-            "Use seasonality_index_by_month only when that month exists in history; otherwise use 1.0.",
-            "Respect inventory signal: if current_stock_in_mc is critically low vs stock_norm_days, avoid unrealistic demand collapse.",
+            "Use seasonality_index_by_month as a mild modifier only; do not let seasonality make the forecast skeptical versus recent historical sales.",
+            "Ignore inventory, stock norms, current stock, future stock, and purchase/order arrivals when estimating baseline demand.",
             "Output should be smooth but not artificially flat when trend/volatility exists.",
         ],
         "constraints": [
             "Use only provided data.",
+            "Forecast baseline demand, not sell-out limited by stock availability.",
+            "Do not reduce the forecast because current or future stock is low or high.",
+            "Do not use target quantities, available stock, stock norms, or placed orders as demand signals.",
+            "For an active series where last_6_avg > 0, keep the first forecast month close to recent historical sales: generally not below 85% of last_6_avg unless last_3_avg and trend_slope_6m both show a clear decline.",
+            "If history contains repeated positive sales, do not output zero or near-zero baseline values.",
+            "Prefer a neutral-to-optimistic baseline over a skeptical baseline when historical sales are positive.",
             "Do not hallucinate external events.",
             "Return exactly one value per requested month.",
             "quantity_in_mc must be a non-negative number.",
@@ -289,10 +321,13 @@ async def forecast_baseline_quantities_in_mc(
         "context": {
             "sku_code": sku_code,
             "branch_id": branch_id,
-            "current_stock_in_mc": current_stock,
-            "stock_norm_days": stock_norm_days,
-            "historical_monthly": history[-24:],
-            "placed_orders_history": placed_orders_history[-24:],
+            "historical_monthly": [
+                {
+                    "date": str(item.get("date", "")),
+                    "fact_quantity_in_mc": float(item.get("fact_quantity_in_mc") or 0.0),
+                }
+                for item in history[-24:]
+            ],
             "derived_features": features,
         },
     }
@@ -315,7 +350,8 @@ async def forecast_baseline_quantities_in_mc(
                 ),
                 "constraints": user_payload["constraints"]
                 + [
-                    "Output must be non-flat and reflect trend_slope_6m direction unless contradicted by stock/order context.",
+                    "Output must be non-flat and reflect trend_slope_6m direction unless contradicted by historical sales seasonality.",
+                    "Recheck that positive recent historical sales are not converted into zero or materially lower demand without a clear historical decline.",
                 ],
             }
             parsed_retry = await _call_openai_forecast(

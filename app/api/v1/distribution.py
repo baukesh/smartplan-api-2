@@ -20,6 +20,26 @@ from app.models.derived import (
 router = APIRouter(prefix="/distribution", tags=["distribution"])
 
 PAGE_SIZE_MAP = {"10": 10, "50": 50, "100": 100, "all": None}
+DISTRIBUTION_DOWNLOAD_HEADERS = {
+    "hub_name": "Хаб",
+    "branch_name": "Склад",
+    "target_amount_dsp_per_branch": "План ₸",
+    "available_amount_kzt_per_branch": "Остаток ₸",
+    "recommended_amount_kzt_per_branch": "Рекомендуемое распределение ₸",
+    "adjusted_amount_kzt_per_branch": "Распределить в кол-ве",
+    "readiness_for_target_per_branch": "Готовность к плану",
+}
+DISTRIBUTION_DETAILS_DOWNLOAD_HEADERS = {
+    "sku_code": "СКЮ код",
+    "sku_name": "Наименование товара",
+    "total_available_quantity_in_mc": "Наличие товара на хабе",
+    "available_quantity_in_mc": "Наличие товара",
+    "average_l3m_quantity_in_mc": "Средние продажи за последние 3 мес",
+    "average_f3m_quantity_in_mc": "Средние продажи за будущие 3 мес",
+    "recommended_quantity_in_mc": "Рекомендуемое кол-во",
+    "adjusted_quantity_in_mc": "Распределить в кол-ве",
+    "readiness_for_target_per_sku": "Готовность к плану",
+}
 
 
 class DistributionAggregateRow(BaseModel):
@@ -949,7 +969,9 @@ async def download_distribution(
         rows = [r for r in rows if normalize_branch_lookup(r.branch_name) == branch_norm]
     export_rows = [r.model_dump() for r in rows]
     output = BytesIO()
-    pd.DataFrame(export_rows).to_excel(output, index=False, sheet_name="distribution")
+    pd.DataFrame(export_rows).rename(columns=DISTRIBUTION_DOWNLOAD_HEADERS).to_excel(
+        output, index=False, sheet_name="distribution"
+    )
     output.seek(0)
     return StreamingResponse(
         output,
@@ -982,7 +1004,9 @@ async def download_distribution_details(
         rows = [r for r in rows if r.sku_code == sku_norm]
     export_rows = [r.model_dump() for r in rows]
     output = BytesIO()
-    pd.DataFrame(export_rows).to_excel(output, index=False, sheet_name="distribution_details")
+    pd.DataFrame(export_rows).rename(columns=DISTRIBUTION_DETAILS_DOWNLOAD_HEADERS).to_excel(
+        output, index=False, sheet_name="distribution_details"
+    )
     output.seek(0)
     return StreamingResponse(
         output,

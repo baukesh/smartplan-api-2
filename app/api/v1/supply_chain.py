@@ -17,12 +17,21 @@ from app.models.derived import ForecastOrders
 router = APIRouter(prefix="/supply-chain", tags=["supply-chain"])
 
 PAGE_SIZE_MAP = {"10": 10, "50": 50, "100": 100, "all": None}
+SUPPLY_CHAIN_DOWNLOAD_HEADERS = {
+    "sku_code": "Код СКЮ",
+    "sku_name": "Наименование товара",
+    "month_prior_available_stock": "Наличие товара -1 от планируемого месяца",
+    "average_l3m_quantity_in_mc": "Средние продажи за последние 3 мес",
+    "average_f3m_quantity_in_mc": "Средние продажи за будущие 3 мес",
+    "recommended_quantity_in_mc": "Рекомендуемое кол-во",
+    "adjusted_quantity_in_mc": "Заказать в кол-ве",
+}
 
 
 class SupplyChainRow(BaseModel):
     sku_code: str
     sku_name: str
-    month_prior_available_stock: float
+    month_prior_available_stock: int
     average_l3m_quantity_in_mc: int
     average_f3m_quantity_in_mc: int
     recommended_quantity_in_mc: int
@@ -201,7 +210,7 @@ async def _load_supply_rows(
         SupplyChainRow(
             sku_code=product_by_sku[str(r.sku_code or "").strip()].sku_code,
             sku_name=product_by_sku[str(r.sku_code or "").strip()].sku_name,
-            month_prior_available_stock=float(r.month_prior_available_stock),
+            month_prior_available_stock=_qty_int(r.month_prior_available_stock),
             average_l3m_quantity_in_mc=_qty_int(r.average_l3m_quantity_in_mc),
             average_f3m_quantity_in_mc=_qty_int(r.average_f3m_quantity_in_mc),
             recommended_quantity_in_mc=_qty_int(r.recommended_quantity_in_mc),
@@ -505,7 +514,9 @@ async def download_supply_chain(
         for r in rows
     ]
     output = BytesIO()
-    pd.DataFrame(export_rows).to_excel(output, index=False, sheet_name="supply_chain")
+    pd.DataFrame(export_rows).rename(columns=SUPPLY_CHAIN_DOWNLOAD_HEADERS).to_excel(
+        output, index=False, sheet_name="supply_chain"
+    )
     output.seek(0)
     return StreamingResponse(
         output,

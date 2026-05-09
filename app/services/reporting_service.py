@@ -9,23 +9,27 @@ from fastapi import HTTPException, status
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.branch_localization import normalize_branch_lookup
+from app.core.branch_localization import localize_branch_name, normalize_branch_lookup
 from app.models.data_uploads import Branch, HistoricalSalesMonthly, PriceList, Product
 from app.models.derived import ForecastSalesMonthly
 from app.models.reporting import DPReport, DPReportForecastOverride
 
 
-VALID_VIEW_TYPES = {"dsp", "cases", "gross weight"}
+VALID_VIEW_TYPES = {"dsp", "invoice price", "cases", "gross weight", "net weight"}
 VALID_OVERRIDE_METRICS = {
     "adjusted_forecast_quantity_in_mc": "baseline_forecast_quantity_in_mc",
     "adjusted_forecast_gross_weight_kg": "baseline_forecast_gross_weight_kg",
+    "adjusted_forecast_net_weight_kg": "baseline_forecast_net_weight_kg",
     "adjusted_forecast_volume_cbm": "baseline_forecast_volume_cbm",
     "adjusted_forecast_amount_kzt": "baseline_forecast_amount_kzt",
+    "adjusted_forecast_invoice_amount_kzt": "baseline_forecast_invoice_amount_kzt",
 }
 VIEW_TYPE_TO_OVERRIDE_METRIC = {
     "cases": "adjusted_forecast_quantity_in_mc",
     "gross weight": "adjusted_forecast_gross_weight_kg",
+    "net weight": "adjusted_forecast_net_weight_kg",
     "dsp": "adjusted_forecast_amount_kzt",
+    "invoice price": "adjusted_forecast_invoice_amount_kzt",
 }
 
 
@@ -36,6 +40,7 @@ class ReportingContext:
     date_to: date
     product_filter: dict
     branch_filter: list[str]
+    hub_filter: list[str]
     view_type: str
 
 
@@ -62,6 +67,7 @@ def parse_product_filter(value: object | None) -> dict:
             "categories": [],
             "sub_categories": [],
             "sublines": [],
+            "sku_statuses": [],
         }
     if isinstance(value, dict):
         source = value
@@ -79,6 +85,7 @@ def parse_product_filter(value: object | None) -> dict:
         "categories": list(source.get("categories", []) or []),
         "sub_categories": list(source.get("sub_categories", []) or []),
         "sublines": list(source.get("sublines", []) or []),
+        "sku_statuses": list(source.get("sku_statuses", []) or []),
     }
 
 
@@ -96,6 +103,10 @@ def parse_branch_filter(value: object | None) -> list[str]:
             pass
         return [x.strip() for x in value.split(",") if x.strip()]
     return []
+
+
+def parse_hub_filter(value: object | None) -> list[str]:
+    return parse_branch_filter(value)
 
 
 def to_json_string(value: object) -> str:
@@ -135,7 +146,7 @@ def validate_view_type(view_type: str) -> str:
     if normalized not in VALID_VIEW_TYPES:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Параметр view_type должен быть одним из: DSP, Cases, Gross weight",
+            detail="Параметр view_type должен быть одним из: DSP, Invoice price, Cases, Gross weight, Net weight",
         )
     return normalized
 
@@ -155,10 +166,16 @@ def _matches_filters(
     branch_name: str,
     product_filter: dict,
     branch_filter: list[str],
+    hub_name: str | None = None,
+    hub_filter: list[str] | None = None,
 ) -> bool:
     if branch_filter:
         normalized_filter = {normalize_branch_lookup(x) for x in branch_filter if str(x).strip()}
         if normalize_branch_lookup(branch_name) not in normalized_filter:
+            return False
+    if hub_filter:
+        hub_values = {str(x).strip() for x in hub_filter if str(x).strip()}
+        if str(hub_name or "").strip() not in hub_values:
             return False
     sku_codes = {v for v in product_filter.get("sku_codes", []) if v}
     sku_names = {v for v in product_filter.get("sku_names", []) if v}
@@ -166,6 +183,7 @@ def _matches_filters(
     categories = {v for v in product_filter.get("categories", []) if v}
     sub_categories = {v for v in product_filter.get("sub_categories", []) if v}
     sublines = {v for v in product_filter.get("sublines", []) if v}
+    sku_statuses = {v for v in product_filter.get("sku_statuses", []) if v}
 
     if sku_codes and product.sku_code not in sku_codes:
         return False
@@ -178,6 +196,8 @@ def _matches_filters(
     if sub_categories and product.sub_category not in sub_categories:
         return False
     if sublines and product.sub_line not in sublines:
+        return False
+    if sku_statuses and product.status not in sku_statuses:
         return False
     return True
 
@@ -192,6 +212,178 @@ async def _load_owner_maps(db: AsyncSession, owner_user_id: int) -> tuple[dict[s
     product_map = {str(p.sku_code).strip(): p for p in products}
     branch_name_by_id = {b.branch_id: b.branch_name for b in branches}
     return product_map, branch_name_by_id
+
+
+def _build_branch_hub_maps(
+    hist_rows: list[HistoricalSalesMonthly],
+) -> tuple[dict[tuple[str, str], str], dict[str, str]]:
+    latest_by_sku_branch: dict[tuple[str, str], tuple[date, str]] = {}
+    latest_by_branch: dict[str, tuple[date, str]] = {}
+    for row in hist_rows:
+        branch_id = str(row.branch_id or "").strip()
+        hub_name = str(row.hub_name or "").strip() or "KZ-HUB"
+        sku_code = str(row.sku_code or row.sku_id or "").strip()
+        if not branch_id:
+            continue
+        sku_branch_key = (sku_code, branch_id)
+        branch_key = branch_id
+        if sku_code and (
+            sku_branch_key not in latest_by_sku_branch
+            or latest_by_sku_branch[sku_branch_key][0] <= row.date
+        ):
+            latest_by_sku_branch[sku_branch_key] = (row.date, hub_name)
+        if branch_key not in latest_by_branch or latest_by_branch[branch_key][0] <= row.date:
+            latest_by_branch[branch_key] = (row.date, hub_name)
+    return (
+        {key: value[1] for key, value in latest_by_sku_branch.items()},
+        {key: value[1] for key, value in latest_by_branch.items()},
+    )
+
+
+def _is_exit_sku_status(value: str | None) -> bool:
+    return str(value or "").strip().lower() == "на вывод"
+
+
+async def build_branch_filter_options(
+    db: AsyncSession,
+    owner_user_id: int,
+    product_filter: dict,
+    hub_filter: list[str],
+) -> list[str]:
+    """Branch dropdown options: respect product + hub (and other product facets), but not branch (Excel-style)."""
+    product_map, branch_name_by_id = await _load_owner_maps(db, owner_user_id)
+    hist_rows = (
+        await db.execute(
+            select(HistoricalSalesMonthly).where(
+                HistoricalSalesMonthly.owner_user_id == owner_user_id
+            )
+        )
+    ).scalars().all()
+    branch_hub_by_sku_branch, branch_hub_by_branch = _build_branch_hub_maps(hist_rows)
+
+    values: set[str] = set()
+    for row in hist_rows:
+        branch_id = str(row.branch_id or "").strip()
+        if not branch_id:
+            continue
+        sku_code = str(row.sku_code or row.sku_id or "").strip()
+        product = product_map.get(sku_code)
+        if product is None:
+            continue
+        branch_name = branch_name_by_id.get(branch_id, branch_id)
+        hub_name = (
+            branch_hub_by_sku_branch.get((sku_code, branch_id))
+            or branch_hub_by_branch.get(branch_id)
+            or str(row.hub_name or "").strip()
+            or "KZ-HUB"
+        )
+        if not _matches_filters(
+            product,
+            branch_name,
+            product_filter,
+            [],
+            hub_name,
+            hub_filter,
+        ):
+            continue
+        display = str(localize_branch_name(branch_name) or branch_name).strip()
+        if display:
+            values.add(display)
+    return sorted(values)
+
+
+async def build_hub_filter_options(
+    db: AsyncSession,
+    owner_user_id: int,
+    product_filter: dict,
+) -> list[str]:
+    """Hub dropdown options: respect product + SKU facets, but not branch (Excel-style)."""
+    product_map, branch_name_by_id = await _load_owner_maps(db, owner_user_id)
+    hist_rows = (
+        await db.execute(
+            select(HistoricalSalesMonthly).where(
+                HistoricalSalesMonthly.owner_user_id == owner_user_id
+            )
+        )
+    ).scalars().all()
+
+    values: set[str] = set()
+    for row in hist_rows:
+        hub_name = str(row.hub_name or "").strip()
+        if not hub_name:
+            continue
+        sku_code = str(row.sku_code or row.sku_id or "").strip()
+        product = product_map.get(sku_code)
+        if product is None:
+            continue
+        branch_id = str(row.branch_id or "").strip()
+        if branch_id:
+            branch_name = branch_name_by_id.get(branch_id, branch_id)
+            if not _matches_filters(
+                product,
+                branch_name,
+                product_filter,
+                [],
+            ):
+                continue
+        else:
+            if not _matches_filters(product, "", product_filter, []):
+                continue
+        values.add(hub_name)
+    return sorted(values)
+
+
+async def build_sku_status_filter_options(
+    db: AsyncSession,
+    owner_user_id: int,
+    product_filter: dict,
+    branch_filter: list[str],
+    hub_filter: list[str],
+) -> list[str]:
+    product_map, branch_name_by_id = await _load_owner_maps(db, owner_user_id)
+    hist_rows = (
+        await db.execute(
+            select(HistoricalSalesMonthly).where(
+                HistoricalSalesMonthly.owner_user_id == owner_user_id
+            )
+        )
+    ).scalars().all()
+    branch_hub_by_sku_branch, branch_hub_by_branch = _build_branch_hub_maps(hist_rows)
+    product_filter_without_status = {
+        **product_filter,
+        "sku_statuses": [],
+    }
+
+    values: set[str] = set()
+    for row in hist_rows:
+        branch_id = str(row.branch_id or "").strip()
+        if not branch_id:
+            continue
+        sku_code = str(row.sku_code or row.sku_id or "").strip()
+        product = product_map.get(sku_code)
+        if product is None:
+            continue
+        sku_status = str(product.status or "").strip()
+        if not sku_status:
+            continue
+        branch_name = branch_name_by_id.get(branch_id, branch_id)
+        hub_name = (
+            branch_hub_by_sku_branch.get((sku_code, branch_id))
+            or branch_hub_by_branch.get(branch_id)
+            or str(row.hub_name or "").strip()
+            or "KZ-HUB"
+        )
+        if not _matches_filters(
+            product,
+            branch_name,
+            product_filter_without_status,
+            branch_filter,
+            hub_name,
+            hub_filter,
+        ):
+            continue
+        values.add(sku_status)
+    return sorted(values)
 
 
 def _key_tuple(row: dict) -> tuple:
@@ -235,6 +427,14 @@ async def build_report_tables(
     report_id: int | None = None,
 ) -> tuple[list[dict], list[dict]]:
     product_map, branch_name_by_id = await _load_owner_maps(db, owner_user_id)
+    all_hist_rows = (
+        await db.execute(
+            select(HistoricalSalesMonthly).where(
+                HistoricalSalesMonthly.owner_user_id == owner_user_id
+            )
+        )
+    ).scalars().all()
+    branch_hub_by_sku_branch, branch_hub_by_branch = _build_branch_hub_maps(all_hist_rows)
     price_rows = (
         await db.execute(select(PriceList).where(PriceList.owner_user_id == owner_user_id))
     ).scalars().all()
@@ -244,7 +444,7 @@ async def build_report_tables(
     for sku_code in prices_by_sku:
         prices_by_sku[sku_code].sort(key=lambda x: x.date)
 
-    def _closest_dsp(sku_code: str, target_month: date) -> float:
+    def _closest_price(sku_code: str, target_month: date) -> PriceList | None:
         prices = prices_by_sku.get(str(sku_code), [])
         best: PriceList | None = None
         for p in prices:
@@ -252,7 +452,15 @@ async def build_report_tables(
             if p_month <= target_month:
                 if best is None or _month_start(best.date) < p_month:
                     best = p
+        return best
+
+    def _closest_dsp(sku_code: str, target_month: date) -> float:
+        best = _closest_price(sku_code, target_month)
         return float(best.dsp or 0.0) if best is not None else 0.0
+
+    def _closest_invoice_price(sku_code: str, target_month: date) -> float:
+        best = _closest_price(sku_code, target_month)
+        return float(best.invoice_price or 0.0) if best is not None else 0.0
 
     hist_rows = (
         await db.execute(
@@ -265,6 +473,30 @@ async def build_report_tables(
     ).scalars().all()
 
     hist_buckets: dict[tuple, dict] = {}
+    historical_hub_stock_by_period: dict[str, dict[str, float]] = {}
+    allowed_hubs_for_branch_filter: set[str] | None = None
+    if ctx.branch_filter:
+        allowed_hubs_for_branch_filter = set()
+        for row in all_hist_rows:
+            branch_id = str(row.branch_id or "").strip()
+            if not branch_id:
+                continue
+            sku_code = str(row.sku_code or row.sku_id or "").strip()
+            product = product_map.get(sku_code)
+            if product is None:
+                continue
+            branch_name = branch_name_by_id.get(branch_id, branch_id)
+            hub_name = str(row.hub_name or "").strip() or "KZ-HUB"
+            if _matches_filters(
+                product,
+                branch_name,
+                ctx.product_filter,
+                ctx.branch_filter,
+                hub_name,
+                [],
+            ):
+                allowed_hubs_for_branch_filter.add(hub_name)
+
     for r in hist_rows:
         if r.date >= ctx.planning_month:
             continue
@@ -272,8 +504,44 @@ async def build_report_tables(
         product = product_map.get(sku_code)
         if not product:
             continue
-        branch_name = branch_name_by_id.get(r.branch_id, r.branch_id)
-        if not _matches_filters(product, branch_name, ctx.product_filter, ctx.branch_filter):
+        branch_id = str(r.branch_id or "").strip()
+        hub_name = str(r.hub_name or "").strip() or "KZ-HUB"
+        if not branch_id:
+            if ctx.hub_filter and hub_name not in set(ctx.hub_filter):
+                continue
+            if allowed_hubs_for_branch_filter is not None and hub_name not in allowed_hubs_for_branch_filter:
+                continue
+            if not _matches_filters(product, "", ctx.product_filter, []):
+                continue
+            dsp = _closest_dsp(sku_code, _month_start(r.date))
+            invoice_price = _closest_invoice_price(sku_code, _month_start(r.date))
+            stock_mc = float(r.past_available_stock or 0.0)
+            period_key = _month_start(r.date).isoformat()
+            bucket = historical_hub_stock_by_period.setdefault(
+                period_key,
+                {
+                    "past_hub_stock": 0.0,
+                    "past_hub_stock_gross_weight_kg": 0.0,
+                    "past_hub_stock_net_weight_kg": 0.0,
+                    "past_hub_stock_amount_kzt": 0.0,
+                    "past_hub_stock_invoice_amount_kzt": 0.0,
+                },
+            )
+            bucket["past_hub_stock"] += stock_mc
+            bucket["past_hub_stock_gross_weight_kg"] += stock_mc * float(product.master_carton_gross_weight_kg or 0.0)
+            bucket["past_hub_stock_net_weight_kg"] += stock_mc * float(product.master_carton_net_weight_kg or 0.0)
+            bucket["past_hub_stock_amount_kzt"] += stock_mc * float(product.pieces_in_master_carton or 0.0) * dsp
+            bucket["past_hub_stock_invoice_amount_kzt"] += stock_mc * float(product.pieces_in_master_carton or 0.0) * invoice_price
+            continue
+        branch_name = branch_name_by_id.get(branch_id, branch_id)
+        if not _matches_filters(
+            product,
+            branch_name,
+            ctx.product_filter,
+            ctx.branch_filter,
+            hub_name,
+            ctx.hub_filter,
+        ):
             continue
         payload = {
             "period": _month_start(r.date).isoformat(),
@@ -282,6 +550,7 @@ async def build_report_tables(
             "category": product.category,
             "sub_category": product.sub_category,
             "subline": product.sub_line,
+            "sku_status": product.status,
             "sku_name": product.sku_name,
         }
         key = _key_tuple(payload)
@@ -301,47 +570,83 @@ async def build_report_tables(
                 **payload,
                 "fact_quantity_in_mc": 0.0,
                 "fact_gross_weight_kg": 0.0,
+                "fact_net_weight_kg": 0.0,
                 "fact_volume_cbm": 0.0,
                 "fact_amount_kzt": 0.0,
+                "fact_invoice_amount_kzt": 0.0,
                 "target_quantity_in_mc": 0.0,
                 "target_gross_weight_kg": 0.0,
+                "target_net_weight_kg": 0.0,
                 "target_volume_cbm": 0.0,
                 "target_amount_kzt": 0.0,
+                "target_invoice_amount_kzt": 0.0,
                 "past_available_stock": 0.0,
                 "past_available_stock_gross_weight_kg": 0.0,
+                "past_available_stock_net_weight_kg": 0.0,
                 "past_available_stock_amount_kzt": 0.0,
+                "past_available_stock_invoice_amount_kzt": 0.0,
             }
         bucket = hist_buckets[key]
         dsp = _closest_dsp(sku_code, _month_start(r.date))
+        invoice_price = _closest_invoice_price(sku_code, _month_start(r.date))
         stock_mc = float(r.past_available_stock or 0.0)
+        net_weight = float(product.master_carton_net_weight_kg or 0.0)
         bucket["fact_quantity_in_mc"] += fact_qty
         bucket["fact_gross_weight_kg"] += float(r.fact_gross_weight_kg or 0.0)
+        bucket["fact_net_weight_kg"] += fact_qty * net_weight
         bucket["fact_volume_cbm"] += float(r.fact_volume_cbm or 0.0)
         bucket["fact_amount_kzt"] += fact_amount
+        bucket["fact_invoice_amount_kzt"] += fact_qty * float(product.pieces_in_master_carton or 0.0) * invoice_price
         bucket["target_quantity_in_mc"] += target_qty
         bucket["target_gross_weight_kg"] += float(r.target_gross_weight_kg or 0.0)
+        bucket["target_net_weight_kg"] += target_qty * net_weight
         bucket["target_volume_cbm"] += float(r.target_volume_cbm or 0.0)
         bucket["target_amount_kzt"] += target_amount
+        bucket["target_invoice_amount_kzt"] += target_qty * float(product.pieces_in_master_carton or 0.0) * invoice_price
         bucket["past_available_stock"] += stock_mc
         bucket["past_available_stock_gross_weight_kg"] += stock_mc * float(product.master_carton_gross_weight_kg or 0.0)
+        bucket["past_available_stock_net_weight_kg"] += stock_mc * net_weight
         bucket["past_available_stock_amount_kzt"] += stock_mc * float(product.pieces_in_master_carton or 0.0) * dsp
+        bucket["past_available_stock_invoice_amount_kzt"] += stock_mc * float(product.pieces_in_master_carton or 0.0) * invoice_price
 
     historical_table = _aggregate_period_totals(
         list(hist_buckets.values()),
         [
             "fact_quantity_in_mc",
             "fact_gross_weight_kg",
+            "fact_net_weight_kg",
             "fact_volume_cbm",
             "fact_amount_kzt",
+            "fact_invoice_amount_kzt",
             "target_quantity_in_mc",
             "target_gross_weight_kg",
+            "target_net_weight_kg",
             "target_volume_cbm",
             "target_amount_kzt",
+            "target_invoice_amount_kzt",
             "past_available_stock",
             "past_available_stock_gross_weight_kg",
+            "past_available_stock_net_weight_kg",
             "past_available_stock_amount_kzt",
+            "past_available_stock_invoice_amount_kzt",
         ],
     )
+    for row in historical_table:
+        period_key = str(row["period"])
+        hub_stock = historical_hub_stock_by_period.get(period_key, {})
+        row["past_hub_stock"] = round(float(hub_stock.get("past_hub_stock", 0.0) or 0.0), 2)
+        row["past_hub_stock_gross_weight_kg"] = round(
+            float(hub_stock.get("past_hub_stock_gross_weight_kg", 0.0) or 0.0), 2
+        )
+        row["past_hub_stock_net_weight_kg"] = round(
+            float(hub_stock.get("past_hub_stock_net_weight_kg", 0.0) or 0.0), 2
+        )
+        row["past_hub_stock_amount_kzt"] = round(
+            float(hub_stock.get("past_hub_stock_amount_kzt", 0.0) or 0.0), 2
+        )
+        row["past_hub_stock_invoice_amount_kzt"] = round(
+            float(hub_stock.get("past_hub_stock_invoice_amount_kzt", 0.0) or 0.0), 2
+        )
 
     fc_rows = (
         await db.execute(
@@ -361,38 +666,102 @@ async def build_report_tables(
         product = product_map.get(sku_code)
         if not product:
             continue
-        branch_name = branch_name_by_id.get(r.branch_id, r.branch_id)
+        branch_id = str(r.branch_id or "").strip()
+        branch_name = branch_name_by_id.get(branch_id, branch_id)
+        hub_name = (
+            branch_hub_by_sku_branch.get((sku_code, branch_id))
+            or branch_hub_by_branch.get(branch_id)
+            or "KZ-HUB"
+        )
+        baseline_qty = float(r.baseline_forecast_quantity_in_mc or 0.0)
+        adjusted_qty = (
+            float(r.adjusted_forecast_quantity_in_mc)
+            if r.adjusted_forecast_quantity_in_mc is not None
+            else baseline_qty
+        )
+        if _is_exit_sku_status(product.status):
+            baseline_qty = 0.0
+            adjusted_qty = 0.0
         atomic_rows.append(
             {
                 "period": _month_start(r.date).isoformat(),
                 "branch_name": branch_name,
+                "hub_name": hub_name,
                 "brand": product.brand,
                 "category": product.category,
                 "sub_category": product.sub_category,
                 "subline": product.sub_line,
+                "sku_status": product.status,
                 "sku_name": product.sku_name,
                 "_product_obj": product,
-                "baseline_forecast_gross_weight_kg": float(r.baseline_forecast_gross_weight_kg or 0.0),
-                "baseline_forecast_volume_cbm": float(r.baseline_forecast_volume_cbm or 0.0),
-                "baseline_forecast_amount_kzt": float(r.baseline_forecast_amount_kzt or 0.0),
-                "baseline_forecast_quantity_in_mc": _qty_int(r.baseline_forecast_quantity_in_mc),
-                "adjusted_forecast_quantity_in_mc": (
-                    _qty_int(r.adjusted_forecast_quantity_in_mc)
-                    if r.adjusted_forecast_quantity_in_mc is not None
-                    else _qty_int(r.baseline_forecast_quantity_in_mc)
+                "baseline_forecast_gross_weight_kg": (
+                    0.0
+                    if _is_exit_sku_status(product.status)
+                    else float(r.baseline_forecast_gross_weight_kg or 0.0)
                 ),
-                "adjusted_forecast_gross_weight_kg": float(r.adjusted_forecast_gross_weight_kg) if r.adjusted_forecast_gross_weight_kg is not None else float(r.baseline_forecast_gross_weight_kg or 0.0),
-                "adjusted_forecast_volume_cbm": float(r.adjusted_forecast_volume_cbm) if r.adjusted_forecast_volume_cbm is not None else float(r.baseline_forecast_volume_cbm or 0.0),
-                "adjusted_forecast_amount_kzt": float(r.adjusted_forecast_amount_kzt) if r.adjusted_forecast_amount_kzt is not None else float(r.baseline_forecast_amount_kzt or 0.0),
+                "baseline_forecast_net_weight_kg": (
+                    baseline_qty
+                    * float(product.master_carton_net_weight_kg or 0.0)
+                ),
+                "baseline_forecast_volume_cbm": (
+                    0.0
+                    if _is_exit_sku_status(product.status)
+                    else float(r.baseline_forecast_volume_cbm or 0.0)
+                ),
+                "baseline_forecast_amount_kzt": (
+                    0.0
+                    if _is_exit_sku_status(product.status)
+                    else float(r.baseline_forecast_amount_kzt or 0.0)
+                ),
+                "baseline_forecast_invoice_amount_kzt": (
+                    baseline_qty
+                    * float(product.pieces_in_master_carton or 0.0)
+                    * _closest_invoice_price(sku_code, _month_start(r.date))
+                ),
+                "baseline_forecast_quantity_in_mc": baseline_qty,
+                "adjusted_forecast_quantity_in_mc": adjusted_qty,
+                "adjusted_forecast_gross_weight_kg": (
+                    0.0
+                    if _is_exit_sku_status(product.status)
+                    else float(r.adjusted_forecast_gross_weight_kg) if r.adjusted_forecast_gross_weight_kg is not None else float(r.baseline_forecast_gross_weight_kg or 0.0)
+                ),
+                "adjusted_forecast_net_weight_kg": (
+                    adjusted_qty
+                    * float(product.master_carton_net_weight_kg or 0.0)
+                ),
+                "adjusted_forecast_volume_cbm": (
+                    0.0
+                    if _is_exit_sku_status(product.status)
+                    else float(r.adjusted_forecast_volume_cbm) if r.adjusted_forecast_volume_cbm is not None else float(r.baseline_forecast_volume_cbm or 0.0)
+                ),
+                "adjusted_forecast_amount_kzt": (
+                    0.0
+                    if _is_exit_sku_status(product.status)
+                    else float(r.adjusted_forecast_amount_kzt) if r.adjusted_forecast_amount_kzt is not None else float(r.baseline_forecast_amount_kzt or 0.0)
+                ),
+                "adjusted_forecast_invoice_amount_kzt": (
+                    adjusted_qty
+                    * float(product.pieces_in_master_carton or 0.0)
+                    * _closest_invoice_price(sku_code, _month_start(r.date))
+                ),
                 "future_available_stock": float(r.future_available_stock or 0.0),
                 "future_available_stock_gross_weight_kg": (
                     float(r.future_available_stock or 0.0)
                     * float(product.master_carton_gross_weight_kg or 0.0)
                 ),
+                "future_available_stock_net_weight_kg": (
+                    float(r.future_available_stock or 0.0)
+                    * float(product.master_carton_net_weight_kg or 0.0)
+                ),
                 "future_available_stock_amount_kzt": (
                     float(r.future_available_stock or 0.0)
                     * float(product.pieces_in_master_carton or 0.0)
                     * _closest_dsp(sku_code, _month_start(r.date))
+                ),
+                "future_available_stock_invoice_amount_kzt": (
+                    float(r.future_available_stock or 0.0)
+                    * float(product.pieces_in_master_carton or 0.0)
+                    * _closest_invoice_price(sku_code, _month_start(r.date))
                 ),
                 "_applied_override_metrics": set(),
             }
@@ -461,14 +830,40 @@ async def build_report_tables(
 
         if "adjusted_forecast_amount_kzt" not in applied_metrics:
             r["adjusted_forecast_amount_kzt"] = adjusted_qty * pieces * dsp
+        if "adjusted_forecast_invoice_amount_kzt" not in applied_metrics:
+            invoice_price = _closest_invoice_price(str(product.sku_code or "").strip(), _month_start(period_date))
+            r["adjusted_forecast_invoice_amount_kzt"] = adjusted_qty * pieces * invoice_price
         if "adjusted_forecast_gross_weight_kg" not in applied_metrics:
             r["adjusted_forecast_gross_weight_kg"] = adjusted_qty * float(
                 product.master_carton_gross_weight_kg or 0.0
+            )
+        if "adjusted_forecast_net_weight_kg" not in applied_metrics:
+            r["adjusted_forecast_net_weight_kg"] = adjusted_qty * float(
+                product.master_carton_net_weight_kg or 0.0
             )
         if "adjusted_forecast_volume_cbm" not in applied_metrics:
             r["adjusted_forecast_volume_cbm"] = adjusted_qty * float(
                 product.master_carton_volume_cbm or 0.0
             )
+
+    for r in atomic_rows:
+        if not _is_exit_sku_status(r["_product_obj"].status):
+            continue
+        for metric in [
+            "baseline_forecast_quantity_in_mc",
+            "baseline_forecast_gross_weight_kg",
+            "baseline_forecast_net_weight_kg",
+            "baseline_forecast_volume_cbm",
+            "baseline_forecast_amount_kzt",
+            "baseline_forecast_invoice_amount_kzt",
+            "adjusted_forecast_quantity_in_mc",
+            "adjusted_forecast_gross_weight_kg",
+            "adjusted_forecast_net_weight_kg",
+            "adjusted_forecast_volume_cbm",
+            "adjusted_forecast_amount_kzt",
+            "adjusted_forecast_invoice_amount_kzt",
+        ]:
+            r[metric] = 0.0
 
     # Apply transient/saved filters only after override distribution so filtered views
     # receive their proportional adjusted share instead of full override totals.
@@ -480,8 +875,57 @@ async def build_report_tables(
             str(r["branch_name"]),
             ctx.product_filter,
             ctx.branch_filter,
+            str(r.get("hub_name") or ""),
+            ctx.hub_filter,
         )
     ]
+
+    latest_hub_stock_by_hub_sku: dict[tuple[str, str], tuple[date, float]] = {}
+    for row in all_hist_rows:
+        if str(row.branch_id or "").strip():
+            continue
+        hub_name = str(row.hub_name or "").strip()
+        sku_code = str(row.sku_code or row.sku_id or "").strip()
+        if not hub_name or not sku_code:
+            continue
+        product = product_map.get(sku_code)
+        if product is None:
+            continue
+        if ctx.hub_filter and hub_name not in set(ctx.hub_filter):
+            continue
+        if allowed_hubs_for_branch_filter is not None and hub_name not in allowed_hubs_for_branch_filter:
+            continue
+        if not _matches_filters(product, "", ctx.product_filter, []):
+            continue
+        key = (hub_name, sku_code)
+        if key not in latest_hub_stock_by_hub_sku or latest_hub_stock_by_hub_sku[key][0] <= row.date:
+            latest_hub_stock_by_hub_sku[key] = (row.date, float(row.past_available_stock or 0.0))
+
+    future_hub_stock_by_period: dict[str, dict[str, float]] = {}
+    forecast_periods = sorted({str(row["period"]) for row in filtered_atomic_rows})
+    for period_key in forecast_periods:
+        period_date = date.fromisoformat(period_key)
+        bucket = future_hub_stock_by_period.setdefault(
+            period_key,
+            {
+                "future_hub_stock": 0.0,
+                "future_hub_stock_gross_weight_kg": 0.0,
+                "future_hub_stock_net_weight_kg": 0.0,
+                "future_hub_stock_amount_kzt": 0.0,
+                "future_hub_stock_invoice_amount_kzt": 0.0,
+            },
+        )
+        for (hub_name, sku_code), (_stock_date, stock_mc) in latest_hub_stock_by_hub_sku.items():
+            product = product_map.get(sku_code)
+            if product is None:
+                continue
+            dsp = _closest_dsp(sku_code, _month_start(period_date))
+            invoice_price = _closest_invoice_price(sku_code, _month_start(period_date))
+            bucket["future_hub_stock"] += stock_mc
+            bucket["future_hub_stock_gross_weight_kg"] += stock_mc * float(product.master_carton_gross_weight_kg or 0.0)
+            bucket["future_hub_stock_net_weight_kg"] += stock_mc * float(product.master_carton_net_weight_kg or 0.0)
+            bucket["future_hub_stock_amount_kzt"] += stock_mc * float(product.pieces_in_master_carton or 0.0) * dsp
+            bucket["future_hub_stock_invoice_amount_kzt"] += stock_mc * float(product.pieces_in_master_carton or 0.0) * invoice_price
 
     forecast_buckets: dict[tuple, dict] = {}
     for r in filtered_atomic_rows:
@@ -497,29 +941,41 @@ async def build_report_tables(
                 "sku_name": r["sku_name"],
                 "baseline_forecast_quantity_in_mc": 0.0,
                 "baseline_forecast_gross_weight_kg": 0.0,
+                "baseline_forecast_net_weight_kg": 0.0,
                 "baseline_forecast_volume_cbm": 0.0,
                 "baseline_forecast_amount_kzt": 0.0,
+                "baseline_forecast_invoice_amount_kzt": 0.0,
                 "adjusted_forecast_quantity_in_mc": 0.0,
                 "adjusted_forecast_gross_weight_kg": 0.0,
+                "adjusted_forecast_net_weight_kg": 0.0,
                 "adjusted_forecast_volume_cbm": 0.0,
                 "adjusted_forecast_amount_kzt": 0.0,
+                "adjusted_forecast_invoice_amount_kzt": 0.0,
                 "future_available_stock": 0.0,
                 "future_available_stock_gross_weight_kg": 0.0,
+                "future_available_stock_net_weight_kg": 0.0,
                 "future_available_stock_amount_kzt": 0.0,
+                "future_available_stock_invoice_amount_kzt": 0.0,
             }
         b = forecast_buckets[key]
         for metric in [
             "baseline_forecast_quantity_in_mc",
             "baseline_forecast_gross_weight_kg",
+            "baseline_forecast_net_weight_kg",
             "baseline_forecast_volume_cbm",
             "baseline_forecast_amount_kzt",
+            "baseline_forecast_invoice_amount_kzt",
             "adjusted_forecast_quantity_in_mc",
             "adjusted_forecast_gross_weight_kg",
+            "adjusted_forecast_net_weight_kg",
             "adjusted_forecast_volume_cbm",
             "adjusted_forecast_amount_kzt",
+            "adjusted_forecast_invoice_amount_kzt",
             "future_available_stock",
             "future_available_stock_gross_weight_kg",
+            "future_available_stock_net_weight_kg",
             "future_available_stock_amount_kzt",
+            "future_available_stock_invoice_amount_kzt",
         ]:
             b[metric] += float(r[metric] or 0.0)
 
@@ -528,17 +984,39 @@ async def build_report_tables(
         [
             "baseline_forecast_quantity_in_mc",
             "baseline_forecast_gross_weight_kg",
+            "baseline_forecast_net_weight_kg",
             "baseline_forecast_volume_cbm",
             "baseline_forecast_amount_kzt",
+            "baseline_forecast_invoice_amount_kzt",
             "adjusted_forecast_quantity_in_mc",
             "adjusted_forecast_gross_weight_kg",
+            "adjusted_forecast_net_weight_kg",
             "adjusted_forecast_volume_cbm",
             "adjusted_forecast_amount_kzt",
+            "adjusted_forecast_invoice_amount_kzt",
             "future_available_stock",
             "future_available_stock_gross_weight_kg",
+            "future_available_stock_net_weight_kg",
             "future_available_stock_amount_kzt",
+            "future_available_stock_invoice_amount_kzt",
         ],
     )
+    for row in forecast_table:
+        period_key = str(row["period"])
+        hub_stock = future_hub_stock_by_period.get(period_key, {})
+        row["future_hub_stock"] = round(float(hub_stock.get("future_hub_stock", 0.0) or 0.0), 2)
+        row["future_hub_stock_gross_weight_kg"] = round(
+            float(hub_stock.get("future_hub_stock_gross_weight_kg", 0.0) or 0.0), 2
+        )
+        row["future_hub_stock_net_weight_kg"] = round(
+            float(hub_stock.get("future_hub_stock_net_weight_kg", 0.0) or 0.0), 2
+        )
+        row["future_hub_stock_amount_kzt"] = round(
+            float(hub_stock.get("future_hub_stock_amount_kzt", 0.0) or 0.0), 2
+        )
+        row["future_hub_stock_invoice_amount_kzt"] = round(
+            float(hub_stock.get("future_hub_stock_invoice_amount_kzt", 0.0) or 0.0), 2
+        )
     return historical_table, forecast_table
 
 
@@ -551,6 +1029,7 @@ async def build_reporting_context(
     planning_month: date | None,
     date_from: date | None,
     date_to: date | None,
+    hub_filter: object | None = None,
 ) -> ReportingContext:
     normalized_view = validate_view_type(view_type)
     if normalized_view == "dsp":
@@ -578,6 +1057,7 @@ async def build_reporting_context(
         date_to=effective_to,
         product_filter=parse_product_filter(product_filter),
         branch_filter=parse_branch_filter(branch_filter),
+        hub_filter=parse_hub_filter(hub_filter),
         view_type=normalized_view,
     )
 
@@ -602,7 +1082,7 @@ async def replace_report_overrides(
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=(
-                    "Неподдерживаемый metric_type. Допустимые значения: DSP, Cases, Gross Weight"
+                    "Неподдерживаемый metric_type. Допустимые значения: DSP, Cases, Gross Weight, Net Weight"
                 ),
             )
         period_value = ov.get("period")
@@ -660,7 +1140,7 @@ async def upsert_report_overrides(
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail=(
-                    "Неподдерживаемый metric_type. Допустимые значения: DSP, Cases, Gross Weight"
+                    "Неподдерживаемый metric_type. Допустимые значения: DSP, Cases, Gross Weight, Net Weight"
                 ),
             )
         period_value = ov.get("period")
