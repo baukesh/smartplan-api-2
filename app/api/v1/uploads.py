@@ -46,6 +46,22 @@ TEMPLATE_FILENAMES = [
 ]
 
 
+async def _clear_latency_caches() -> None:
+    from app.api.v1.dashboard import clear_dashboard_cache
+    from app.api.v1.distribution import clear_distribution_cache
+    from app.api.v1.inventory_health import clear_inventory_health_cache
+    from app.api.v1.reports import clear_report_cache
+    from app.core.response_cache import clear_response_cache
+
+    await asyncio.gather(
+        clear_dashboard_cache(),
+        clear_distribution_cache(),
+        clear_inventory_health_cache(),
+        clear_report_cache(),
+        clear_response_cache(),
+    )
+
+
 class UploadSpec:
     def __init__(self, required_columns: list[str]):
         self.required_columns = required_columns
@@ -383,6 +399,7 @@ async def _refresh_materialized_safe(db: AsyncSession, owner_user_id: int) -> st
             changed_keys=changed_keys,
             stage_callback=lambda stage: _set_refresh_stage(owner_user_id, stage),
         )
+        await _clear_latency_caches()
         return None
     except asyncio.CancelledError:
         await db.rollback()
@@ -492,6 +509,7 @@ async def _cancel_pending_refresh_for_upload(owner_user_id: int) -> None:
 
 
 def _schedule_materialized_refresh(owner_user_id: int) -> None:
+    asyncio.create_task(_clear_latency_caches())
     _refresh_status_by_owner[owner_user_id] = {
         **_refresh_status_by_owner.get(owner_user_id, {}),
         "in_progress": False,
@@ -571,6 +589,7 @@ def _accumulate_changed_keys(owner_user_id: int, changed_keys: list[tuple[str, s
 
 def _defer_materialized_refresh_until_placed_orders(owner_user_id: int) -> None:
     """Record pending keys but defer heavy pipelines until `/uploads/placed-orders`."""
+    asyncio.create_task(_clear_latency_caches())
     _refresh_status_by_owner[owner_user_id] = {
         **_refresh_status_by_owner.get(owner_user_id, {}),
         "in_progress": False,

@@ -81,10 +81,6 @@ def _round_qty(v: float | None) -> int:
     return int(round(float(v)))
 
 
-def _is_exit_sku_status(value: str | None) -> bool:
-    return str(value or "").strip().lower() == "на вывод"
-
-
 def _as_aware_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
@@ -345,9 +341,6 @@ async def refresh_forecast_sales_monthly(
 
     async def _get_baseline_series(job: dict) -> list[float]:
         nonlocal gpt_attempted, gpt_fallbacks, cache_hits
-        product = job["product"]
-        if _is_exit_sku_status(product.status):
-            return [0.0 for _ in job["forecast_months"]]
         if forecast_source == "fast":
             gpt_fallbacks += 1
             return forecast_fast_baseline_quantities_in_mc(
@@ -454,31 +447,31 @@ async def refresh_forecast_sales_monthly(
 
         for idx, forecast_date in enumerate(forecast_months):
             baseline_qty = float(baseline_series[idx]) if idx < len(baseline_series) else 0.0
-            rounded_baseline_qty = float(_round_qty(baseline_qty))
+            forecast_case_qty = _round2(baseline_qty) or 0.0
             closest_dsp = _closest_price_on_or_before(
                 prices_by_sku.get(sku_code, []), forecast_date
             )
             baseline_amount = None
             if closest_dsp is not None:
                 baseline_amount = (
-                    rounded_baseline_qty * product.pieces_in_master_carton * closest_dsp.dsp
+                    forecast_case_qty * product.pieces_in_master_carton * closest_dsp.dsp
                 )
             allocated_arrival_qty = float(
                 arrival_allocations.get((sku_code, branch_id, _month_start(forecast_date)), 0.0)
             )
-            future_stock = max(prev_stock + allocated_arrival_qty - rounded_baseline_qty, 0.0)
+            future_stock = max(prev_stock + allocated_arrival_qty - forecast_case_qty, 0.0)
             to_insert.append(
                 ForecastSalesMonthly(
                     sku_id=product.sku_id,
                     sku_code=sku_code,
                     branch_id=branch_id,
                     date=forecast_date,
-                    baseline_forecast_quantity_in_mc=rounded_baseline_qty,
+                    baseline_forecast_quantity_in_mc=forecast_case_qty,
                     baseline_forecast_gross_weight_kg=(
-                        _round2(rounded_baseline_qty * product.master_carton_gross_weight_kg)
+                        _round2(forecast_case_qty * product.master_carton_gross_weight_kg)
                     ),
                     baseline_forecast_volume_cbm=(
-                        _round2(rounded_baseline_qty * product.master_carton_volume_cbm)
+                        _round2(forecast_case_qty * product.master_carton_volume_cbm)
                     ),
                     baseline_forecast_amount_kzt=_round2(baseline_amount),
                     adjusted_forecast_quantity_in_mc=None,

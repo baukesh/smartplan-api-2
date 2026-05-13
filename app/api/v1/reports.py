@@ -1,13 +1,17 @@
+import asyncio
 from datetime import date
 from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import Select, exists, or_, select
+from sqlalchemy import Select, exists, func, or_, select
 
 from app.api.date_params import parse_query_date
 from app.api.deps import CurrentUser, DBSession, is_admin, require_roles
 from app.core.branch_localization import localize_branch_name
+from app.core.database import AsyncSessionLocal
+from app.core.response_cache import clear_response_cache
+from app.core.ttl_cache import AsyncTTLCache
 from app.models.data_uploads import Branch, HistoricalSalesMonthly, Product
 from app.models.derived import ForecastSalesMonthly
 from app.models.reporting import DPReport, DPReportAccess, DPReportForecastOverride
@@ -18,6 +22,7 @@ from app.services.reporting_service import (
     build_hub_filter_options,
     build_reporting_context,
     build_sku_status_filter_options,
+    clear_reporting_service_caches,
     default_period_for_planning,
     get_current_planning_month,
     normalize_override_metric,
@@ -31,6 +36,11 @@ from app.services.reporting_service import (
 )
 
 router = APIRouter(prefix="/reports", tags=["reports"])
+_report_detail_cache: AsyncTTLCache[dict] = AsyncTTLCache(ttl_seconds=60.0, maxsize=96)
+_report_minmax_cache: AsyncTTLCache[tuple[date | None, date | None, date | None]] = AsyncTTLCache(
+    ttl_seconds=120.0,
+    maxsize=128,
+)
 
 
 class ProductFilterPayload(BaseModel):
@@ -289,6 +299,15 @@ def _project_tables_for_view_type(
         else "future_hub_stock"
     )
 
+    def _project_forecast_value(value: float) -> float:
+        numeric = float(value or 0.0)
+        if normalized_view == "cases":
+            if numeric >= 1:
+                return float(int(round(numeric)))
+            if 0 < numeric < 1:
+                return round(numeric, 2)
+        return round(numeric, 2)
+
     projected_historical: list[dict] = []
     for row in historical_table:
         projected_historical.append(
@@ -306,9 +325,11 @@ def _project_tables_for_view_type(
         projected_forecast.append(
             {
                 "period": row.get("period"),
-                "baseline_forecast_value": round(float(row.get(baseline_key, 0.0) or 0.0), 2),
-                "adjusted_forecast_value": round(
-                    float(row.get(adjusted_key, row.get(baseline_key, 0.0)) or 0.0), 2
+                "baseline_forecast_value": _project_forecast_value(
+                    float(row.get(baseline_key, 0.0) or 0.0)
+                ),
+                "adjusted_forecast_value": _project_forecast_value(
+                    float(row.get(adjusted_key, row.get(baseline_key, 0.0)) or 0.0)
                 ),
                 "future_available_stock": round(float(row.get(forecast_stock_key, 0.0) or 0.0), 2),
                 "future_hub_stock": round(float(row.get(forecast_hub_stock_key, 0.0) or 0.0), 2),
@@ -340,6 +361,43 @@ def _clean_list(values: list[str] | None) -> list[str]:
     if values is None:
         return []
     return [str(v).strip() for v in values if str(v).strip()]
+
+
+def _user_cache_scope(user: CurrentUser) -> tuple[str, int]:
+    return ("admin" if is_admin(user) else "user", int(user.id))
+
+
+def _cache_list(values: list[str] | None) -> tuple[str, ...]:
+    return tuple(sorted(str(v).strip() for v in (values or []) if str(v).strip()))
+
+
+def _cache_product_filter(product_filter: dict) -> tuple:
+    return tuple(
+        (key, _cache_list(product_filter.get(key) or []))
+        for key in (
+            "sku_codes",
+            "sku_names",
+            "brands",
+            "categories",
+            "sub_categories",
+            "sublines",
+            "sku_statuses",
+        )
+    )
+
+
+def _cache_date(value: date | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
+async def clear_report_cache() -> None:
+    await _report_detail_cache.clear()
+    await _report_minmax_cache.clear()
+    await clear_reporting_service_caches()
+    await clear_response_cache()
+    from app.api.v1.distribution import clear_distribution_cache
+
+    await clear_distribution_cache()
 
 
 def _single_filter_value(values: list[str] | None) -> str | None:
@@ -481,7 +539,7 @@ def _matches_applied_filters(product: Product, branch_name_value: str, product_f
     categories = {str(v).strip() for v in (product_filter.get("categories") or []) if str(v).strip()}
     sub_categories = {str(v).strip() for v in (product_filter.get("sub_categories") or []) if str(v).strip()}
     sublines = {str(v).strip() for v in (product_filter.get("sublines") or []) if str(v).strip()}
-    sku_statuses = {str(v).strip() for v in (product_filter.get("sku_statuses") or []) if str(v).strip()}
+    sku_statuses = {str(v).strip().lower() for v in (product_filter.get("sku_statuses") or []) if str(v).strip()}
     if sku_codes and str(product.sku_code or "").strip() not in sku_codes:
         return False
     if sku_names and str(product.sku_name or "").strip() not in sku_names:
@@ -494,9 +552,35 @@ def _matches_applied_filters(product: Product, branch_name_value: str, product_f
         return False
     if sublines and str(product.sub_line or "").strip() not in sublines:
         return False
-    if sku_statuses and str(product.status or "").strip() not in sku_statuses:
+    if sku_statuses and str(product.status or "").strip().lower() not in sku_statuses:
         return False
     return True
+
+
+def _has_product_filters(product_filter: dict) -> bool:
+    return any(
+        str(v).strip()
+        for key in (
+            "sku_codes",
+            "sku_names",
+            "brands",
+            "categories",
+            "sub_categories",
+            "sublines",
+            "sku_statuses",
+        )
+        for v in (product_filter.get(key) or [])
+    )
+
+
+def _allowed_sku_codes_for_product_filter(product_by_code: dict[str, Product], product_filter: dict) -> set[str] | None:
+    if not _has_product_filters(product_filter):
+        return None
+    return {
+        sku_code
+        for sku_code, product in product_by_code.items()
+        if _matches_applied_filters(product, "", product_filter, [])
+    }
 
 
 def _matches_hub_filter(hub_name_value: str | None, hub_filter: list[str]) -> bool:
@@ -549,10 +633,57 @@ async def _compute_min_max_dates(
     branch_filter: list[str],
     hub_filter: list[str],
 ) -> tuple[date | None, date | None, date | None]:
+    key = (
+        "report-minmax",
+        owner_user_id,
+        _cache_product_filter(product_filter),
+        _cache_list(branch_filter),
+        _cache_list(hub_filter),
+    )
+    return await _report_minmax_cache.get_or_set(
+        key,
+        lambda: _compute_min_max_dates_uncached(db, owner_user_id, product_filter, branch_filter, hub_filter),
+    )
+
+
+async def _compute_min_max_dates_uncached(
+    db: DBSession,
+    owner_user_id: int,
+    product_filter: dict,
+    branch_filter: list[str],
+    hub_filter: list[str],
+) -> tuple[date | None, date | None, date | None]:
+    if not _has_product_filters(product_filter) and not branch_filter and not hub_filter:
+        hist_min, hist_max = (
+            await db.execute(
+                select(
+                    func.min(HistoricalSalesMonthly.date),
+                    func.max(HistoricalSalesMonthly.date),
+                ).where(
+                    HistoricalSalesMonthly.owner_user_id == owner_user_id,
+                    HistoricalSalesMonthly.branch_id != "",
+                )
+            )
+        ).one()
+        forecast_max = (
+            await db.execute(
+                select(func.max(ForecastSalesMonthly.date)).where(
+                    ForecastSalesMonthly.owner_user_id == owner_user_id
+                )
+            )
+        ).scalar_one_or_none()
+        min_hist = _month_start(hist_min) if hist_min else None
+        max_hist = _month_start(hist_max) if hist_max else None
+        max_forecast = _month_start(forecast_max) if forecast_max else None
+        return min_hist, max_hist, (max_forecast or max_hist)
+
     products = (
         await db.execute(select(Product).where(Product.owner_user_id == owner_user_id))
     ).scalars().all()
     product_by_code = {str(p.sku_code or "").strip(): p for p in products}
+    allowed_sku_codes = _allowed_sku_codes_for_product_filter(product_by_code, product_filter)
+    if allowed_sku_codes == set():
+        return None, None, None
     branches = (
         await db.execute(select(Branch).where(Branch.owner_user_id == owner_user_id))
     ).scalars().all()
@@ -560,15 +691,16 @@ async def _compute_min_max_dates(
     latest_branch_hub_by_sku_branch: dict[tuple[str, str], tuple[date, str]] = {}
     latest_branch_hub_by_branch: dict[str, tuple[date, str]] = {}
 
+    hist_stmt = select(HistoricalSalesMonthly).where(HistoricalSalesMonthly.owner_user_id == owner_user_id)
+    forecast_stmt = select(ForecastSalesMonthly).where(ForecastSalesMonthly.owner_user_id == owner_user_id)
+    if allowed_sku_codes is not None:
+        hist_stmt = hist_stmt.where(HistoricalSalesMonthly.sku_code.in_(allowed_sku_codes))
+        forecast_stmt = forecast_stmt.where(ForecastSalesMonthly.sku_code.in_(allowed_sku_codes))
     hist_rows = (
-        await db.execute(
-            select(HistoricalSalesMonthly).where(HistoricalSalesMonthly.owner_user_id == owner_user_id)
-        )
+        await db.execute(hist_stmt)
     ).scalars().all()
     forecast_rows = (
-        await db.execute(
-            select(ForecastSalesMonthly).where(ForecastSalesMonthly.owner_user_id == owner_user_id)
-        )
+        await db.execute(forecast_stmt)
     ).scalars().all()
 
     min_hist: date | None = None
@@ -626,6 +758,64 @@ async def _compute_min_max_dates(
         max_forecast = m if max_forecast is None else max(max_forecast, m)
 
     return min_hist, max_hist, (max_forecast or max_hist)
+
+
+async def _compute_min_max_dates_isolated(
+    owner_user_id: int,
+    product_filter: dict,
+    branch_filter: list[str],
+    hub_filter: list[str],
+) -> tuple[date | None, date | None, date | None]:
+    async with AsyncSessionLocal() as session:
+        return await _compute_min_max_dates(
+            db=session,
+            owner_user_id=owner_user_id,
+            product_filter=product_filter,
+            branch_filter=branch_filter,
+            hub_filter=hub_filter,
+        )
+
+
+async def _build_branch_filter_options_isolated(
+    owner_user_id: int,
+    product_filter: dict,
+    hub_filter: list[str],
+) -> list[str]:
+    async with AsyncSessionLocal() as session:
+        return await build_branch_filter_options(
+            db=session,
+            owner_user_id=owner_user_id,
+            product_filter=product_filter,
+            hub_filter=hub_filter,
+        )
+
+
+async def _build_hub_filter_options_isolated(
+    owner_user_id: int,
+    product_filter: dict,
+) -> list[str]:
+    async with AsyncSessionLocal() as session:
+        return await build_hub_filter_options(
+            db=session,
+            owner_user_id=owner_user_id,
+            product_filter=product_filter,
+        )
+
+
+async def _build_sku_status_filter_options_isolated(
+    owner_user_id: int,
+    product_filter: dict,
+    branch_filter: list[str],
+    hub_filter: list[str],
+) -> list[str]:
+    async with AsyncSessionLocal() as session:
+        return await build_sku_status_filter_options(
+            db=session,
+            owner_user_id=owner_user_id,
+            product_filter=product_filter,
+            branch_filter=branch_filter,
+            hub_filter=hub_filter,
+        )
 
 
 def _effective_filters_from_overrides(
@@ -699,6 +889,73 @@ async def _build_report_detail(
     ignore_saved_product_filter: bool = False,
     ignore_saved_branch_filter: bool = False,
 ) -> dict:
+    # Report detail construction is expensive and read-heavy; cache only after access checks.
+    report_updated_at = getattr(report, "updated_at", None)
+    key = (
+        "report-detail",
+        int(report.id),
+        int(report.created_by_id or 0),
+        report_updated_at.isoformat() if report_updated_at is not None else None,
+        view_type_override.strip().lower() if view_type_override else None,
+        _cache_date(date_from_override),
+        _cache_date(date_to_override),
+        _cache_list(sku_code),
+        _cache_list(sku_name),
+        _cache_list(brand),
+        _cache_list(category),
+        _cache_list(sub_category),
+        _cache_list(subline),
+        _cache_list(sku_status),
+        _cache_list(branch_name),
+        _cache_list(hub_name),
+        bool(project_by_view_type),
+        bool(ignore_saved_product_filter),
+        bool(ignore_saved_branch_filter),
+    )
+    return await _report_detail_cache.get_or_set(
+        key,
+        lambda: _build_report_detail_uncached(
+            db,
+            report,
+            view_type_override=view_type_override,
+            date_from_override=date_from_override,
+            date_to_override=date_to_override,
+            sku_code=sku_code,
+            sku_name=sku_name,
+            brand=brand,
+            category=category,
+            sub_category=sub_category,
+            subline=subline,
+            sku_status=sku_status,
+            branch_name=branch_name,
+            hub_name=hub_name,
+            project_by_view_type=project_by_view_type,
+            ignore_saved_product_filter=ignore_saved_product_filter,
+            ignore_saved_branch_filter=ignore_saved_branch_filter,
+        ),
+    )
+
+
+async def _build_report_detail_uncached(
+    db: DBSession,
+    report: DPReport,
+    *,
+    view_type_override: str | None = None,
+    date_from_override: date | None = None,
+    date_to_override: date | None = None,
+    sku_code: list[str] | None = None,
+    sku_name: list[str] | None = None,
+    brand: list[str] | None = None,
+    category: list[str] | None = None,
+    sub_category: list[str] | None = None,
+    subline: list[str] | None = None,
+    sku_status: list[str] | None = None,
+    branch_name: list[str] | None = None,
+    hub_name: list[str] | None = None,
+    project_by_view_type: bool = False,
+    ignore_saved_product_filter: bool = False,
+    ignore_saved_branch_filter: bool = False,
+) -> dict:
     owner_user_id = int(report.created_by_id or 0)
     saved_product_filter = (
         {}
@@ -730,11 +987,40 @@ async def _build_report_detail(
         date_from=date_from_override or report.date_from,
         date_to=date_to_override or report.date_to,
     )
-    historical_table, forecast_table = await build_report_tables(
-        db=db,
-        owner_user_id=owner_user_id,
-        ctx=ctx,
-        report_id=report.id,
+    (
+        (historical_table, forecast_table),
+        (min_hist_month, max_hist_month_available, max_available_month),
+        branch_options,
+        hub_options,
+        sku_status_options,
+    ) = await asyncio.gather(
+        build_report_tables(
+            db=db,
+            owner_user_id=owner_user_id,
+            ctx=ctx,
+            report_id=report.id,
+        ),
+        _compute_min_max_dates_isolated(
+            owner_user_id=owner_user_id,
+            product_filter=ctx.product_filter,
+            branch_filter=ctx.branch_filter,
+            hub_filter=ctx.hub_filter,
+        ),
+        _build_branch_filter_options_isolated(
+            owner_user_id=owner_user_id,
+            product_filter=ctx.product_filter,
+            hub_filter=ctx.hub_filter,
+        ),
+        _build_hub_filter_options_isolated(
+            owner_user_id=owner_user_id,
+            product_filter=ctx.product_filter,
+        ),
+        _build_sku_status_filter_options_isolated(
+            owner_user_id=owner_user_id,
+            product_filter=ctx.product_filter,
+            branch_filter=ctx.branch_filter,
+            hub_filter=ctx.hub_filter,
+        ),
     )
     if project_by_view_type:
         historical_table, forecast_table = _project_tables_for_view_type(
@@ -742,14 +1028,6 @@ async def _build_report_detail(
             forecast_table=forecast_table,
             view_type=ctx.view_type,
         )
-
-    min_hist_month, max_hist_month_available, max_available_month = await _compute_min_max_dates(
-        db=db,
-        owner_user_id=owner_user_id,
-        product_filter=ctx.product_filter,
-        branch_filter=ctx.branch_filter,
-        hub_filter=ctx.hub_filter,
-    )
 
     if max_available_month is not None:
         requested_from = _month_start(ctx.date_from)
@@ -772,24 +1050,6 @@ async def _build_report_detail(
             forecast_table = []
 
     card = report_card_payload(report)
-    branch_options = await build_branch_filter_options(
-        db=db,
-        owner_user_id=owner_user_id,
-        product_filter=ctx.product_filter,
-        hub_filter=ctx.hub_filter,
-    )
-    hub_options = await build_hub_filter_options(
-        db=db,
-        owner_user_id=owner_user_id,
-        product_filter=ctx.product_filter,
-    )
-    sku_status_options = await build_sku_status_filter_options(
-        db=db,
-        owner_user_id=owner_user_id,
-        product_filter=ctx.product_filter,
-        branch_filter=ctx.branch_filter,
-        hub_filter=ctx.hub_filter,
-    )
     return {
         "report": {
             "report_id": card["report_id"],
@@ -1041,6 +1301,7 @@ async def create_report(
         ),
     )
     await db.commit()
+    await clear_report_cache()
     await db.refresh(report)
     payload_out = await _build_report_detail(db, report, project_by_view_type=True)
     return ReportDetailProjectedResponse(**payload_out)
@@ -1422,6 +1683,7 @@ async def update_report(
             overrides=overrides,
         )
     await db.commit()
+    await clear_report_cache()
     await db.refresh(report)
     payload_out = await _build_report_detail(db, report, project_by_view_type=True)
     return ReportDetailProjectedResponse(**payload_out)
@@ -1440,6 +1702,7 @@ async def delete_report(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Недостаточно прав")
     report.is_deleted = True
     await db.commit()
+    await clear_report_cache()
 
 
 @router.get("/{report_id:int}/access", response_model=List[ReportAccessOut])
@@ -1493,6 +1756,7 @@ async def grant_report_access(
         )
         db.add(access)
         await db.commit()
+        await clear_report_cache()
         await db.refresh(access)
     return ReportAccessOut(
         user_id=access.user_id,
@@ -1522,4 +1786,5 @@ async def revoke_report_access(
     if access:
         await db.delete(access)
         await db.commit()
+        await clear_report_cache()
 

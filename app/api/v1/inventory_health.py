@@ -8,12 +8,15 @@ from sqlalchemy import func, select
 
 from app.api.date_params import parse_query_date
 from app.core.branch_localization import localize_branch_name, normalize_branch_lookup
+from app.core.ttl_cache import AsyncTTLCache
 from app.api.deps import CurrentUser, DBSession, is_admin
-from app.models.data_uploads import Branch, HistoricalSalesMonthly, PriceList, Product
+from app.models.data_uploads import Branch, HistoricalSalesMonthly, PriceList, Product, ProductBranch
+from app.models.derived import ForecastSalesMonthly
 
 router = APIRouter(prefix="/inventory-health", tags=["inventory-health"])
 
 PAGE_SIZE_MAP = {"10": 10, "50": 50, "100": 100, "all": None}
+_inventory_metrics_cache: AsyncTTLCache[list["_SkuMetrics"]] = AsyncTTLCache(ttl_seconds=45.0, maxsize=128)
 
 
 class InventoryHealthTableRow(BaseModel):
@@ -61,9 +64,6 @@ class TopSkuShareResponse(BaseModel):
 
 class OutOfStockRow(BaseModel):
     sku_name: str
-    share_of_stock: float
-    health_index_deviation: int
-    average_historical_sales: float
 
 
 class OutOfStockResponse(BaseModel):
@@ -79,7 +79,8 @@ class InventoryHealthFilterOptionsResponse(BaseModel):
 class HealthIndexInformationResponse(BaseModel):
     healthy: str
     normal: str
-    critical: str
+    critical_understock: str
+    critical_overstock: str
 
 
 class HealthIndexDeviationInformationResponse(BaseModel):
@@ -98,6 +99,12 @@ class _SkuMetrics(BaseModel):
     stock: float
     stock_dsp: float
     stock_invoice_price: float
+    required_stock: float
+    required_stock_dsp: float
+    required_stock_invoice_price: float
+    stock_diff: float
+    stock_diff_dsp: float
+    stock_diff_invoice_price: float
     share_business: float
     share_stock: float
     share_percent: float
@@ -143,6 +150,45 @@ def _metric_stock_value(metric: str, m: _SkuMetrics) -> float:
     return m.stock
 
 
+def _metric_required_stock_value(metric: str, m: _SkuMetrics) -> float:
+    if metric == "dsp":
+        return m.required_stock_dsp
+    if metric == "invoice price":
+        return m.required_stock_invoice_price
+    return m.required_stock
+
+
+def _metric_stock_diff_value(metric: str, m: _SkuMetrics) -> float:
+    if metric == "dsp":
+        return m.stock_diff_dsp
+    if metric == "invoice price":
+        return m.stock_diff_invoice_price
+    return m.stock_diff
+
+
+def _forecast_required_for_stock_norm(
+    forecast_qty_by_key: dict[tuple[int, str, str, date], float],
+    owner_user_id: int,
+    branch_id: str,
+    sku_code: str,
+    basis_month: date,
+    stock_norm_days: float,
+) -> float:
+    if stock_norm_days <= 0:
+        return 0.0
+    target_qty = 0.0
+    remaining_days = float(stock_norm_days)
+    month_offset = 1
+    while remaining_days > 0:
+        covered_days = min(30.0, remaining_days)
+        month = _add_months(basis_month, month_offset)
+        monthly_qty = forecast_qty_by_key.get((owner_user_id, branch_id, sku_code, month), 0.0)
+        target_qty += monthly_qty * (covered_days / 30.0)
+        remaining_days -= covered_days
+        month_offset += 1
+    return target_qty
+
+
 def _paginate(items: list, page: int, page_size: str) -> tuple[list, int, int]:
     size = _parse_page_size(page_size)
     total_items = len(items)
@@ -158,6 +204,13 @@ def _month_bounds(d: date) -> tuple[date, date]:
     last_day = monthrange(d.year, d.month)[1]
     last = d.replace(day=last_day)
     return first, last
+
+
+def _add_months(d: date, months: int) -> date:
+    month = d.month - 1 + months
+    year = d.year + month // 12
+    month = month % 12 + 1
+    return date(year, month, 1)
 
 
 def _resolve_date_window(
@@ -278,7 +331,48 @@ async def get_inventory_health_filter_options(
     )
 
 
+def _user_cache_scope(user: CurrentUser) -> tuple[str, int]:
+    return ("admin" if is_admin(user) else "user", int(user.id))
+
+
+def _normalize_cache_date(value: str | date | None) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, date):
+        return value.isoformat()
+    return str(value).strip() or None
+
+
+async def clear_inventory_health_cache() -> None:
+    await _inventory_metrics_cache.clear()
+
+
 async def _compute_inventory_metrics(
+    db: DBSession,
+    user: CurrentUser,
+    view_type: str,
+    branch_names: list[str] | None,
+    period: str | date | None,
+    date_from: str | date | None,
+    date_to: str | date | None,
+) -> list[_SkuMetrics]:
+    metric = _normalize_view_type(view_type)
+    branch_key = tuple(sorted(normalize_branch_lookup(n) for n in (branch_names or []) if str(n or "").strip()))
+    key = (
+        *_user_cache_scope(user),
+        metric,
+        branch_key,
+        _normalize_cache_date(period),
+        _normalize_cache_date(date_from),
+        _normalize_cache_date(date_to),
+    )
+    return await _inventory_metrics_cache.get_or_set(
+        key,
+        lambda: _compute_inventory_metrics_uncached(db, user, metric, branch_names, period, date_from, date_to),
+    )
+
+
+async def _compute_inventory_metrics_uncached(
     db: DBSession,
     user: CurrentUser,
     view_type: str,
@@ -343,6 +437,19 @@ async def _compute_inventory_metrics(
     if not hs_rows:
         return []
 
+    sales_window_end = requested_to_month or (max_existing_date.replace(day=1) if max_existing_date else None)
+    sales_window_start = _add_months(sales_window_end, -5) if sales_window_end else None
+    sales_stmt = select(HistoricalSalesMonthly)
+    if not is_admin(user):
+        sales_stmt = sales_stmt.where(HistoricalSalesMonthly.owner_user_id == user.id)
+    if selected_branch_ids:
+        sales_stmt = sales_stmt.where(HistoricalSalesMonthly.branch_id.in_(selected_branch_ids))
+    if sales_window_start:
+        sales_stmt = sales_stmt.where(HistoricalSalesMonthly.date >= sales_window_start)
+    if sales_window_end:
+        sales_stmt = sales_stmt.where(HistoricalSalesMonthly.date <= sales_window_end)
+    sales_rows = (await db.execute(sales_stmt)).scalars().all()
+
     product_stmt = select(Product)
     if not is_admin(user):
         product_stmt = product_stmt.where(Product.owner_user_id == user.id)
@@ -359,9 +466,85 @@ async def _compute_inventory_metrics(
     for k in prices_by_key:
         prices_by_key[k].sort(key=lambda x: x.date)
 
-    agg: dict[tuple[int, str], dict[str, float | str | int | None]] = {}
+    product_branch_stmt = select(ProductBranch)
+    forecast_stmt = select(ForecastSalesMonthly)
+    if not is_admin(user):
+        product_branch_stmt = product_branch_stmt.where(ProductBranch.owner_user_id == user.id)
+        forecast_stmt = forecast_stmt.where(ForecastSalesMonthly.owner_user_id == user.id)
+    if selected_branch_ids:
+        product_branch_stmt = product_branch_stmt.where(ProductBranch.branch_id.in_(selected_branch_ids))
+        forecast_stmt = forecast_stmt.where(ForecastSalesMonthly.branch_id.in_(selected_branch_ids))
+    product_branch_rows = (await db.execute(product_branch_stmt)).scalars().all()
+    stock_norm_by_branch_sku = {
+        (row.owner_user_id, str(row.branch_id or "").strip(), str(row.sku_code or "").strip()): float(
+            row.stock_norm or 0.0
+        )
+        for row in product_branch_rows
+    }
+    forecast_rows = (await db.execute(forecast_stmt)).scalars().all()
+    forecast_qty_by_key: dict[tuple[int, str, str, date], float] = {}
+    for row in forecast_rows:
+        month = row.date.replace(day=1)
+        key = (
+            row.owner_user_id,
+            str(row.branch_id or "").strip(),
+            str(row.sku_code or "").strip(),
+            month,
+        )
+        qty = (
+            float(row.adjusted_forecast_quantity_in_mc)
+            if row.adjusted_forecast_quantity_in_mc is not None
+            else float(row.baseline_forecast_quantity_in_mc or 0.0)
+        )
+        forecast_qty_by_key[key] = forecast_qty_by_key.get(key, 0.0) + qty
+
+    sales_agg: dict[tuple[int, str], dict[str, float]] = {}
     month_buckets_by_sku: dict[tuple[int, str], set[str]] = {}
+    for r in sales_rows:
+        if not str(r.branch_id or "").strip():
+            continue
+        key = (r.owner_user_id, str(r.sku_code or "").strip())
+        p = product_map.get(key)
+        if not p:
+            continue
+        price_candidates = prices_by_key.get(key, [])
+        chosen_price = None
+        for pr in price_candidates:
+            if pr.date <= r.date:
+                chosen_price = pr
+        if chosen_price is None and price_candidates:
+            chosen_price = price_candidates[0]
+        dsp = float(chosen_price.dsp) if chosen_price is not None else 0.0
+        invoice_price = float(chosen_price.invoice_price) if chosen_price is not None else 0.0
+
+        sales_qty = float(r.fact_quantity_in_mc or 0.0)
+        sales_dsp = sales_qty * float(p.pieces_in_master_carton or 0.0) * dsp
+        sales_invoice_price = sales_qty * float(p.pieces_in_master_carton or 0.0) * invoice_price
+        sales_bucket = sales_agg.setdefault(
+            key,
+            {
+                "sales_qty": 0.0,
+                "sales_dsp": 0.0,
+                "sales_invoice_price": 0.0,
+            },
+        )
+        sales_bucket["sales_qty"] += sales_qty
+        sales_bucket["sales_dsp"] += sales_dsp
+        sales_bucket["sales_invoice_price"] += sales_invoice_price
+        month_buckets_by_sku.setdefault(key, set()).add(r.date.replace(day=1).isoformat())
+
+    for key, sales_bucket in sales_agg.items():
+        month_count = len(month_buckets_by_sku.get(key, set()))
+        if month_count <= 0:
+            continue
+        sales_bucket["sales_qty"] /= month_count
+        sales_bucket["sales_dsp"] /= month_count
+        sales_bucket["sales_invoice_price"] /= month_count
+
+    agg: dict[tuple[int, str], dict[str, float | str | int | None]] = {}
     for r in hs_rows:
+        if not str(r.branch_id or "").strip():
+            continue
         key = (r.owner_user_id, str(r.sku_code or "").strip())
         p = product_map.get(key)
         if not p:
@@ -377,12 +560,25 @@ async def _compute_inventory_metrics(
         dsp = float(chosen_price.dsp) if chosen_price is not None else 0.0
         invoice_price = float(chosen_price.invoice_price) if chosen_price is not None else 0.0
 
-        sales_qty = float(r.fact_quantity_in_mc or 0.0)
-        sales_dsp = sales_qty * float(p.pieces_in_master_carton or 0.0) * dsp
-        sales_invoice_price = sales_qty * float(p.pieces_in_master_carton or 0.0) * invoice_price
         stock = float(r.past_available_stock or 0.0)
         stock_dsp = stock * float(p.pieces_in_master_carton or 0.0) * dsp
         stock_invoice_price = stock * float(p.pieces_in_master_carton or 0.0) * invoice_price
+        branch_id = str(r.branch_id or "").strip()
+        month = r.date.replace(day=1)
+        stock_norm_days = stock_norm_by_branch_sku.get(
+            (r.owner_user_id, branch_id, str(r.sku_code or "").strip()),
+            float(p.general_stock_norm_days or 0.0),
+        )
+        required_stock = _forecast_required_for_stock_norm(
+            forecast_qty_by_key=forecast_qty_by_key,
+            owner_user_id=r.owner_user_id,
+            branch_id=branch_id,
+            sku_code=str(r.sku_code or "").strip(),
+            basis_month=month,
+            stock_norm_days=stock_norm_days,
+        )
+        required_stock_dsp = required_stock * float(p.pieces_in_master_carton or 0.0) * dsp
+        required_stock_invoice_price = required_stock * float(p.pieces_in_master_carton or 0.0) * invoice_price
 
         bucket = agg.setdefault(
             key,
@@ -391,21 +587,27 @@ async def _compute_inventory_metrics(
                 "sku_code": p.sku_code,
                 "sku_name": p.sku_name,
                 "status": str(p.status or "").strip().lower(),
-                "sales_qty": 0.0,
-                "sales_dsp": 0.0,
-                "sales_invoice_price": 0.0,
+                "sales_qty": float(sales_agg.get(key, {}).get("sales_qty", 0.0)),
+                "sales_dsp": float(sales_agg.get(key, {}).get("sales_dsp", 0.0)),
+                "sales_invoice_price": float(
+                    sales_agg.get(key, {}).get("sales_invoice_price", 0.0)
+                ),
                 "stock": 0.0,
                 "stock_dsp": 0.0,
                 "stock_invoice_price": 0.0,
+                "required_stock": 0.0,
+                "required_stock_dsp": 0.0,
+                "required_stock_invoice_price": 0.0,
             },
         )
-        bucket["sales_qty"] = float(bucket["sales_qty"]) + sales_qty
-        bucket["sales_dsp"] = float(bucket["sales_dsp"]) + sales_dsp
-        bucket["sales_invoice_price"] = float(bucket["sales_invoice_price"]) + sales_invoice_price
         bucket["stock"] = float(bucket["stock"]) + stock
         bucket["stock_dsp"] = float(bucket["stock_dsp"]) + stock_dsp
         bucket["stock_invoice_price"] = float(bucket["stock_invoice_price"]) + stock_invoice_price
-        month_buckets_by_sku.setdefault(key, set()).add(r.date.replace(day=1).isoformat())
+        bucket["required_stock"] = float(bucket["required_stock"]) + required_stock
+        bucket["required_stock_dsp"] = float(bucket["required_stock_dsp"]) + required_stock_dsp
+        bucket["required_stock_invoice_price"] = (
+            float(bucket["required_stock_invoice_price"]) + required_stock_invoice_price
+        )
 
     if not agg:
         return []
@@ -453,6 +655,11 @@ async def _compute_inventory_metrics(
         sku_key = (int(v.get("owner_user_id", 0) or 0), str(v["sku_code"]))
         month_count = len(month_buckets_by_sku.get(sku_key, set()))
         avg_hist_sales = (float(v["sales_qty"]) / float(month_count)) if month_count > 0 else 0.0
+        stock_diff = abs(float(v["stock"]) - float(v["required_stock"]))
+        stock_diff_dsp = abs(float(v["stock_dsp"]) - float(v["required_stock_dsp"]))
+        stock_diff_invoice_price = abs(
+            float(v["stock_invoice_price"]) - float(v["required_stock_invoice_price"])
+        )
         interim.append(
             {
                 "sku_code": str(v["sku_code"]),
@@ -463,6 +670,12 @@ async def _compute_inventory_metrics(
                 "stock": float(v["stock"]),
                 "stock_dsp": float(v["stock_dsp"]),
                 "stock_invoice_price": float(v["stock_invoice_price"]),
+                "required_stock": float(v["required_stock"]),
+                "required_stock_dsp": float(v["required_stock_dsp"]),
+                "required_stock_invoice_price": float(v["required_stock_invoice_price"]),
+                "stock_diff": stock_diff,
+                "stock_diff_dsp": stock_diff_dsp,
+                "stock_diff_invoice_price": stock_diff_invoice_price,
                 "share_business": share_business,
                 "share_stock": share_stock,
                 "share_percent": share_business * 100.0,
@@ -714,48 +927,63 @@ async def get_category_c(
     )
 
 
-def _top_issue_rows(metrics: list[_SkuMetrics], issue_type: str, top_n: int) -> list[TopSkuShareRow]:
-    total_stock = sum(m.stock for m in metrics)
-    def _deviation(m: _SkuMetrics) -> float:
-        return abs(float(m.health_index) - 100.0)
-
+def _top_issue_rows(
+    metrics: list[_SkuMetrics],
+    issue_type: str,
+    top_n: int,
+    view_type: str,
+) -> list[TopSkuShareRow]:
+    metric = _normalize_view_type(view_type)
     if issue_type == "overstock":
-        chosen = [m for m in metrics if m.health_index >= 100.0]
+        chosen = [
+            m
+            for m in metrics
+            if _metric_stock_value(metric, m) > _metric_required_stock_value(metric, m)
+            and _metric_stock_diff_value(metric, m) > 0
+        ]
     elif issue_type == "understock":
-        chosen = [m for m in metrics if 0.0 < m.health_index < 100.0]
+        chosen = [
+            m
+            for m in metrics
+            if _metric_stock_value(metric, m) < _metric_required_stock_value(metric, m)
+            and _metric_stock_diff_value(metric, m) > 0
+        ]
     else:
-        chosen = [m for m in metrics if abs(m.health_index) < 1e-9]
+        chosen = []
 
-    chosen = sorted(chosen, key=lambda m: (_deviation(m), m.share_stock), reverse=True)
-    raw_deviations = [_deviation(m) for m in chosen]
-    max_deviation = max(raw_deviations) if raw_deviations else 0.0
-    min_deviation = min(raw_deviations) if raw_deviations else 0.0
-
-    def _scaled_deviation(raw: float) -> int:
-        if max_deviation <= 200.0:
-            return int(raw)
-        if max_deviation <= min_deviation:
-            return 200
-        scaled = (raw - min_deviation) / (max_deviation - min_deviation) * 200.0
-        return int(round(max(0.0, min(200.0, scaled))))
-
-    sliced = chosen[: max(top_n, 0)]
-    return [
+    total_diff = sum(_metric_stock_diff_value(metric, m) for m in chosen)
+    chosen = sorted(chosen, key=lambda m: _metric_stock_diff_value(metric, m), reverse=True)
+    limit = max(top_n, 0)
+    sliced = chosen[:limit]
+    rows = [
         TopSkuShareRow(
             sku_name=m.sku_name,
-            share_of_stock=round((m.stock / total_stock * 100.0) if total_stock > 0 else 0.0, 1),
-            health_index_deviation=_scaled_deviation(_deviation(m)),
+            share_of_stock=share,
+            health_index_deviation=int(round(share)),
         )
         for m in sliced
+        for share in [
+            round((_metric_stock_diff_value(metric, m) / total_diff * 100.0) if total_diff > 0 else 0.0, 1)
+        ]
     ]
+    if len(chosen) > limit:
+        others_diff = sum(_metric_stock_diff_value(metric, m) for m in chosen[limit:])
+        others_share = round((others_diff / total_diff * 100.0) if total_diff > 0 else 0.0, 1)
+        rows.append(
+            TopSkuShareRow(
+                sku_name="Others",
+                share_of_stock=others_share,
+                health_index_deviation=int(round(others_share)),
+            )
+        )
+    return rows
 
 
 def _out_of_stock_rows(metrics: list[_SkuMetrics], top_n: int) -> list[OutOfStockRow]:
-    total_stock = sum(m.stock for m in metrics)
     active_zero_stock = [
         m
         for m in metrics
-        if abs(m.health_index) < 1e-9 and str(m.status or "").strip().lower() == "активный"
+        if abs(float(m.stock)) < 1e-9 and str(m.status or "").strip().lower() == "активный"
     ]
     active_zero_stock = sorted(
         active_zero_stock,
@@ -763,16 +991,7 @@ def _out_of_stock_rows(metrics: list[_SkuMetrics], top_n: int) -> list[OutOfStoc
         reverse=True,
     )
     sliced = active_zero_stock[: max(top_n, 0)]
-    return [
-        OutOfStockRow(
-            sku_name=m.sku_name,
-            share_of_stock=share_of_stock,
-            health_index_deviation=0,
-            average_historical_sales=share_of_stock,
-        )
-        for m in sliced
-        for share_of_stock in [round((m.stock / total_stock * 100.0) if total_stock > 0 else 0.0, 1)]
-    ]
+    return [OutOfStockRow(sku_name=m.sku_name) for m in sliced]
 
 
 @router.get("/overstock", response_model=TopSkuShareResponse)
@@ -796,7 +1015,7 @@ async def get_overstock(
         date_from,
         date_to,
     )
-    return TopSkuShareResponse(items=_top_issue_rows(metrics, "overstock", top_n))
+    return TopSkuShareResponse(items=_top_issue_rows(metrics, "overstock", top_n, view_type))
 
 
 @router.get("/understock", response_model=TopSkuShareResponse)
@@ -820,9 +1039,10 @@ async def get_understock(
         date_from,
         date_to,
     )
-    return TopSkuShareResponse(items=_top_issue_rows(metrics, "understock", top_n))
+    return TopSkuShareResponse(items=_top_issue_rows(metrics, "understock", top_n, view_type))
 
 
+@router.get("/out-of-stock/", response_model=OutOfStockResponse, include_in_schema=False)
 @router.get("/out-of-stock", response_model=OutOfStockResponse)
 async def get_out_of_stock(
     db: DBSession,
@@ -856,7 +1076,8 @@ async def get_health_index_information_icon(
     return HealthIndexInformationResponse(
         healthy="90-110",
         normal="70-90 или 110-130",
-        critical="меньше 70 или больше 130",
+        critical_understock="меньше 70: критический недостаток запаса относительно нормы",
+        critical_overstock="больше 130: критический избыток запаса относительно нормы",
     )
 
 

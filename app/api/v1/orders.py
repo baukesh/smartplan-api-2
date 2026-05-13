@@ -9,6 +9,7 @@ from app.api.date_params import parse_query_date
 from app.api.deps import CurrentUser, DBSession, is_admin
 from app.api.v1.uploads import (
     _accumulate_changed_keys,
+    _clear_latency_caches,
     _expand_changed_keys,
     _schedule_materialized_refresh,
 )
@@ -455,6 +456,7 @@ async def update_order_statuses(
         }
         for owner_id in owner_ids:
             await refresh_orders_aggregated(db, owner_user_id=owner_id)
+    await _clear_latency_caches()
 
     return {"rows_updated": updated}
 
@@ -699,6 +701,7 @@ async def patch_order_details(
     await db.commit()
 
     await refresh_orders_aggregated(db, owner_user_id=owner_user_id)
+    await _clear_latency_caches()
     if payload.receival_date is not None:
         changed_keys = await _expand_changed_keys(
             db,

@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, datetime
 from io import BytesIO
 import math
 
@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from sqlalchemy import delete, func, select
 
 from app.api.deps import CurrentUser, DBSession, is_admin
+from app.core.ttl_cache import AsyncTTLCache
 from app.core.branch_localization import normalize_branch_lookup
 from app.models.data_uploads import Branch, HistoricalSalesMonthly, PriceList, Product, ProductBranch
 from app.models.derived import (
@@ -16,10 +17,14 @@ from app.models.derived import (
     DistributionSkuAdjustment,
     ForecastSalesMonthly,
 )
+from app.models.reporting import DPReport, DPReportForecastOverride
 
 router = APIRouter(prefix="/distribution", tags=["distribution"])
 
 PAGE_SIZE_MAP = {"10": 10, "50": 50, "100": 100, "all": None}
+_distribution_calc_cache: AsyncTTLCache[
+    tuple[date, list["_BranchSkuCalc"], dict[tuple[int, str], str], dict[tuple[int, str], str]]
+] = AsyncTTLCache(ttl_seconds=45.0, maxsize=64)
 DISTRIBUTION_DOWNLOAD_HEADERS = {
     "hub_name": "Хаб",
     "branch_name": "Склад",
@@ -27,6 +32,8 @@ DISTRIBUTION_DOWNLOAD_HEADERS = {
     "available_amount_kzt_per_branch": "Остаток ₸",
     "recommended_amount_kzt_per_branch": "Рекомендуемое распределение ₸",
     "adjusted_amount_kzt_per_branch": "Распределить в кол-ве",
+    "total_adjusted_volume_cbm_per_branch": "Объем распределения",
+    "total_adjusted_gross_weight_kg_per_branch": "Общий вес распределения",
     "readiness_for_target_per_branch": "Готовность к плану",
 }
 DISTRIBUTION_DETAILS_DOWNLOAD_HEADERS = {
@@ -45,10 +52,12 @@ DISTRIBUTION_DETAILS_DOWNLOAD_HEADERS = {
 class DistributionAggregateRow(BaseModel):
     hub_name: str
     branch_name: str
-    target_amount_dsp_per_branch: float
-    available_amount_kzt_per_branch: float
+    target_amount_dsp_per_branch: int
+    available_amount_kzt_per_branch: int
     recommended_amount_kzt_per_branch: float
     adjusted_amount_kzt_per_branch: float
+    total_adjusted_volume_cbm_per_branch: float
+    total_adjusted_gross_weight_kg_per_branch: float
     readiness_for_target_per_branch: int
 
 
@@ -69,6 +78,7 @@ class DistributionSummaryResponse(BaseModel):
     planning_date: str
     total_target_amount_dsp: float
     total_fact_amount_dsp: float
+    total_readiness_for_target: int
 
 
 class DistributionSummaryInformationIconResponse(BaseModel):
@@ -119,6 +129,7 @@ class DistributionDetailsSummaryResponse(BaseModel):
     branch_name: str
     total_adjusted_volume_cbm_per_branch: float
     total_adjusted_gross_weight_kg_per_branch: float
+    total_adjusted_amount_dsp_per_branch: float
 
 
 class DistributionBranchAdjustRow(BaseModel):
@@ -229,6 +240,64 @@ def _safe_readiness(numerator: float, denominator: float) -> int:
     return value
 
 
+def _target_amount_dsp(row: _BranchSkuCalc) -> float:
+    return float(row.stock_norm_target_qty) * row.pieces_in_master_carton * row.dsp
+
+
+def _available_amount_dsp(row: _BranchSkuCalc) -> float:
+    return float(row.available_qty) * row.pieces_in_master_carton * row.dsp
+
+
+def _recommended_amount_dsp(row: _BranchSkuCalc) -> float:
+    return float(row.recommended_qty) * row.pieces_in_master_carton * row.dsp
+
+
+def _potential_amount_dsp(row: _BranchSkuCalc) -> float:
+    target_qty = max(float(row.stock_norm_target_qty), 0.0)
+    available_qty = max(float(row.available_qty), 0.0)
+    return min(available_qty, target_qty) * row.pieces_in_master_carton * row.dsp
+
+
+def _adjusted_qty_for_row(
+    row: _BranchSkuCalc,
+    detail_adj_map: dict[tuple[int, str, str], int],
+) -> int:
+    adjustment_key = (row.owner_user_id, row.branch_id, row.sku_code)
+    if adjustment_key in detail_adj_map:
+        return int(detail_adj_map[adjustment_key])
+    return int(row.recommended_qty)
+
+
+def _adjusted_metrics_for_rows(
+    rows: list[_BranchSkuCalc],
+    detail_adj_map: dict[tuple[int, str, str], int],
+) -> tuple[float, float, float]:
+    total_volume = 0.0
+    total_gross_weight = 0.0
+    total_amount = 0.0
+    for row in rows:
+        adjusted = float(_adjusted_qty_for_row(row, detail_adj_map))
+        total_volume += adjusted * row.master_carton_volume_cbm
+        total_gross_weight += adjusted * row.master_carton_gross_weight_kg
+        total_amount += adjusted * row.pieces_in_master_carton * row.dsp
+    return round(total_volume, 2), round(total_gross_weight, 2), round(total_amount, 2)
+
+
+def _forecast_target_for_planning_month(
+    forecast_qty_by_key: dict[tuple[int, str, str, date], float],
+    owner_user_id: int,
+    branch_id: str,
+    sku_code: str,
+    planning_date: date,
+) -> float:
+    return float(
+        forecast_qty_by_key.get(
+            (owner_user_id, branch_id, sku_code, _month_start(planning_date)),
+            0.0,
+        )
+    )
+
+
 def _forecast_target_for_stock_norm(
     forecast_qty_by_key: dict[tuple[int, str, str, date], float],
     owner_user_id: int,
@@ -252,6 +321,82 @@ def _forecast_target_for_stock_norm(
         month_offset += 1
 
     return target_qty
+
+
+def _latest_report_by_owner(report_rows: list[DPReport]) -> dict[int, DPReport]:
+    latest: dict[int, DPReport] = {}
+    for report in report_rows:
+        owner_id = int(report.created_by_id or 0)
+        if owner_id <= 0:
+            continue
+        current = latest.get(owner_id)
+        report_updated = report.updated_at or report.created_at or datetime.min
+        current_updated = (
+            current.updated_at or current.created_at or datetime.min
+            if current is not None
+            else datetime.min
+        )
+        if current is None or (report_updated, int(report.id)) > (current_updated, int(current.id)):
+            latest[owner_id] = report
+    return latest
+
+
+def _override_specificity(row: DPReportForecastOverride) -> int:
+    return sum(
+        1
+        for value in [
+            row.branch_name,
+            row.brand,
+            row.category,
+            row.sub_category,
+            row.subline,
+            row.sku_name,
+        ]
+        if value
+    )
+
+
+def _apply_report_case_overrides_to_forecasts(
+    *,
+    forecast_atoms: list[dict],
+    report_rows: list[DPReport],
+    override_rows: list[DPReportForecastOverride],
+) -> None:
+    latest_reports = _latest_report_by_owner(report_rows)
+    latest_report_ids = {int(report.id) for report in latest_reports.values()}
+    if not latest_report_ids:
+        return
+
+    relevant_overrides = [
+        row
+        for row in override_rows
+        if int(row.report_id) in latest_report_ids
+        and row.metric_type == "adjusted_forecast_quantity_in_mc"
+    ]
+    for ov in sorted(relevant_overrides, key=lambda row: (_override_specificity(row), int(row.id))):
+        target_period = _month_start(ov.period)
+        matched = [
+            atom
+            for atom in forecast_atoms
+            if int(atom["owner_user_id"]) == int(ov.owner_user_id)
+            and atom["period"] == target_period
+            and (ov.branch_name is None or atom["branch_name"] == ov.branch_name)
+            and (ov.brand is None or atom["brand"] == ov.brand)
+            and (ov.category is None or atom["category"] == ov.category)
+            and (ov.sub_category is None or atom["sub_category"] == ov.sub_category)
+            and (ov.subline is None or atom["subline"] == ov.subline)
+            and (ov.sku_name is None or atom["sku_name"] == ov.sku_name)
+        ]
+        if not matched:
+            continue
+        baseline_sum = sum(float(atom["baseline_qty"]) for atom in matched)
+        if baseline_sum > 0:
+            for atom in matched:
+                atom["effective_qty"] = float(ov.value) * (float(atom["baseline_qty"]) / baseline_sum)
+        else:
+            even_share = float(ov.value) / len(matched)
+            for atom in matched:
+                atom["effective_qty"] = even_share
 
 
 def _format_ru_month_year_short(value: date) -> str:
@@ -313,7 +458,26 @@ async def _resolve_planning_date(db: DBSession, user: CurrentUser) -> date:
     return _add_months(_month_start(max_hist), 1)
 
 
+def _user_cache_scope(user: CurrentUser) -> tuple[str, int]:
+    return ("admin" if is_admin(user) else "user", int(user.id))
+
+
+async def clear_distribution_cache() -> None:
+    await _distribution_calc_cache.clear()
+
+
 async def _build_distribution_calc(
+    db: DBSession,
+    user: CurrentUser,
+) -> tuple[date, list[_BranchSkuCalc], dict[tuple[int, str], str], dict[tuple[int, str], str]]:
+    key = (*_user_cache_scope(user), "distribution-calc")
+    return await _distribution_calc_cache.get_or_set(
+        key,
+        lambda: _build_distribution_calc_uncached(db, user),
+    )
+
+
+async def _build_distribution_calc_uncached(
     db: DBSession,
     user: CurrentUser,
 ) -> tuple[date, list[_BranchSkuCalc], dict[tuple[int, str], str], dict[tuple[int, str], str]]:
@@ -324,18 +488,21 @@ async def _build_distribution_calc(
     b_stmt = select(Branch)
     pr_stmt = select(PriceList)
     fs_stmt = select(ForecastSalesMonthly)
+    report_stmt = select(DPReport).where(DPReport.is_deleted.is_(False))
     if not is_admin(user):
         hs_stmt = hs_stmt.where(HistoricalSalesMonthly.owner_user_id == user.id)
         p_stmt = p_stmt.where(Product.owner_user_id == user.id)
         b_stmt = b_stmt.where(Branch.owner_user_id == user.id)
         pr_stmt = pr_stmt.where(PriceList.owner_user_id == user.id)
         fs_stmt = fs_stmt.where(ForecastSalesMonthly.owner_user_id == user.id)
+        report_stmt = report_stmt.where(DPReport.created_by_id == user.id)
 
     hist_rows = (await db.execute(hs_stmt)).scalars().all()
     product_rows = (await db.execute(p_stmt)).scalars().all()
     branch_rows = (await db.execute(b_stmt)).scalars().all()
     price_rows = (await db.execute(pr_stmt)).scalars().all()
     forecast_rows = (await db.execute(fs_stmt)).scalars().all()
+    report_rows = (await db.execute(report_stmt)).scalars().all()
 
     product_by_key = {(p.owner_user_id, str(p.sku_code or "").strip()): p for p in product_rows}
     default_stock_norm_days_by_key = {
@@ -392,18 +559,66 @@ async def _build_distribution_calc(
                 float(r.fact_quantity_in_mc or 0.0)
             )
     f3_by_key: dict[tuple[int, str, str], list[float]] = {}
-    forecast_qty_by_key: dict[tuple[int, str, str, date], float] = {}
+    forecast_atoms: list[dict] = []
     for r in forecast_rows:
         m = _month_start(r.date)
-        qty = (
+        sku_code = str(r.sku_code or "").strip()
+        product = product_by_key.get((r.owner_user_id, sku_code))
+        baseline_qty = float(r.baseline_forecast_quantity_in_mc or 0.0)
+        effective_qty = (
             float(r.adjusted_forecast_quantity_in_mc)
             if r.adjusted_forecast_quantity_in_mc is not None
-            else float(r.baseline_forecast_quantity_in_mc or 0.0)
+            else baseline_qty
         )
-        forecast_key = (r.owner_user_id, str(r.branch_id).strip(), str(r.sku_code or "").strip(), m)
+        branch_id = str(r.branch_id).strip()
+        forecast_atoms.append(
+            {
+                "owner_user_id": int(r.owner_user_id),
+                "branch_id": branch_id,
+                "branch_name": branch_name_map.get((r.owner_user_id, branch_id), branch_id),
+                "period": m,
+                "sku_code": sku_code,
+                "sku_name": str(product.sku_name) if product is not None else "",
+                "brand": str(product.brand) if product is not None else "",
+                "category": str(product.category) if product is not None else "",
+                "sub_category": str(product.sub_category) if product is not None else "",
+                "subline": str(product.sub_line) if product is not None else "",
+                "baseline_qty": baseline_qty,
+                "effective_qty": effective_qty,
+            }
+        )
+
+    report_ids = [int(report.id) for report in report_rows]
+    override_rows: list[DPReportForecastOverride] = []
+    if report_ids:
+        override_stmt = select(DPReportForecastOverride).where(
+            DPReportForecastOverride.report_id.in_(report_ids),
+            DPReportForecastOverride.metric_type == "adjusted_forecast_quantity_in_mc",
+        )
+        if not is_admin(user):
+            override_stmt = override_stmt.where(DPReportForecastOverride.owner_user_id == user.id)
+        override_rows = (await db.execute(override_stmt)).scalars().all()
+    _apply_report_case_overrides_to_forecasts(
+        forecast_atoms=forecast_atoms,
+        report_rows=report_rows,
+        override_rows=override_rows,
+    )
+
+    forecast_qty_by_key: dict[tuple[int, str, str, date], float] = {}
+    for atom in forecast_atoms:
+        qty = float(atom["effective_qty"])
+        forecast_key = (
+            int(atom["owner_user_id"]),
+            str(atom["branch_id"]),
+            str(atom["sku_code"]),
+            atom["period"],
+        )
         forecast_qty_by_key[forecast_key] = forecast_qty_by_key.get(forecast_key, 0.0) + qty
-        if m in f3_months:
-            f3_by_key.setdefault((r.owner_user_id, str(r.branch_id).strip(), str(r.sku_code or "").strip()), []).append(qty)
+        if atom["period"] in f3_months:
+            f3_by_key.setdefault(
+                (int(atom["owner_user_id"]), str(atom["branch_id"]), str(atom["sku_code"])),
+                [],
+            ).append(qty)
 
     # Aggregate latest rows by branch+sku.
     branch_sku_rows: dict[tuple[int, str, str], dict[str, float | str | date]] = {}
@@ -429,7 +644,8 @@ async def _build_distribution_calc(
         if not str(existing["hub_name"]).strip():
             existing["hub_name"] = str(r.hub_name or "").strip() or "KZ-HUB"
 
-    # Branch-level stock norm from branch_stock_norm upload table.
+    # Branch-level stock norm is used only for recommendation need, not for the
+    # displayed target/readiness calculations.
     branch_norm_stmt = select(ProductBranch)
     if not is_admin(user):
         branch_norm_stmt = branch_norm_stmt.where(ProductBranch.owner_user_id == user.id)
@@ -439,15 +655,23 @@ async def _build_distribution_calc(
         for r in branch_norm_rows
     }
 
-    # Unconstrained need per branch+sku and proportional allocation from hub pool.
+    # Unconstrained recommendation need per branch+sku and proportional allocation
+    # from hub pool. Displayed target/readiness still use planning-month target only.
     need_by_hub_sku: dict[tuple[int, str, str], dict[str, int]] = {}
     stock_norm_target_by_branch_sku: dict[tuple[int, str, str], float] = {}
     for (owner_id, branch_id, sku_code), vals in branch_sku_rows.items():
+        planning_month_target_qty = _forecast_target_for_planning_month(
+            forecast_qty_by_key=forecast_qty_by_key,
+            owner_user_id=owner_id,
+            branch_id=branch_id,
+            sku_code=sku_code,
+            planning_date=planning_date,
+        )
         stock_norm_days = branch_norm_days_by_key.get(
             (owner_id, branch_id, sku_code),
             float(default_stock_norm_days_by_key.get((owner_id, sku_code), 0.0)),
         )
-        stock_norm_target_qty = _forecast_target_for_stock_norm(
+        recommendation_target_qty = _forecast_target_for_stock_norm(
             forecast_qty_by_key=forecast_qty_by_key,
             owner_user_id=owner_id,
             branch_id=branch_id,
@@ -455,8 +679,8 @@ async def _build_distribution_calc(
             planning_date=planning_date,
             stock_norm_days=stock_norm_days,
         )
-        stock_norm_target_by_branch_sku[(owner_id, branch_id, sku_code)] = stock_norm_target_qty
-        need_qty = max(int(math.ceil(stock_norm_target_qty - float(vals["available_qty"]))), 0)
+        stock_norm_target_by_branch_sku[(owner_id, branch_id, sku_code)] = planning_month_target_qty
+        need_qty = max(int(math.ceil(recommendation_target_qty - float(vals["available_qty"]))), 0)
         hub_name = str(vals["hub_name"]).strip() or "KZ-HUB"
         need_by_hub_sku.setdefault((owner_id, hub_name, sku_code), {})[branch_id] = need_qty
 
@@ -528,22 +752,36 @@ async def get_distribution_aggregated(
         (r.owner_user_id, str(r.branch_id).strip()): float(r.adjusted_amount_kzt_per_branch or 0.0)
         for r in adj_rows
     }
+    detail_adj_stmt = select(DistributionSkuAdjustment).where(DistributionSkuAdjustment.planning_date == planning_date)
+    if not is_admin(user):
+        detail_adj_stmt = detail_adj_stmt.where(DistributionSkuAdjustment.owner_user_id == user.id)
+    detail_adj_rows = (await db.execute(detail_adj_stmt)).scalars().all()
+    detail_adj_map = {
+        (r.owner_user_id, str(r.branch_id).strip(), str(r.sku_code or "").strip()): _qty_int(r.adjusted_quantity_in_mc)
+        for r in detail_adj_rows
+    }
 
     buckets: dict[tuple[int, str, str, str], dict[str, float]] = {}
+    rows_by_branch: dict[tuple[int, str, str, str], list[_BranchSkuCalc]] = {}
     for r in calc_rows:
         key = (r.owner_user_id, r.branch_id, r.branch_name, r.hub_name)
+        rows_by_branch.setdefault(key, []).append(r)
         if key not in buckets:
             buckets[key] = {
                 "available_amount": 0.0,
                 "recommended_amount": 0.0,
+                "target_amount": 0.0,
+                "potential_amount": 0.0,
             }
         b = buckets[key]
-        b["available_amount"] += float(r.available_qty) * r.pieces_in_master_carton * r.dsp
-        b["recommended_amount"] += float(r.recommended_qty) * r.pieces_in_master_carton * r.dsp
+        b["available_amount"] += _available_amount_dsp(r)
+        b["recommended_amount"] += _recommended_amount_dsp(r)
+        b["target_amount"] += _target_amount_dsp(r)
+        b["potential_amount"] += _potential_amount_dsp(r)
 
     rows: list[DistributionAggregateRow] = []
     for (owner_id, branch_id, branch_name_value, hub_name), vals in buckets.items():
-        target_amount = float(vals["available_amount"]) + float(vals["recommended_amount"])
+        target_amount = float(vals["target_amount"])
         explicit_adjustment_key = (owner_id, branch_id)
         readiness_adjusted_amount = float(branch_adj_map.get(explicit_adjustment_key, 0.0))
         display_adjusted_amount = (
@@ -552,17 +790,23 @@ async def get_distribution_aggregated(
             else float(vals["recommended_amount"])
         )
         readiness = _safe_readiness(
-            numerator=float(vals["available_amount"]) + readiness_adjusted_amount,
+            numerator=float(vals["potential_amount"]),
             denominator=target_amount,
+        )
+        adjusted_volume, adjusted_gross_weight, _adjusted_amount = _adjusted_metrics_for_rows(
+            rows_by_branch.get((owner_id, branch_id, branch_name_value, hub_name), []),
+            detail_adj_map,
         )
         rows.append(
             DistributionAggregateRow(
                 hub_name=hub_name,
                 branch_name=branch_name_value,
-                target_amount_dsp_per_branch=round(target_amount, 2),
-                available_amount_kzt_per_branch=round(float(vals["available_amount"]), 2),
+                target_amount_dsp_per_branch=_qty_int(target_amount),
+                available_amount_kzt_per_branch=_qty_int(vals["available_amount"]),
                 recommended_amount_kzt_per_branch=round(float(vals["recommended_amount"]), 2),
                 adjusted_amount_kzt_per_branch=round(display_adjusted_amount, 2),
+                total_adjusted_volume_cbm_per_branch=adjusted_volume,
+                total_adjusted_gross_weight_kg_per_branch=adjusted_gross_weight,
                 readiness_for_target_per_branch=int(readiness),
             )
         )
@@ -610,12 +854,13 @@ async def get_distribution_summary(
     user: CurrentUser,
 ) -> DistributionSummaryResponse:
     planning_date, calc_rows, _, _ = await _build_distribution_calc(db, user)
-    total_target = sum(float(r.target_qty) * r.pieces_in_master_carton * r.dsp for r in calc_rows)
-    total_fact = sum(float(r.fact_qty) * r.pieces_in_master_carton * r.dsp for r in calc_rows)
+    total_target = sum(_target_amount_dsp(r) for r in calc_rows)
+    total_fact = sum(_potential_amount_dsp(r) for r in calc_rows)
     return DistributionSummaryResponse(
         planning_date=planning_date.isoformat(),
         total_target_amount_dsp=round(total_target, 2),
         total_fact_amount_dsp=round(total_fact, 2),
+        total_readiness_for_target=_safe_readiness(total_fact, total_target),
     )
 
 
@@ -756,17 +1001,10 @@ async def get_distribution_details_summary(
     if not selected_rows:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Филиал не найден")
 
-    total_volume = 0.0
-    total_gross_weight = 0.0
-    for r in selected_rows:
-        adjustment_key = (r.owner_user_id, r.branch_id, r.sku_code)
-        adjusted = float(
-            detail_adj_map[adjustment_key]
-            if adjustment_key in detail_adj_map
-            else r.recommended_qty
-        )
-        total_volume += adjusted * r.master_carton_volume_cbm
-        total_gross_weight += adjusted * r.master_carton_gross_weight_kg
+    total_volume, total_gross_weight, total_adjusted_amount = _adjusted_metrics_for_rows(
+        selected_rows,
+        detail_adj_map,
+    )
 
     first = selected_rows[0]
     return DistributionDetailsSummaryResponse(
@@ -775,6 +1013,7 @@ async def get_distribution_details_summary(
         branch_name=first.branch_name,
         total_adjusted_volume_cbm_per_branch=round(total_volume, 2),
         total_adjusted_gross_weight_kg_per_branch=round(total_gross_weight, 2),
+        total_adjusted_amount_dsp_per_branch=round(total_adjusted_amount, 2),
     )
 
 
@@ -883,6 +1122,7 @@ async def patch_distribution_branch_adjustments(
             )
             updated += 1
     await db.commit()
+    await clear_distribution_cache()
     return {"rows_updated": updated}
 
 
@@ -945,6 +1185,7 @@ async def patch_distribution_detail_adjustments(
                 )
             updated += 1
     await db.commit()
+    await clear_distribution_cache()
     return {"rows_updated": updated}
 
 

@@ -10,12 +10,22 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.branch_localization import localize_branch_name, normalize_branch_lookup
+from app.core.ttl_cache import AsyncTTLCache
 from app.models.data_uploads import Branch, HistoricalSalesMonthly, PriceList, Product
 from app.models.derived import ForecastSalesMonthly
 from app.models.reporting import DPReport, DPReportForecastOverride
 
 
 VALID_VIEW_TYPES = {"dsp", "invoice price", "cases", "gross weight", "net weight"}
+_owner_report_source_cache: AsyncTTLCache["ReportOwnerSource"] = AsyncTTLCache(
+    ttl_seconds=120.0,
+    maxsize=32,
+    copy_values=False,
+)
+_report_tables_cache: AsyncTTLCache[tuple[list[dict], list[dict]]] = AsyncTTLCache(ttl_seconds=120.0, maxsize=128)
+_branch_filter_options_cache: AsyncTTLCache[list[str]] = AsyncTTLCache(ttl_seconds=120.0, maxsize=128)
+_hub_filter_options_cache: AsyncTTLCache[list[str]] = AsyncTTLCache(ttl_seconds=120.0, maxsize=128)
+_sku_status_filter_options_cache: AsyncTTLCache[list[str]] = AsyncTTLCache(ttl_seconds=120.0, maxsize=128)
 VALID_OVERRIDE_METRICS = {
     "adjusted_forecast_quantity_in_mc": "baseline_forecast_quantity_in_mc",
     "adjusted_forecast_gross_weight_kg": "baseline_forecast_gross_weight_kg",
@@ -42,6 +52,14 @@ class ReportingContext:
     branch_filter: list[str]
     hub_filter: list[str]
     view_type: str
+
+
+@dataclass
+class ReportOwnerSource:
+    product_map: dict[str, Product]
+    branch_name_by_id: dict[str, str]
+    hist_rows: list[HistoricalSalesMonthly]
+    price_rows: list[PriceList]
 
 
 def _month_start(d: date) -> date:
@@ -183,7 +201,11 @@ def _matches_filters(
     categories = {v for v in product_filter.get("categories", []) if v}
     sub_categories = {v for v in product_filter.get("sub_categories", []) if v}
     sublines = {v for v in product_filter.get("sublines", []) if v}
-    sku_statuses = {v for v in product_filter.get("sku_statuses", []) if v}
+    sku_statuses = {
+        str(v).strip().lower()
+        for v in product_filter.get("sku_statuses", [])
+        if str(v).strip()
+    }
 
     if sku_codes and product.sku_code not in sku_codes:
         return False
@@ -197,21 +219,44 @@ def _matches_filters(
         return False
     if sublines and product.sub_line not in sublines:
         return False
-    if sku_statuses and product.status not in sku_statuses:
+    if sku_statuses and str(product.status or "").strip().lower() not in sku_statuses:
         return False
     return True
 
 
 async def _load_owner_maps(db: AsyncSession, owner_user_id: int) -> tuple[dict[str, Product], dict[str, str]]:
+    source = await _load_owner_report_source(db, owner_user_id)
+    return source.product_map, source.branch_name_by_id
+
+
+async def _load_owner_report_source(db: AsyncSession, owner_user_id: int) -> ReportOwnerSource:
+    return await _owner_report_source_cache.get_or_set(
+        ("owner-report-source", owner_user_id),
+        lambda: _load_owner_report_source_uncached(db, owner_user_id),
+    )
+
+
+async def _load_owner_report_source_uncached(db: AsyncSession, owner_user_id: int) -> ReportOwnerSource:
     products = (
         await db.execute(select(Product).where(Product.owner_user_id == owner_user_id))
     ).scalars().all()
     branches = (
         await db.execute(select(Branch).where(Branch.owner_user_id == owner_user_id))
     ).scalars().all()
-    product_map = {str(p.sku_code).strip(): p for p in products}
-    branch_name_by_id = {b.branch_id: b.branch_name for b in branches}
-    return product_map, branch_name_by_id
+    hist_rows = (
+        await db.execute(
+            select(HistoricalSalesMonthly).where(HistoricalSalesMonthly.owner_user_id == owner_user_id)
+        )
+    ).scalars().all()
+    price_rows = (
+        await db.execute(select(PriceList).where(PriceList.owner_user_id == owner_user_id))
+    ).scalars().all()
+    return ReportOwnerSource(
+        product_map={str(p.sku_code).strip(): p for p in products},
+        branch_name_by_id={b.branch_id: b.branch_name for b in branches},
+        hist_rows=hist_rows,
+        price_rows=price_rows,
+    )
 
 
 def _build_branch_hub_maps(
@@ -240,8 +285,57 @@ def _build_branch_hub_maps(
     )
 
 
-def _is_exit_sku_status(value: str | None) -> bool:
-    return str(value or "").strip().lower() == "на вывод"
+def _has_product_filters(product_filter: dict) -> bool:
+    return any(
+        str(v).strip()
+        for key in (
+            "sku_codes",
+            "sku_names",
+            "brands",
+            "categories",
+            "sub_categories",
+            "sublines",
+            "sku_statuses",
+        )
+        for v in (product_filter.get(key) or [])
+    )
+
+
+def _sku_codes_for_product_filter(product_map: dict[str, Product], product_filter: dict) -> set[str] | None:
+    if not _has_product_filters(product_filter):
+        return None
+    return {
+        sku_code
+        for sku_code, product in product_map.items()
+        if _matches_filters(product, "", product_filter, [])
+    }
+
+
+def _filter_key(product_filter: dict) -> tuple:
+    return tuple(
+        (key, tuple(sorted(str(v).strip() for v in (product_filter.get(key) or []) if str(v).strip())))
+        for key in (
+            "sku_codes",
+            "sku_names",
+            "brands",
+            "categories",
+            "sub_categories",
+            "sublines",
+            "sku_statuses",
+        )
+    )
+
+
+def _list_key(values: list[str] | None) -> tuple[str, ...]:
+    return tuple(sorted(str(v).strip() for v in (values or []) if str(v).strip()))
+
+
+async def clear_reporting_service_caches() -> None:
+    await _owner_report_source_cache.clear()
+    await _report_tables_cache.clear()
+    await _branch_filter_options_cache.clear()
+    await _hub_filter_options_cache.clear()
+    await _sku_status_filter_options_cache.clear()
 
 
 async def build_branch_filter_options(
@@ -250,15 +344,30 @@ async def build_branch_filter_options(
     product_filter: dict,
     hub_filter: list[str],
 ) -> list[str]:
+    key = ("branch-options", owner_user_id, _filter_key(product_filter), _list_key(hub_filter))
+    return await _branch_filter_options_cache.get_or_set(
+        key,
+        lambda: _build_branch_filter_options_uncached(db, owner_user_id, product_filter, hub_filter),
+    )
+
+
+async def _build_branch_filter_options_uncached(
+    db: AsyncSession,
+    owner_user_id: int,
+    product_filter: dict,
+    hub_filter: list[str],
+) -> list[str]:
     """Branch dropdown options: respect product + hub (and other product facets), but not branch (Excel-style)."""
-    product_map, branch_name_by_id = await _load_owner_maps(db, owner_user_id)
-    hist_rows = (
-        await db.execute(
-            select(HistoricalSalesMonthly).where(
-                HistoricalSalesMonthly.owner_user_id == owner_user_id
-            )
-        )
-    ).scalars().all()
+    source = await _load_owner_report_source(db, owner_user_id)
+    product_map = source.product_map
+    branch_name_by_id = source.branch_name_by_id
+    allowed_sku_codes = _sku_codes_for_product_filter(product_map, product_filter)
+    if allowed_sku_codes == set():
+        return []
+    hist_rows = [
+        row for row in source.hist_rows
+        if allowed_sku_codes is None or str(row.sku_code or row.sku_id or "").strip() in allowed_sku_codes
+    ]
     branch_hub_by_sku_branch, branch_hub_by_branch = _build_branch_hub_maps(hist_rows)
 
     values: set[str] = set()
@@ -297,15 +406,29 @@ async def build_hub_filter_options(
     owner_user_id: int,
     product_filter: dict,
 ) -> list[str]:
+    key = ("hub-options", owner_user_id, _filter_key(product_filter))
+    return await _hub_filter_options_cache.get_or_set(
+        key,
+        lambda: _build_hub_filter_options_uncached(db, owner_user_id, product_filter),
+    )
+
+
+async def _build_hub_filter_options_uncached(
+    db: AsyncSession,
+    owner_user_id: int,
+    product_filter: dict,
+) -> list[str]:
     """Hub dropdown options: respect product + SKU facets, but not branch (Excel-style)."""
-    product_map, branch_name_by_id = await _load_owner_maps(db, owner_user_id)
-    hist_rows = (
-        await db.execute(
-            select(HistoricalSalesMonthly).where(
-                HistoricalSalesMonthly.owner_user_id == owner_user_id
-            )
-        )
-    ).scalars().all()
+    source = await _load_owner_report_source(db, owner_user_id)
+    product_map = source.product_map
+    branch_name_by_id = source.branch_name_by_id
+    allowed_sku_codes = _sku_codes_for_product_filter(product_map, product_filter)
+    if allowed_sku_codes == set():
+        return []
+    hist_rows = [
+        row for row in source.hist_rows
+        if allowed_sku_codes is None or str(row.sku_code or row.sku_id or "").strip() in allowed_sku_codes
+    ]
 
     values: set[str] = set()
     for row in hist_rows:
@@ -340,19 +463,41 @@ async def build_sku_status_filter_options(
     branch_filter: list[str],
     hub_filter: list[str],
 ) -> list[str]:
-    product_map, branch_name_by_id = await _load_owner_maps(db, owner_user_id)
-    hist_rows = (
-        await db.execute(
-            select(HistoricalSalesMonthly).where(
-                HistoricalSalesMonthly.owner_user_id == owner_user_id
-            )
-        )
-    ).scalars().all()
-    branch_hub_by_sku_branch, branch_hub_by_branch = _build_branch_hub_maps(hist_rows)
+    key = (
+        "sku-status-options",
+        owner_user_id,
+        _filter_key(product_filter),
+        _list_key(branch_filter),
+        _list_key(hub_filter),
+    )
+    return await _sku_status_filter_options_cache.get_or_set(
+        key,
+        lambda: _build_sku_status_filter_options_uncached(db, owner_user_id, product_filter, branch_filter, hub_filter),
+    )
+
+
+async def _build_sku_status_filter_options_uncached(
+    db: AsyncSession,
+    owner_user_id: int,
+    product_filter: dict,
+    branch_filter: list[str],
+    hub_filter: list[str],
+) -> list[str]:
+    source = await _load_owner_report_source(db, owner_user_id)
+    product_map = source.product_map
+    branch_name_by_id = source.branch_name_by_id
     product_filter_without_status = {
         **product_filter,
         "sku_statuses": [],
     }
+    allowed_sku_codes = _sku_codes_for_product_filter(product_map, product_filter_without_status)
+    if allowed_sku_codes == set():
+        return []
+    hist_rows = [
+        row for row in source.hist_rows
+        if allowed_sku_codes is None or str(row.sku_code or row.sku_id or "").strip() in allowed_sku_codes
+    ]
+    branch_hub_by_sku_branch, branch_hub_by_branch = _build_branch_hub_maps(hist_rows)
 
     values: set[str] = set()
     for row in hist_rows:
@@ -426,18 +571,58 @@ async def build_report_tables(
     ctx: ReportingContext,
     report_id: int | None = None,
 ) -> tuple[list[dict], list[dict]]:
-    product_map, branch_name_by_id = await _load_owner_maps(db, owner_user_id)
-    all_hist_rows = (
-        await db.execute(
-            select(HistoricalSalesMonthly).where(
-                HistoricalSalesMonthly.owner_user_id == owner_user_id
+    key = (
+        "report-tables",
+        owner_user_id,
+        report_id,
+        ctx.planning_month.isoformat(),
+        ctx.date_from.isoformat(),
+        ctx.date_to.isoformat(),
+        _filter_key(ctx.product_filter),
+        _list_key(ctx.branch_filter),
+        _list_key(ctx.hub_filter),
+    )
+    return await _report_tables_cache.get_or_set(
+        key,
+        lambda: _build_report_tables_uncached(db, owner_user_id, ctx, report_id),
+    )
+
+
+async def _build_report_tables_uncached(
+    db: AsyncSession,
+    owner_user_id: int,
+    ctx: ReportingContext,
+    report_id: int | None = None,
+) -> tuple[list[dict], list[dict]]:
+    source = await _load_owner_report_source(db, owner_user_id)
+    product_map = source.product_map
+    branch_name_by_id = source.branch_name_by_id
+    allowed_sku_codes = _sku_codes_for_product_filter(product_map, ctx.product_filter)
+    if allowed_sku_codes == set():
+        return [], []
+    override_rows: list[DPReportForecastOverride] = []
+    if report_id is not None:
+        override_rows = (
+            await db.execute(
+                select(DPReportForecastOverride).where(
+                    DPReportForecastOverride.report_id == report_id,
+                    DPReportForecastOverride.owner_user_id == owner_user_id,
+                )
             )
-        )
-    ).scalars().all()
+        ).scalars().all()
+    # Overrides must be distributed over their full saved scope before transient
+    # product filters are applied for display; otherwise a filtered subset can
+    # receive the full override value and look inflated.
+    source_sku_codes = None if override_rows else allowed_sku_codes
+    all_hist_rows = [
+        row for row in source.hist_rows
+        if source_sku_codes is None or str(row.sku_code or row.sku_id or "").strip() in source_sku_codes
+    ]
     branch_hub_by_sku_branch, branch_hub_by_branch = _build_branch_hub_maps(all_hist_rows)
-    price_rows = (
-        await db.execute(select(PriceList).where(PriceList.owner_user_id == owner_user_id))
-    ).scalars().all()
+    price_rows = [
+        row for row in source.price_rows
+        if source_sku_codes is None or str(row.sku_code or "").strip() in source_sku_codes
+    ]
     prices_by_sku: dict[str, list[PriceList]] = defaultdict(list)
     for row in price_rows:
         prices_by_sku[str(row.sku_code or "").strip()].append(row)
@@ -462,15 +647,10 @@ async def build_report_tables(
         best = _closest_price(sku_code, target_month)
         return float(best.invoice_price or 0.0) if best is not None else 0.0
 
-    hist_rows = (
-        await db.execute(
-            select(HistoricalSalesMonthly).where(
-                HistoricalSalesMonthly.owner_user_id == owner_user_id,
-                HistoricalSalesMonthly.date >= ctx.date_from,
-                HistoricalSalesMonthly.date <= ctx.date_to,
-            )
-        )
-    ).scalars().all()
+    hist_rows = [
+        row for row in all_hist_rows
+        if row.date >= ctx.date_from and row.date <= ctx.date_to
+    ]
 
     hist_buckets: dict[tuple, dict] = {}
     historical_hub_stock_by_period: dict[str, dict[str, float]] = {}
@@ -648,14 +828,15 @@ async def build_report_tables(
             float(hub_stock.get("past_hub_stock_invoice_amount_kzt", 0.0) or 0.0), 2
         )
 
+    fc_stmt = select(ForecastSalesMonthly).where(
+        ForecastSalesMonthly.owner_user_id == owner_user_id,
+        ForecastSalesMonthly.date >= ctx.date_from,
+        ForecastSalesMonthly.date <= ctx.date_to,
+    )
+    if source_sku_codes is not None:
+        fc_stmt = fc_stmt.where(ForecastSalesMonthly.sku_code.in_(source_sku_codes))
     fc_rows = (
-        await db.execute(
-            select(ForecastSalesMonthly).where(
-                ForecastSalesMonthly.owner_user_id == owner_user_id,
-                ForecastSalesMonthly.date >= ctx.date_from,
-                ForecastSalesMonthly.date <= ctx.date_to,
-            )
-        )
+        await db.execute(fc_stmt)
     ).scalars().all()
 
     atomic_rows: list[dict] = []
@@ -679,9 +860,6 @@ async def build_report_tables(
             if r.adjusted_forecast_quantity_in_mc is not None
             else baseline_qty
         )
-        if _is_exit_sku_status(product.status):
-            baseline_qty = 0.0
-            adjusted_qty = 0.0
         atomic_rows.append(
             {
                 "period": _month_start(r.date).isoformat(),
@@ -695,23 +873,17 @@ async def build_report_tables(
                 "sku_name": product.sku_name,
                 "_product_obj": product,
                 "baseline_forecast_gross_weight_kg": (
-                    0.0
-                    if _is_exit_sku_status(product.status)
-                    else float(r.baseline_forecast_gross_weight_kg or 0.0)
+                    float(r.baseline_forecast_gross_weight_kg or 0.0)
                 ),
                 "baseline_forecast_net_weight_kg": (
                     baseline_qty
                     * float(product.master_carton_net_weight_kg or 0.0)
                 ),
                 "baseline_forecast_volume_cbm": (
-                    0.0
-                    if _is_exit_sku_status(product.status)
-                    else float(r.baseline_forecast_volume_cbm or 0.0)
+                    float(r.baseline_forecast_volume_cbm or 0.0)
                 ),
                 "baseline_forecast_amount_kzt": (
-                    0.0
-                    if _is_exit_sku_status(product.status)
-                    else float(r.baseline_forecast_amount_kzt or 0.0)
+                    float(r.baseline_forecast_amount_kzt or 0.0)
                 ),
                 "baseline_forecast_invoice_amount_kzt": (
                     baseline_qty
@@ -721,23 +893,17 @@ async def build_report_tables(
                 "baseline_forecast_quantity_in_mc": baseline_qty,
                 "adjusted_forecast_quantity_in_mc": adjusted_qty,
                 "adjusted_forecast_gross_weight_kg": (
-                    0.0
-                    if _is_exit_sku_status(product.status)
-                    else float(r.adjusted_forecast_gross_weight_kg) if r.adjusted_forecast_gross_weight_kg is not None else float(r.baseline_forecast_gross_weight_kg or 0.0)
+                    float(r.adjusted_forecast_gross_weight_kg) if r.adjusted_forecast_gross_weight_kg is not None else float(r.baseline_forecast_gross_weight_kg or 0.0)
                 ),
                 "adjusted_forecast_net_weight_kg": (
                     adjusted_qty
                     * float(product.master_carton_net_weight_kg or 0.0)
                 ),
                 "adjusted_forecast_volume_cbm": (
-                    0.0
-                    if _is_exit_sku_status(product.status)
-                    else float(r.adjusted_forecast_volume_cbm) if r.adjusted_forecast_volume_cbm is not None else float(r.baseline_forecast_volume_cbm or 0.0)
+                    float(r.adjusted_forecast_volume_cbm) if r.adjusted_forecast_volume_cbm is not None else float(r.baseline_forecast_volume_cbm or 0.0)
                 ),
                 "adjusted_forecast_amount_kzt": (
-                    0.0
-                    if _is_exit_sku_status(product.status)
-                    else float(r.adjusted_forecast_amount_kzt) if r.adjusted_forecast_amount_kzt is not None else float(r.baseline_forecast_amount_kzt or 0.0)
+                    float(r.adjusted_forecast_amount_kzt) if r.adjusted_forecast_amount_kzt is not None else float(r.baseline_forecast_amount_kzt or 0.0)
                 ),
                 "adjusted_forecast_invoice_amount_kzt": (
                     adjusted_qty
@@ -767,15 +933,7 @@ async def build_report_tables(
             }
         )
 
-    if report_id is not None:
-        override_rows = (
-            await db.execute(
-                select(DPReportForecastOverride).where(
-                    DPReportForecastOverride.report_id == report_id,
-                    DPReportForecastOverride.owner_user_id == owner_user_id,
-                )
-            )
-        ).scalars().all()
+    if override_rows:
         sorted_overrides = sorted(
             override_rows,
             key=lambda o: sum(
@@ -845,25 +1003,6 @@ async def build_report_tables(
             r["adjusted_forecast_volume_cbm"] = adjusted_qty * float(
                 product.master_carton_volume_cbm or 0.0
             )
-
-    for r in atomic_rows:
-        if not _is_exit_sku_status(r["_product_obj"].status):
-            continue
-        for metric in [
-            "baseline_forecast_quantity_in_mc",
-            "baseline_forecast_gross_weight_kg",
-            "baseline_forecast_net_weight_kg",
-            "baseline_forecast_volume_cbm",
-            "baseline_forecast_amount_kzt",
-            "baseline_forecast_invoice_amount_kzt",
-            "adjusted_forecast_quantity_in_mc",
-            "adjusted_forecast_gross_weight_kg",
-            "adjusted_forecast_net_weight_kg",
-            "adjusted_forecast_volume_cbm",
-            "adjusted_forecast_amount_kzt",
-            "adjusted_forecast_invoice_amount_kzt",
-        ]:
-            r[metric] = 0.0
 
     # Apply transient/saved filters only after override distribution so filtered views
     # receive their proportional adjusted share instead of full override totals.

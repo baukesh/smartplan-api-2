@@ -1,7 +1,9 @@
 from contextlib import asynccontextmanager
 import json
+import logging
+import time
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
@@ -25,7 +27,10 @@ from app.core.order_status import normalize_order_status
 from app.core.product_status import normalize_product_status
 from app.core.config import settings
 from app.core.database import engine
+from app.core.response_cache import CachedResponse, response_cache
 from app.models.base import Base
+
+logger = logging.getLogger(__name__)
 
 
 async def _column_exists(conn, table_name: str, column_name: str) -> bool:
@@ -484,6 +489,25 @@ async def _ensure_branch_names_russian(conn) -> None:
         )
 
 
+async def _ensure_performance_indexes(conn) -> None:
+    index_statements = [
+        "CREATE INDEX IF NOT EXISTS ix_hsm_owner_date_branch_sku ON historical_sales_monthly (owner_user_id, date, branch_id, sku_code)",
+        "CREATE INDEX IF NOT EXISTS ix_hsm_owner_branch_date ON historical_sales_monthly (owner_user_id, branch_id, date)",
+        "CREATE INDEX IF NOT EXISTS ix_hsm_owner_sku_date ON historical_sales_monthly (owner_user_id, sku_code, date)",
+        "CREATE INDEX IF NOT EXISTS ix_hsm_owner_hub_sku_date ON historical_sales_monthly (owner_user_id, hub_name, sku_code, date)",
+        "CREATE INDEX IF NOT EXISTS ix_fsm_owner_date_branch_sku ON forecast_sales_monthly (owner_user_id, date, branch_id, sku_code)",
+        "CREATE INDEX IF NOT EXISTS ix_fsm_owner_branch_sku_date ON forecast_sales_monthly (owner_user_id, branch_id, sku_code, date)",
+        "CREATE INDEX IF NOT EXISTS ix_product_branch_owner_branch_sku ON product_branch (owner_user_id, branch_id, sku_code)",
+        "CREATE INDEX IF NOT EXISTS ix_price_list_owner_sku_date ON price_list (owner_user_id, sku_code, date)",
+        "CREATE INDEX IF NOT EXISTS ix_dist_branch_adj_owner_date_branch ON distribution_branch_adjustments (owner_user_id, planning_date, branch_id)",
+        "CREATE INDEX IF NOT EXISTS ix_dist_sku_adj_owner_date_branch_sku ON distribution_sku_adjustments (owner_user_id, planning_date, branch_id, sku_code)",
+        "CREATE INDEX IF NOT EXISTS ix_dp_overrides_owner_report_period ON dp_report_forecast_overrides (owner_user_id, report_id, period)",
+        "CREATE INDEX IF NOT EXISTS ix_orders_owner_sku_receival ON placed_orders (owner_user_id, sku_code, receival_date)",
+    ]
+    for statement in index_statements:
+        await conn.execute(text(statement))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Create tables on startup for MVP; replace with Alembic in production
@@ -501,6 +525,7 @@ async def lifespan(app: FastAPI):
             await _ensure_product_owner_unique_sqlite(conn)
             await _ensure_numeric_health_index_columns_sqlite(conn)
         await _ensure_inventory_health_sku_code_column(conn)
+        await _ensure_performance_indexes(conn)
     yield
 
 
@@ -509,6 +534,69 @@ app = FastAPI(
     openapi_url=f"{settings.API_V1_PREFIX}/openapi.json",
     lifespan=lifespan,
 )
+
+
+@app.middleware("http")
+async def add_process_time_header(request: Request, call_next):
+    start = time.perf_counter()
+    cacheable_prefixes = (f"{settings.API_V1_PREFIX}/dashboard/", f"{settings.API_V1_PREFIX}/reports/")
+    cacheable_get = request.method == "GET" and request.url.path.startswith(cacheable_prefixes)
+    cache_key = None
+    if cacheable_get:
+        cache_key = (
+            "http-response",
+            request.headers.get("authorization", ""),
+            request.headers.get("x-api-key", ""),
+            request.url.path,
+            request.url.query,
+        )
+        cached = await response_cache.get(cache_key)
+        if cached is not None:
+            response = Response(
+                content=cached.body,
+                status_code=cached.status_code,
+                media_type=cached.media_type,
+                headers=cached.headers,
+            )
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            response.headers["X-Process-Time-Ms"] = str(round(elapsed_ms, 1))
+            response.headers["X-Cache"] = "HIT"
+            return response
+
+    response = await call_next(request)
+    if cache_key is not None and response.status_code == 200:
+        body = b"".join([chunk async for chunk in response.body_iterator])
+        headers = {
+            key: value
+            for key, value in response.headers.items()
+            if key.lower() not in {"content-length", "x-process-time-ms", "x-cache"}
+        }
+        cached_response = CachedResponse(
+            status_code=response.status_code,
+            media_type=response.media_type,
+            headers=headers,
+            body=body,
+        )
+        await response_cache.set(cache_key, cached_response)
+        response = Response(
+            content=body,
+            status_code=cached_response.status_code,
+            media_type=cached_response.media_type,
+            headers=headers,
+        )
+        response.headers["X-Cache"] = "MISS"
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+    response.headers["X-Process-Time-Ms"] = str(round(elapsed_ms, 1))
+    if elapsed_ms >= 500.0:
+        logger.info(
+            "slow_request method=%s path=%s query=%s status=%s elapsed_ms=%s",
+            request.method,
+            request.url.path,
+            request.url.query,
+            response.status_code,
+            round(elapsed_ms, 1),
+        )
+    return response
 
 allow_all_cors = settings.BACKEND_CORS_ALLOW_ALL
 app.add_middleware(
