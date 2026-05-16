@@ -5,7 +5,7 @@ import math
 import pandas as pd
 from fastapi import APIRouter, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import delete, func, select
 
 from app.api.deps import CurrentUser, DBSession, is_admin
@@ -71,6 +71,12 @@ class DistributionAggregateResponse(BaseModel):
 
 class DistributionAggregateFilterOptions(BaseModel):
     branch_name: list[str]
+    sku_code: list[str] = Field(default_factory=list)
+    sku_name: list[str] = Field(default_factory=list)
+    brand: list[str] = Field(default_factory=list)
+    category: list[str] = Field(default_factory=list)
+    sub_category: list[str] = Field(default_factory=list)
+    subline: list[str] = Field(default_factory=list)
     readiness_for_target_per_branch: list[int]
 
 
@@ -120,6 +126,10 @@ class DistributionDetailsResponse(BaseModel):
 class DistributionDetailsFilterOptions(BaseModel):
     sku_code: list[str]
     sku_name: list[str]
+    brand: list[str] = Field(default_factory=list)
+    category: list[str] = Field(default_factory=list)
+    sub_category: list[str] = Field(default_factory=list)
+    subline: list[str] = Field(default_factory=list)
     readiness_for_target_per_sku: list[int]
 
 
@@ -159,6 +169,10 @@ class _BranchSkuCalc(BaseModel):
     sku_id: str
     sku_code: str
     sku_name: str
+    brand: str
+    category: str
+    sub_category: str
+    subline: str
     date: date
     target_qty: float
     stock_norm_target_qty: float
@@ -213,6 +227,86 @@ def _branch_name_matches(query_value: str, branch_name: str, branch_id: str) -> 
         normalize_branch_lookup(query_value) == normalize_branch_lookup(branch_name)
         or str(query_value).strip() == str(branch_id).strip()
     )
+
+
+PRODUCT_FILTER_FIELDS = {
+    "sku_code": "sku_code",
+    "sku_name": "sku_name",
+    "brand": "brand",
+    "category": "category",
+    "sub_category": "sub_category",
+    "subline": "subline",
+}
+
+
+def _clean_filter_values(values: list[str] | None) -> set[str]:
+    return {str(v).strip() for v in (values or []) if str(v).strip()}
+
+
+def _product_filter_payload(
+    *,
+    sku_code: list[str] | None = None,
+    sku_name: list[str] | None = None,
+    brand: list[str] | None = None,
+    category: list[str] | None = None,
+    sub_category: list[str] | None = None,
+    subline: list[str] | None = None,
+) -> dict[str, set[str]]:
+    return {
+        "sku_code": _clean_filter_values(sku_code),
+        "sku_name": _clean_filter_values(sku_name),
+        "brand": _clean_filter_values(brand),
+        "category": _clean_filter_values(category),
+        "sub_category": _clean_filter_values(sub_category),
+        "subline": _clean_filter_values(subline),
+    }
+
+
+def _matches_product_filters(
+    row: _BranchSkuCalc,
+    product_filter: dict[str, set[str]],
+    *,
+    ignore_field: str | None = None,
+) -> bool:
+    for field_name in PRODUCT_FILTER_FIELDS:
+        if field_name == ignore_field:
+            continue
+        values = product_filter.get(field_name) or set()
+        if values and str(getattr(row, field_name) or "").strip() not in values:
+            return False
+    return True
+
+
+def _product_filter_options(
+    rows: list[_BranchSkuCalc],
+    product_filter: dict[str, set[str]],
+    *,
+    extra_match=None,
+) -> dict[str, list[str]]:
+    options: dict[str, list[str]] = {}
+    for option_name, attr_name in PRODUCT_FILTER_FIELDS.items():
+        values: set[str] = set()
+        for row in rows:
+            if not _matches_product_filters(row, product_filter, ignore_field=option_name):
+                continue
+            if extra_match is not None and not extra_match(row):
+                continue
+            value = str(getattr(row, attr_name) or "").strip()
+            if value:
+                values.add(value)
+        options[option_name] = sorted(values)
+    return options
+
+
+def _branch_matches_selected(branch_name: str, branch_filter: list[str] | None) -> bool:
+    if not branch_filter:
+        return True
+    branch_name_values = {
+        normalize_branch_lookup(v)
+        for v in branch_filter
+        if str(v).strip()
+    }
+    return normalize_branch_lookup(branch_name) in branch_name_values
 
 
 def _pick_dsp_for_sales_date(prices: list[PriceList], sales_date: date) -> float:
@@ -281,6 +375,202 @@ def _adjusted_metrics_for_rows(
         total_gross_weight += adjusted * row.master_carton_gross_weight_kg
         total_amount += adjusted * row.pieces_in_master_carton * row.dsp
     return round(total_volume, 2), round(total_gross_weight, 2), round(total_amount, 2)
+
+
+def _build_aggregate_rows(
+    *,
+    calc_rows: list[_BranchSkuCalc],
+    branch_adj_map: dict[tuple[int, str], float],
+    detail_adj_map: dict[tuple[int, str, str], int],
+) -> tuple[
+    list[DistributionAggregateRow],
+    dict[tuple[int, str, str, str], list[_BranchSkuCalc]],
+    dict[tuple[int, str, str, str], DistributionAggregateRow],
+]:
+    buckets: dict[tuple[int, str, str, str], dict[str, float]] = {}
+    rows_by_branch: dict[tuple[int, str, str, str], list[_BranchSkuCalc]] = {}
+    for row in calc_rows:
+        key = (row.owner_user_id, row.branch_id, row.branch_name, row.hub_name)
+        rows_by_branch.setdefault(key, []).append(row)
+        if key not in buckets:
+            buckets[key] = {
+                "available_amount": 0.0,
+                "recommended_amount": 0.0,
+                "target_amount": 0.0,
+                "potential_amount": 0.0,
+            }
+        bucket = buckets[key]
+        bucket["available_amount"] += _available_amount_dsp(row)
+        bucket["recommended_amount"] += _recommended_amount_dsp(row)
+        bucket["target_amount"] += _target_amount_dsp(row)
+        bucket["potential_amount"] += _potential_amount_dsp(row)
+
+    out: list[DistributionAggregateRow] = []
+    row_by_key: dict[tuple[int, str, str, str], DistributionAggregateRow] = {}
+    for (owner_id, branch_id, branch_name_value, hub_name), vals in buckets.items():
+        target_amount = float(vals["target_amount"])
+        explicit_adjustment_key = (owner_id, branch_id)
+        readiness_adjusted_amount = float(branch_adj_map.get(explicit_adjustment_key, 0.0))
+        display_adjusted_amount = (
+            readiness_adjusted_amount
+            if explicit_adjustment_key in branch_adj_map
+            else float(vals["recommended_amount"])
+        )
+        readiness = _safe_readiness(
+            numerator=float(vals["potential_amount"]),
+            denominator=target_amount,
+        )
+        adjusted_volume, adjusted_gross_weight, _adjusted_amount = _adjusted_metrics_for_rows(
+            rows_by_branch.get((owner_id, branch_id, branch_name_value, hub_name), []),
+            detail_adj_map,
+        )
+        aggregate_row = DistributionAggregateRow(
+            hub_name=hub_name,
+            branch_name=branch_name_value,
+            target_amount_dsp_per_branch=_qty_int(target_amount),
+            available_amount_kzt_per_branch=_qty_int(vals["available_amount"]),
+            recommended_amount_kzt_per_branch=round(float(vals["recommended_amount"]), 2),
+            adjusted_amount_kzt_per_branch=round(display_adjusted_amount, 2),
+            total_adjusted_volume_cbm_per_branch=adjusted_volume,
+            total_adjusted_gross_weight_kg_per_branch=adjusted_gross_weight,
+            readiness_for_target_per_branch=int(readiness),
+        )
+        out.append(aggregate_row)
+        row_by_key[(owner_id, branch_id, branch_name_value, hub_name)] = aggregate_row
+    return out, rows_by_branch, row_by_key
+
+
+def _aggregate_filter_options(
+    *,
+    calc_rows: list[_BranchSkuCalc],
+    product_filter: dict[str, set[str]],
+    branch_name: list[str] | None,
+    readiness_for_target_per_branch: list[int] | None,
+    branch_adj_map: dict[tuple[int, str], float],
+    detail_adj_map: dict[tuple[int, str, str], int],
+) -> DistributionAggregateFilterOptions:
+    readiness_values = {int(v) for v in (readiness_for_target_per_branch or [])}
+    product_options: dict[str, list[str]] = {}
+    for option_name in PRODUCT_FILTER_FIELDS:
+        candidate_rows = [
+            row
+            for row in calc_rows
+            if _matches_product_filters(row, product_filter, ignore_field=option_name)
+        ]
+        _candidate_aggregate_rows, _candidate_rows_by_branch, candidate_row_by_key = _build_aggregate_rows(
+            calc_rows=candidate_rows,
+            branch_adj_map=branch_adj_map,
+            detail_adj_map=detail_adj_map,
+        )
+        eligible_branch_keys = {
+            key
+            for key, aggregate_row in candidate_row_by_key.items()
+            if _branch_matches_selected(aggregate_row.branch_name, branch_name)
+            and (
+                not readiness_values
+                or int(aggregate_row.readiness_for_target_per_branch) in readiness_values
+            )
+        }
+        values = {
+            str(getattr(row, option_name) or "").strip()
+            for row in candidate_rows
+            if (row.owner_user_id, row.branch_id, row.branch_name, row.hub_name) in eligible_branch_keys
+            and str(getattr(row, option_name) or "").strip()
+        }
+        product_options[option_name] = sorted(values)
+
+    product_filtered_rows = [
+        row
+        for row in calc_rows
+        if _matches_product_filters(row, product_filter)
+    ]
+    aggregate_rows, _rows_by_branch, _row_by_key = _build_aggregate_rows(
+        calc_rows=product_filtered_rows,
+        branch_adj_map=branch_adj_map,
+        detail_adj_map=detail_adj_map,
+    )
+    branch_options_rows = [
+        row
+        for row in aggregate_rows
+        if (
+            not readiness_for_target_per_branch
+            or int(row.readiness_for_target_per_branch)
+            in {int(v) for v in readiness_for_target_per_branch}
+        )
+    ]
+    readiness_options_rows = [
+        row
+        for row in aggregate_rows
+        if _branch_matches_selected(row.branch_name, branch_name)
+    ]
+    return DistributionAggregateFilterOptions(
+        branch_name=sorted({row.branch_name for row in branch_options_rows}),
+        sku_code=product_options["sku_code"],
+        sku_name=product_options["sku_name"],
+        brand=product_options["brand"],
+        category=product_options["category"],
+        sub_category=product_options["sub_category"],
+        subline=product_options["subline"],
+        readiness_for_target_per_branch=sorted(
+            {int(row.readiness_for_target_per_branch) for row in readiness_options_rows}
+        ),
+    )
+
+
+def _build_detail_row(
+    row: _BranchSkuCalc,
+    detail_adj_map: dict[tuple[int, str, str], int],
+) -> DistributionDetailRow:
+    explicit_adjustment_key = (row.owner_user_id, row.branch_id, row.sku_code)
+    readiness_adjusted = int(detail_adj_map.get(explicit_adjustment_key, 0))
+    recommended_for_target = int(row.recommended_qty)
+    display_adjusted = (
+        readiness_adjusted
+        if explicit_adjustment_key in detail_adj_map
+        else recommended_for_target
+    )
+    readiness = _safe_readiness(
+        numerator=float(row.available_qty) + float(readiness_adjusted),
+        denominator=float(row.stock_norm_target_qty),
+    )
+    return DistributionDetailRow(
+        sku_code=row.sku_code,
+        sku_name=row.sku_name,
+        total_available_quantity_in_mc=int(math.ceil(float(row.total_hub_available_qty))),
+        available_quantity_in_mc=int(math.ceil(float(row.available_qty))),
+        average_l3m_quantity_in_mc=int(row.avg_l3m),
+        average_f3m_quantity_in_mc=int(row.avg_f3m),
+        recommended_quantity_in_mc=int(recommended_for_target),
+        adjusted_quantity_in_mc=int(display_adjusted),
+        readiness_for_target_per_sku=int(readiness),
+    )
+
+
+def _details_filter_options(
+    *,
+    selected_rows: list[_BranchSkuCalc],
+    product_filter: dict[str, set[str]],
+    readiness_for_target_per_sku_filter: list[int] | None,
+    detail_adj_map: dict[tuple[int, str, str], int],
+) -> DistributionDetailsFilterOptions:
+    product_options = _product_filter_options(selected_rows, product_filter)
+    product_filtered_rows = [
+        row
+        for row in selected_rows
+        if _matches_product_filters(row, product_filter)
+    ]
+    detail_rows = [_build_detail_row(row, detail_adj_map) for row in product_filtered_rows]
+    return DistributionDetailsFilterOptions(
+        sku_code=product_options["sku_code"],
+        sku_name=product_options["sku_name"],
+        brand=product_options["brand"],
+        category=product_options["category"],
+        sub_category=product_options["sub_category"],
+        subline=product_options["subline"],
+        readiness_for_target_per_sku=sorted(
+            {int(row.readiness_for_target_per_sku) for row in detail_rows}
+        ),
+    )
 
 
 def _forecast_target_for_planning_month(
@@ -712,6 +1002,10 @@ async def _build_distribution_calc_uncached(
                 sku_id=str(product.sku_id),
                 sku_code=sku_code,
                 sku_name=str(product.sku_name),
+                brand=str(product.brand or ""),
+                category=str(product.category or ""),
+                sub_category=str(product.sub_category or ""),
+                subline=str(product.sub_line or ""),
                 date=row_date,
                 target_qty=float(vals["target_qty"]),
                 stock_norm_target_qty=float(stock_norm_target_by_branch_sku.get((owner_id, branch_id, sku_code), 0.0)),
@@ -737,6 +1031,12 @@ async def get_distribution_aggregated(
     db: DBSession,
     user: CurrentUser,
     branch_name: list[str] | None = Query(default=None),
+    sku_code: list[str] | None = Query(default=None),
+    sku_name: list[str] | None = Query(default=None),
+    brand: list[str] | None = Query(default=None),
+    category: list[str] | None = Query(default=None),
+    sub_category: list[str] | None = Query(default=None),
+    subline: list[str] | None = Query(default=None),
     readiness_for_target_per_branch: list[int] | None = Query(default=None),
     page: int = Query(1, ge=1),
     page_size: str = Query("10"),
@@ -760,67 +1060,28 @@ async def get_distribution_aggregated(
         (r.owner_user_id, str(r.branch_id).strip(), str(r.sku_code or "").strip()): _qty_int(r.adjusted_quantity_in_mc)
         for r in detail_adj_rows
     }
-
-    buckets: dict[tuple[int, str, str, str], dict[str, float]] = {}
-    rows_by_branch: dict[tuple[int, str, str, str], list[_BranchSkuCalc]] = {}
-    for r in calc_rows:
-        key = (r.owner_user_id, r.branch_id, r.branch_name, r.hub_name)
-        rows_by_branch.setdefault(key, []).append(r)
-        if key not in buckets:
-            buckets[key] = {
-                "available_amount": 0.0,
-                "recommended_amount": 0.0,
-                "target_amount": 0.0,
-                "potential_amount": 0.0,
-            }
-        b = buckets[key]
-        b["available_amount"] += _available_amount_dsp(r)
-        b["recommended_amount"] += _recommended_amount_dsp(r)
-        b["target_amount"] += _target_amount_dsp(r)
-        b["potential_amount"] += _potential_amount_dsp(r)
-
-    rows: list[DistributionAggregateRow] = []
-    for (owner_id, branch_id, branch_name_value, hub_name), vals in buckets.items():
-        target_amount = float(vals["target_amount"])
-        explicit_adjustment_key = (owner_id, branch_id)
-        readiness_adjusted_amount = float(branch_adj_map.get(explicit_adjustment_key, 0.0))
-        display_adjusted_amount = (
-            readiness_adjusted_amount
-            if explicit_adjustment_key in branch_adj_map
-            else float(vals["recommended_amount"])
-        )
-        readiness = _safe_readiness(
-            numerator=float(vals["potential_amount"]),
-            denominator=target_amount,
-        )
-        adjusted_volume, adjusted_gross_weight, _adjusted_amount = _adjusted_metrics_for_rows(
-            rows_by_branch.get((owner_id, branch_id, branch_name_value, hub_name), []),
-            detail_adj_map,
-        )
-        rows.append(
-            DistributionAggregateRow(
-                hub_name=hub_name,
-                branch_name=branch_name_value,
-                target_amount_dsp_per_branch=_qty_int(target_amount),
-                available_amount_kzt_per_branch=_qty_int(vals["available_amount"]),
-                recommended_amount_kzt_per_branch=round(float(vals["recommended_amount"]), 2),
-                adjusted_amount_kzt_per_branch=round(display_adjusted_amount, 2),
-                total_adjusted_volume_cbm_per_branch=adjusted_volume,
-                total_adjusted_gross_weight_kg_per_branch=adjusted_gross_weight,
-                readiness_for_target_per_branch=int(readiness),
-            )
-        )
+    product_filter = _product_filter_payload(
+        sku_code=sku_code,
+        sku_name=sku_name,
+        brand=brand,
+        category=category,
+        sub_category=sub_category,
+        subline=subline,
+    )
+    filtered_calc_rows = [
+        row for row in calc_rows if _matches_product_filters(row, product_filter)
+    ]
+    rows, _rows_by_branch, _row_by_key = _build_aggregate_rows(
+        calc_rows=filtered_calc_rows,
+        branch_adj_map=branch_adj_map,
+        detail_adj_map=detail_adj_map,
+    )
     filtered_rows = rows
     if branch_name:
-        branch_name_values = {
-            normalize_branch_lookup(v)
-            for v in branch_name
-            if str(v).strip()
-        }
         filtered_rows = [
             r
             for r in filtered_rows
-            if normalize_branch_lookup(r.branch_name) in branch_name_values
+            if _branch_matches_selected(r.branch_name, branch_name)
         ]
     if readiness_for_target_per_branch:
         readiness_values = {int(v) for v in readiness_for_target_per_branch}
@@ -830,13 +1091,17 @@ async def get_distribution_aggregated(
             if int(r.readiness_for_target_per_branch) in readiness_values
         ]
 
-    filter_options = DistributionAggregateFilterOptions(
-        branch_name=sorted({r.branch_name for r in filtered_rows}),
-        readiness_for_target_per_branch=sorted(
-            {int(r.readiness_for_target_per_branch) for r in filtered_rows}
-        ),
+    filter_options = _aggregate_filter_options(
+        calc_rows=calc_rows,
+        product_filter=product_filter,
+        branch_name=branch_name,
+        readiness_for_target_per_branch=readiness_for_target_per_branch,
+        branch_adj_map=branch_adj_map,
+        detail_adj_map=detail_adj_map,
     )
-    filtered_rows.sort(key=lambda x: (x.hub_name, x.branch_name))
+    filtered_rows.sort(
+        key=lambda x: (-x.target_amount_dsp_per_branch, x.hub_name, x.branch_name)
+    )
     paged, total_items, total_pages = _paginate(filtered_rows, page=page, page_size=page_size)
     return DistributionAggregateResponse(
         planning_date=planning_date.isoformat(),
@@ -899,6 +1164,10 @@ async def get_distribution_details(
     branch_name: str = Query(...),
     sku_code_filter: list[str] | None = Query(default=None, alias="sku_code"),
     sku_name_filter: list[str] | None = Query(default=None, alias="sku_name"),
+    brand: list[str] | None = Query(default=None),
+    category: list[str] | None = Query(default=None),
+    sub_category: list[str] | None = Query(default=None),
+    subline: list[str] | None = Query(default=None),
     readiness_for_target_per_sku_filter: list[int] | None = Query(
         default=None, alias="readiness_for_target_per_sku"
     ),
@@ -919,54 +1188,30 @@ async def get_distribution_details(
         for r in adj_rows
     }
 
-    detail_rows: list[DistributionDetailRow] = []
-    for r in selected:
-        explicit_adjustment_key = (r.owner_user_id, r.branch_id, r.sku_code)
-        readiness_adjusted = int(detail_adj_map.get(explicit_adjustment_key, 0))
-        recommended_for_target = int(r.recommended_qty)
-        display_adjusted = (
-            readiness_adjusted
-            if explicit_adjustment_key in detail_adj_map
-            else recommended_for_target
-        )
-        readiness = _safe_readiness(
-            numerator=float(r.available_qty) + float(readiness_adjusted),
-            denominator=float(r.stock_norm_target_qty),
-        )
-        detail_rows.append(
-            DistributionDetailRow(
-                sku_code=r.sku_code,
-                sku_name=r.sku_name,
-                total_available_quantity_in_mc=int(math.ceil(float(r.total_hub_available_qty))),
-                available_quantity_in_mc=int(math.ceil(float(r.available_qty))),
-                average_l3m_quantity_in_mc=int(r.avg_l3m),
-                average_f3m_quantity_in_mc=int(r.avg_f3m),
-                recommended_quantity_in_mc=int(recommended_for_target),
-                adjusted_quantity_in_mc=int(display_adjusted),
-                readiness_for_target_per_sku=int(readiness),
-            )
-        )
-
-    filtered_rows = detail_rows
-    if sku_code_filter:
-        sku_code_values = {str(v).strip() for v in sku_code_filter if str(v).strip()}
-        filtered_rows = [r for r in filtered_rows if r.sku_code in sku_code_values]
-    if sku_name_filter:
-        sku_name_values = {str(v).strip() for v in sku_name_filter if str(v).strip()}
-        filtered_rows = [r for r in filtered_rows if r.sku_name in sku_name_values]
+    product_filter = _product_filter_payload(
+        sku_code=sku_code_filter,
+        sku_name=sku_name_filter,
+        brand=brand,
+        category=category,
+        sub_category=sub_category,
+        subline=subline,
+    )
+    filtered_calc_rows = [
+        row for row in selected if _matches_product_filters(row, product_filter)
+    ]
+    filtered_rows = [_build_detail_row(row, detail_adj_map) for row in filtered_calc_rows]
     if readiness_for_target_per_sku_filter:
         readiness_values = {int(v) for v in readiness_for_target_per_sku_filter}
         filtered_rows = [r for r in filtered_rows if int(r.readiness_for_target_per_sku) in readiness_values]
 
-    filter_options = DistributionDetailsFilterOptions(
-        sku_code=sorted({r.sku_code for r in filtered_rows}),
-        sku_name=sorted({r.sku_name for r in filtered_rows}),
-        readiness_for_target_per_sku=sorted(
-            {int(r.readiness_for_target_per_sku) for r in filtered_rows}
-        ),
+    filter_options = _details_filter_options(
+        selected_rows=selected,
+        product_filter=product_filter,
+        readiness_for_target_per_sku_filter=readiness_for_target_per_sku_filter,
+        detail_adj_map=detail_adj_map,
     )
 
-    filtered_rows.sort(key=lambda x: x.sku_code)
+    filtered_rows.sort(key=lambda x: (-x.recommended_quantity_in_mc, x.sku_code))
     paged, total_items, total_pages = _paginate(filtered_rows, page=page, page_size=page_size)
     first = selected[0]
     return DistributionDetailsResponse(
@@ -1195,19 +1440,29 @@ async def download_distribution(
     db: DBSession,
     user: CurrentUser,
     branch_name: str | None = Query(None),
+    sku_code: list[str] | None = Query(default=None),
+    sku_name: list[str] | None = Query(default=None),
+    brand: list[str] | None = Query(default=None),
+    category: list[str] | None = Query(default=None),
+    sub_category: list[str] | None = Query(default=None),
+    subline: list[str] | None = Query(default=None),
+    readiness_for_target_per_branch: list[int] | None = Query(default=None),
 ):
     response = await get_distribution_aggregated(
         db=db,
         user=user,
-        branch_name=None,
-        readiness_for_target_per_branch=None,
+        branch_name=[branch_name] if branch_name else None,
+        sku_code=sku_code,
+        sku_name=sku_name,
+        brand=brand,
+        category=category,
+        sub_category=sub_category,
+        subline=subline,
+        readiness_for_target_per_branch=readiness_for_target_per_branch,
         page=1,
         page_size="all",
     )
     rows = response.items
-    if branch_name:
-        branch_norm = normalize_branch_lookup(branch_name)
-        rows = [r for r in rows if normalize_branch_lookup(r.branch_name) == branch_norm]
     export_rows = [r.model_dump() for r in rows]
     output = BytesIO()
     pd.DataFrame(export_rows).rename(columns=DISTRIBUTION_DOWNLOAD_HEADERS).to_excel(
@@ -1228,21 +1483,28 @@ async def download_distribution_details(
     user: CurrentUser,
     branch_name: str = Query(...),
     sku_code: str | None = Query(None),
+    sku_name: list[str] | None = Query(default=None),
+    brand: list[str] | None = Query(default=None),
+    category: list[str] | None = Query(default=None),
+    sub_category: list[str] | None = Query(default=None),
+    subline: list[str] | None = Query(default=None),
+    readiness_for_target_per_sku: list[int] | None = Query(default=None),
 ):
     response = await get_distribution_details(
         db=db,
         user=user,
         branch_name=branch_name,
-        sku_code_filter=None,
-        sku_name_filter=None,
-        readiness_for_target_per_sku_filter=None,
+        sku_code_filter=[sku_code] if sku_code else None,
+        sku_name_filter=sku_name,
+        brand=brand,
+        category=category,
+        sub_category=sub_category,
+        subline=subline,
+        readiness_for_target_per_sku_filter=readiness_for_target_per_sku,
         page=1,
         page_size="all",
     )
     rows = response.items
-    if sku_code:
-        sku_norm = sku_code.strip()
-        rows = [r for r in rows if r.sku_code == sku_norm]
     export_rows = [r.model_dump() for r in rows]
     output = BytesIO()
     pd.DataFrame(export_rows).rename(columns=DISTRIBUTION_DETAILS_DOWNLOAD_HEADERS).to_excel(

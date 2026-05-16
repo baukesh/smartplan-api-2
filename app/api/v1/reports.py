@@ -520,6 +520,22 @@ def _month_iso(d: date) -> str:
     return f"{d.year:04d}-{d.month:02d}"
 
 
+def _period_bounds_from_tables(*tables: list[dict]) -> tuple[date | None, date | None]:
+    months: list[date] = []
+    for table in tables:
+        for row in table:
+            raw_period = str(row.get("period") or "").strip()
+            if not raw_period:
+                continue
+            try:
+                months.append(_month_start(date.fromisoformat(raw_period)))
+            except ValueError:
+                continue
+    if not months:
+        return None, None
+    return min(months), max(months)
+
+
 def _iter_months(start: date, end: date):
     current = _month_start(start)
     last = _month_start(end)
@@ -1049,6 +1065,10 @@ async def _build_report_detail_uncached(
         else:
             forecast_table = []
 
+    response_min_month, response_max_month = _period_bounds_from_tables(
+        historical_table,
+        forecast_table,
+    )
     card = report_card_payload(report)
     return {
         "report": {
@@ -1064,8 +1084,8 @@ async def _build_report_detail_uncached(
             "is_draft": card["is_draft"],
             "planning_month": ctx.planning_month,
         },
-        "min_date": _month_iso(min_hist_month) if min_hist_month else None,
-        "max_date": _month_iso(max_available_month) if max_available_month else None,
+        "min_date": _month_iso(response_min_month) if response_min_month else None,
+        "max_date": _month_iso(response_max_month) if response_max_month else None,
         "historical_table": historical_table,
         "forecast_table": forecast_table,
     }
