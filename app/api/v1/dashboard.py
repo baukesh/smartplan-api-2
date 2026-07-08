@@ -16,6 +16,10 @@ from app.api.v1.inventory_health import (
 from app.core.ttl_cache import AsyncTTLCache
 from app.models.data_uploads import Branch, HistoricalSalesMonthly, PriceList, Product
 from app.models.derived import ForecastSalesMonthly
+from app.services.report_override_utils import (
+    apply_forecast_overrides_to_atoms,
+    latest_forecast_overrides_for_owners,
+)
 
 router = APIRouter(prefix="/dashboard", tags=["dashboard"])
 
@@ -209,6 +213,115 @@ def _is_amount_view(view_type: str) -> bool:
     return view_type in {"dsp", "invoice price"}
 
 
+_DASHBOARD_CASE_OVERRIDE_METRIC = "adjusted_forecast_quantity_in_mc"
+_DASHBOARD_DSP_OVERRIDE_METRIC = "adjusted_forecast_amount_kzt"
+_DASHBOARD_INVOICE_OVERRIDE_METRIC = "adjusted_forecast_invoice_amount_kzt"
+
+
+def _dashboard_view_override_metric(view_type: str) -> str | None:
+    if view_type == "dsp":
+        return _DASHBOARD_DSP_OVERRIDE_METRIC
+    if view_type == "invoice price":
+        return _DASHBOARD_INVOICE_OVERRIDE_METRIC
+    return None
+
+
+def _dashboard_override_metric_types(view_type: str) -> set[str]:
+    metrics = {_DASHBOARD_CASE_OVERRIDE_METRIC}
+    view_metric = _dashboard_view_override_metric(view_type)
+    if view_metric is not None:
+        metrics.add(view_metric)
+    return metrics
+
+
+async def _latest_dashboard_forecast_overrides(
+    db: DBSession,
+    *,
+    forecast_rows: list[ForecastSalesMonthly],
+    product_by_sku: dict[str, Product],
+    product_pieces_by_key: dict[tuple[int, str], float],
+    branch_name_by_id: dict[str, str],
+    normalized_view_type: str,
+    price_for_key_on_or_before,
+) -> dict[str, dict[tuple[str, str, date], float]]:
+    metric_types = _dashboard_override_metric_types(normalized_view_type)
+    owner_ids = {int(row.owner_user_id) for row in forecast_rows}
+    override_rows = await latest_forecast_overrides_for_owners(
+        db,
+        owner_ids,
+        metric_types=metric_types,
+    )
+    if not override_rows:
+        return {metric: {} for metric in metric_types}
+
+    atoms: list[dict] = []
+    for row in forecast_rows:
+        owner_id = int(row.owner_user_id)
+        sku_code = str(row.sku_code or "").strip()
+        product = product_by_sku.get(sku_code)
+        branch_id = str(row.branch_id or "").strip()
+        row_month = _month_start(row.date)
+        tuple_key = (owner_id, sku_code)
+        baseline_qty = float(row.baseline_forecast_quantity_in_mc or 0.0)
+        adjusted_qty = (
+            float(row.adjusted_forecast_quantity_in_mc)
+            if row.adjusted_forecast_quantity_in_mc is not None
+            else baseline_qty
+        )
+        pieces = product_pieces_by_key.get(tuple_key, 0.0)
+        price_value = price_for_key_on_or_before(tuple_key, row.date)
+        baseline_amount = float(row.baseline_forecast_amount_kzt or 0.0)
+        adjusted_amount = (
+            float(row.adjusted_forecast_amount_kzt)
+            if row.adjusted_forecast_amount_kzt is not None
+            else baseline_amount
+        )
+        baseline_metrics = {
+            _DASHBOARD_CASE_OVERRIDE_METRIC: baseline_qty,
+            _DASHBOARD_DSP_OVERRIDE_METRIC: baseline_amount,
+            _DASHBOARD_INVOICE_OVERRIDE_METRIC: baseline_qty * pieces * price_value,
+        }
+        effective_metrics = {
+            _DASHBOARD_CASE_OVERRIDE_METRIC: adjusted_qty,
+            _DASHBOARD_DSP_OVERRIDE_METRIC: adjusted_amount,
+            _DASHBOARD_INVOICE_OVERRIDE_METRIC: adjusted_qty * pieces * price_value,
+        }
+        atoms.append(
+            {
+                "owner_user_id": owner_id,
+                "branch_id": branch_id,
+                "branch_name": branch_name_by_id.get(branch_id, branch_id),
+                "period": row_month,
+                "sku_code": sku_code,
+                "sku_name": str(getattr(product, "sku_name", "") or ""),
+                "brand": str(getattr(product, "brand", "") or ""),
+                "category": str(getattr(product, "category", "") or ""),
+                "sub_category": str(getattr(product, "sub_category", "") or ""),
+                "subline": str(getattr(product, "sub_line", "") or ""),
+                "row_key": (sku_code, branch_id, row_month),
+                "baseline_metrics": baseline_metrics,
+                "effective_metrics": effective_metrics,
+                "applied_metrics": set(),
+            }
+        )
+
+    apply_forecast_overrides_to_atoms(
+        forecast_atoms=atoms,
+        override_rows=override_rows,
+        metric_types=metric_types,
+    )
+    values_by_metric: dict[str, dict[tuple[str, str, date], float]] = {
+        metric: {} for metric in metric_types
+    }
+    for atom in atoms:
+        row_key = atom["row_key"]
+        applied_metrics = atom.get("applied_metrics", set())
+        for metric in metric_types:
+            if metric in applied_metrics:
+                values_by_metric[metric][row_key] = float(atom["effective_metrics"].get(metric, 0.0) or 0.0)
+    return values_by_metric
+
+
 async def _inventory_issue_overview(
     db: DBSession,
     user: CurrentUser,
@@ -389,10 +502,12 @@ async def _build_dashboard_sales_data(
     products = (await db.execute(product_stmt)).scalars().all()
     product_name_by_key: dict[tuple[int, str], str] = {}
     product_pieces_by_key: dict[tuple[int, str], float] = {}
+    product_by_sku: dict[str, Product] = {}
     for p in products:
         key = (int(p.owner_user_id), str(p.sku_code or "").strip())
         product_name_by_key[key] = str(p.sku_name or "").strip()
         product_pieces_by_key[key] = float(p.pieces_in_master_carton or 0.0)
+        product_by_sku[str(p.sku_code or "").strip()] = p
 
     prices_by_key: dict[tuple[int, str], list[PriceList]] = {}
     if _is_amount_view(normalized_view_type):
@@ -492,15 +607,41 @@ async def _build_dashboard_sales_data(
             user,
         )
         fc_rows = (await db.execute(fc_stmt)).scalars().all()
+        branch_stmt = _scope_stmt(select(Branch), Branch, user)
+        branch_rows_for_overrides = (await db.execute(branch_stmt)).scalars().all()
+        branch_name_by_id = {
+            str(row.branch_id).strip(): str(row.branch_name)
+            for row in branch_rows_for_overrides
+        }
+        latest_override_values = await _latest_dashboard_forecast_overrides(
+            db,
+            forecast_rows=fc_rows,
+            product_by_sku=product_by_sku,
+            product_pieces_by_key=product_pieces_by_key,
+            branch_name_by_id=branch_name_by_id,
+            normalized_view_type=normalized_view_type,
+            price_for_key_on_or_before=_price_for_key_on_or_before,
+        )
+        latest_override_qty = latest_override_values.get(_DASHBOARD_CASE_OVERRIDE_METRIC, {})
+        view_override_metric = _dashboard_view_override_metric(normalized_view_type)
+        latest_view_override = (
+            latest_override_values.get(view_override_metric, {})
+            if view_override_metric is not None
+            else {}
+        )
         for row in fc_rows:
             sku_code_value = str(row.sku_code or "").strip()
             branch_id_value = str(row.branch_id or "").strip()
+            row_month = _month_start(row.date)
+            latest_qty_key = (sku_code_value, branch_id_value, row_month)
             sku_key = (int(row.owner_user_id), sku_code_value)
             pieces = product_pieces_by_key.get(sku_key, 0.0)
             price_value = _price_for_key_on_or_before(sku_key, row.date) if _is_amount_view(normalized_view_type) else 0.0
             baseline_qty = float(row.baseline_forecast_quantity_in_mc or 0.0)
             adjusted_qty = (
-                float(row.adjusted_forecast_quantity_in_mc)
+                latest_override_qty.get(latest_qty_key)
+                if latest_qty_key in latest_override_qty
+                else float(row.adjusted_forecast_quantity_in_mc)
                 if row.adjusted_forecast_quantity_in_mc is not None
                 else baseline_qty
             )
@@ -511,7 +652,11 @@ async def _build_dashboard_sales_data(
                     else baseline_qty * pieces * price_value
                 )
                 adjusted_amount = (
-                    float(row.adjusted_forecast_amount_kzt)
+                    latest_view_override[latest_qty_key]
+                    if latest_qty_key in latest_view_override
+                    else adjusted_qty * pieces * price_value
+                    if latest_qty_key in latest_override_qty
+                    else float(row.adjusted_forecast_amount_kzt)
                     if normalized_view_type == "dsp" and row.adjusted_forecast_amount_kzt is not None
                     else baseline_amount
                     if normalized_view_type == "dsp"
@@ -1317,6 +1462,7 @@ async def _build_plot_data(
         (int(p.owner_user_id), str(p.sku_code).strip()): p
         for p in products
     }
+    product_by_sku = {str(p.sku_code or "").strip(): p for p in products}
     product_pieces_by_key = {
         key: float(product.pieces_in_master_carton or 0.0)
         for key, product in products_by_key.items()
@@ -1454,6 +1600,28 @@ async def _build_plot_data(
             user,
         )
         fc_rows = (await db.execute(fc_stmt)).scalars().all()
+        branch_stmt = _scope_stmt(select(Branch), Branch, user)
+        branch_rows_for_overrides = (await db.execute(branch_stmt)).scalars().all()
+        branch_name_by_id = {
+            str(row.branch_id).strip(): str(row.branch_name)
+            for row in branch_rows_for_overrides
+        }
+        latest_override_values = await _latest_dashboard_forecast_overrides(
+            db,
+            forecast_rows=fc_rows,
+            product_by_sku=product_by_sku,
+            product_pieces_by_key=product_pieces_by_key,
+            branch_name_by_id=branch_name_by_id,
+            normalized_view_type=normalized_view_type,
+            price_for_key_on_or_before=_price_for_key_on_or_before,
+        )
+        latest_override_qty = latest_override_values.get(_DASHBOARD_CASE_OVERRIDE_METRIC, {})
+        view_override_metric = _dashboard_view_override_metric(normalized_view_type)
+        latest_view_override = (
+            latest_override_values.get(view_override_metric, {})
+            if view_override_metric is not None
+            else {}
+        )
         all_hist_stmt = _scope_stmt(select(HistoricalSalesMonthly), HistoricalSalesMonthly, user)
         all_hist_rows = (await db.execute(all_hist_stmt)).scalars().all()
         latest_hub_stock_by_hub_sku: dict[tuple[int, str, str], tuple[date, float]] = {}
@@ -1476,6 +1644,9 @@ async def _build_plot_data(
         fc_buckets: dict[date, dict[str, float]] = {}
         for row in fc_rows:
             key = _month_start(row.date)
+            sku_code_value = str(row.sku_code or "").strip()
+            branch_id_value = str(row.branch_id or "").strip()
+            latest_qty_key = (sku_code_value, branch_id_value, key)
             b = fc_buckets.setdefault(
                 key,
                 {
@@ -1494,12 +1665,19 @@ async def _build_plot_data(
                 else 0.0
             )
             adjusted_qty = (
-                float(row.adjusted_forecast_quantity_in_mc)
+                latest_override_qty.get(latest_qty_key)
+                if latest_qty_key in latest_override_qty
+                else float(row.adjusted_forecast_quantity_in_mc)
                 if row.adjusted_forecast_quantity_in_mc is not None
                 else baseline_qty
             )
             adjusted_amount = (
-                float(row.adjusted_forecast_amount_kzt)
+                latest_view_override[latest_qty_key]
+                if latest_qty_key in latest_view_override
+                else adjusted_qty * product_pieces_by_key.get((int(row.owner_user_id), sku_code_value), 0.0)
+                * _price_for_key_on_or_before((int(row.owner_user_id), sku_code_value), row.date)
+                if latest_qty_key in latest_override_qty
+                else float(row.adjusted_forecast_amount_kzt)
                 if normalized_view_type == "dsp" and row.adjusted_forecast_amount_kzt is not None
                 else baseline_amount
             )

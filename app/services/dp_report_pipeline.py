@@ -13,6 +13,7 @@ from sqlalchemy import delete, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
+from app.core.order_status import normalize_order_status
 from app.models.data_uploads import (
     HistoricalSalesMonthly,
     PlacedOrder,
@@ -99,6 +100,8 @@ def _aggregate_order_arrivals_by_sku_month(
 ) -> dict[tuple[str, date], float]:
     arrivals: dict[tuple[str, date], float] = defaultdict(float)
     for order in placed_orders:
+        if normalize_order_status(order.status) != "в пути":
+            continue
         sku_code = str(order.sku_code or order.sku_id or "").strip()
         if not sku_code:
             continue
@@ -206,6 +209,9 @@ async def refresh_forecast_sales_monthly(
             select(PlacedOrder).where(PlacedOrder.owner_user_id == owner_user_id)
         )
     ).scalars().all()
+    in_transit_orders = [
+        order for order in placed_orders if normalize_order_status(order.status) == "в пути"
+    ]
 
     prices_by_sku: dict[str, list[PriceList]] = defaultdict(list)
     for p in prices:
@@ -227,7 +233,7 @@ async def refresh_forecast_sales_monthly(
     }
 
     placed_orders_by_sku: dict[str, list[PlacedOrder]] = defaultdict(list)
-    for po in placed_orders:
+    for po in in_transit_orders:
         placed_orders_by_sku[str(po.sku_code or "").strip()].append(po)
     for sku in placed_orders_by_sku:
         placed_orders_by_sku[sku].sort(key=lambda x: x.creation_date)
@@ -430,13 +436,6 @@ async def refresh_forecast_sales_monthly(
                 cache_row.expires_at = now_utc + cache_ttl
         cache_writes = len(cache_upserts)
 
-    arrivals_by_sku_month = _aggregate_order_arrivals_by_sku_month(placed_orders)
-    arrival_allocations = _allocate_order_arrivals_by_branch(
-        job_payloads=job_payloads,
-        baseline_series_by_key=baseline_series_by_key,
-        arrivals_by_sku_month=arrivals_by_sku_month,
-    )
-
     for job in job_payloads:
         sku_code = job["sku_code"]
         branch_id = job["branch_id"]
@@ -456,10 +455,7 @@ async def refresh_forecast_sales_monthly(
                 baseline_amount = (
                     forecast_case_qty * product.pieces_in_master_carton * closest_dsp.dsp
                 )
-            allocated_arrival_qty = float(
-                arrival_allocations.get((sku_code, branch_id, _month_start(forecast_date)), 0.0)
-            )
-            future_stock = max(prev_stock + allocated_arrival_qty - forecast_case_qty, 0.0)
+            future_stock = max(prev_stock - forecast_case_qty, 0.0)
             to_insert.append(
                 ForecastSalesMonthly(
                     sku_id=product.sku_id,

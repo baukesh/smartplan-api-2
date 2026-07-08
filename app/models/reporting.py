@@ -64,3 +64,18 @@ class DPReportForecastOverride(Base, TimestampMixin):
     adjustment_reason: Mapped[str | None] = mapped_column(String(2000))
     value: Mapped[float] = mapped_column(Float)
 
+
+class PromoActivity(Base, TimestampMixin):
+    __tablename__ = "promo_activities"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    owner_user_id: Mapped[int] = mapped_column(index=True)
+    promo_name: Mapped[str] = mapped_column(String(255), index=True)
+    promo_channel: Mapped[str | None] = mapped_column(String(255), index=True)
+    promo_branches: Mapped[str] = mapped_column(String(8000))
+    promo_sku_codes: Mapped[str] = mapped_column(String(8000))
+    promo_start_date: Mapped[date] = mapped_column(Date, index=True)
+    promo_end_date: Mapped[date] = mapped_column(Date, index=True)
+    promo_effect_cases: Mapped[float] = mapped_column(Float, default=0.0)
+    promo_is_active: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+

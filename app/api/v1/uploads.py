@@ -344,6 +344,15 @@ def _deduplicate_records_by_key(records: list[dict], key_fields: list[str]) -> l
     return list(deduped.values())
 
 
+def _normalize_uploaded_order_id(value) -> str:
+    normalized = str(value or "").strip()
+    if normalized.startswith("#"):
+        normalized = normalized[1:].strip()
+    if normalized.startswith("№"):
+        normalized = normalized[1:].strip()
+    return normalized
+
+
 async def _upsert_records_by_key(
     db: AsyncSession,
     model: type,
@@ -370,6 +379,55 @@ async def _upsert_records_by_key(
                     delete_stmt = delete_stmt.where(tuple_(*fields).in_(key_values))
                 await db.execute(delete_stmt)
                 db.add_all([model(**record) for record in deduped_records])
+                await db.commit()
+                return len(deduped_records)
+            except OperationalError as exc:
+                await db.rollback()
+                last_exc = exc
+                if "database is locked" in str(exc).lower() and attempt < max_attempts:
+                    await asyncio.sleep(0.3 * attempt)
+                    continue
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="База данных временно занята. Повторите попытку загрузки.",
+                ) from exc
+        if last_exc is not None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="База данных временно занята. Повторите попытку загрузки.",
+            ) from last_exc
+    return 0
+
+
+async def _replace_records_by_scope_key(
+    db: AsyncSession,
+    model: type,
+    records: list[dict],
+    owner_user_id: int,
+    *,
+    scope_field: str,
+    scope_values: list,
+    key_fields: list[str],
+) -> int:
+    deduped_records = _deduplicate_records_by_key(records, key_fields)
+    cleaned_scope_values = list(dict.fromkeys(v for v in scope_values if v is not None))
+    if not deduped_records and not cleaned_scope_values:
+        return 0
+
+    async with UPLOAD_WRITE_LOCK:
+        max_attempts = 5
+        last_exc: Exception | None = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                if cleaned_scope_values:
+                    field = getattr(model, scope_field)
+                    delete_stmt = delete(model).where(
+                        model.owner_user_id == owner_user_id,
+                        field.in_(cleaned_scope_values),
+                    )
+                    await db.execute(delete_stmt)
+                if deduped_records:
+                    db.add_all([model(**record) for record in deduped_records])
                 await db.commit()
                 return len(deduped_records)
             except OperationalError as exc:
@@ -1511,7 +1569,7 @@ async def upload_placed_orders(
             continue
         prepared.append(
             {
-                "order_id": str(row["order_id"]),
+                "order_id": _normalize_uploaded_order_id(row["order_id"]),
                 "sku_id": sku_id,
                 "sku_code": str(product.sku_code).strip(),
                 "order_name": str(row["order_name"]),
@@ -1537,17 +1595,34 @@ async def upload_placed_orders(
             detail=_summarize_row_errors(row_errors),
         )
 
-    count = await _upsert_records_by_key(
+    uploaded_order_ids = [str(r.get("order_id", "")).strip() for r in prepared if str(r.get("order_id", "")).strip()]
+    existing_order_sku_codes = []
+    if uploaded_order_ids:
+        existing_order_sku_codes = (
+            await db.execute(
+                select(PlacedOrder.sku_code).where(
+                    PlacedOrder.owner_user_id == owner_user_id,
+                    PlacedOrder.order_id.in_(list(dict.fromkeys(uploaded_order_ids))),
+                )
+            )
+        ).scalars().all()
+
+    count = await _replace_records_by_scope_key(
         db,
         PlacedOrder,
         prepared,
         owner_user_id=owner_user_id,
+        scope_field="order_id",
+        scope_values=uploaded_order_ids,
         key_fields=["order_id", "sku_code"],
     )
     changed_keys = await _expand_changed_keys(
         db,
         owner_user_id=owner_user_id,
-        sku_codes=[str(r.get("sku_code", "")) for r in prepared],
+        sku_codes=[
+            *[str(r.get("sku_code", "")) for r in prepared],
+            *[str(sku_code or "") for sku_code in existing_order_sku_codes],
+        ],
     )
     _accumulate_changed_keys(owner_user_id, changed_keys)
     await refresh_orders_aggregated(db, owner_user_id=owner_user_id)

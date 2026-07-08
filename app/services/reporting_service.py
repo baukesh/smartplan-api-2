@@ -9,9 +9,10 @@ from fastapi import HTTPException, status
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.order_status import normalize_order_status
 from app.core.branch_localization import localize_branch_name, normalize_branch_lookup
 from app.core.ttl_cache import AsyncTTLCache
-from app.models.data_uploads import Branch, HistoricalSalesMonthly, PriceList, Product
+from app.models.data_uploads import Branch, HistoricalSalesMonthly, PlacedOrder, PriceList, Product
 from app.models.derived import ForecastSalesMonthly
 from app.models.reporting import DPReport, DPReportForecastOverride
 
@@ -539,8 +540,29 @@ def _key_tuple(row: dict) -> tuple:
         row["category"],
         row["sub_category"],
         row["subline"],
+        row.get("sku_code", ""),
         row["sku_name"],
     )
+
+
+def _round_metric_rows(rows: list[dict], metric_fields: list[str]) -> list[dict]:
+    out: list[dict] = []
+    for row in rows:
+        out_row = dict(row)
+        out_row.pop("_product_obj", None)
+        out_row.pop("_applied_override_metrics", None)
+        for field in metric_fields:
+            out_row[field] = round(float(out_row.get(field, 0.0) or 0.0), 2)
+        out.append(out_row)
+    out.sort(
+        key=lambda row: (
+            str(row.get("period") or ""),
+            str(row.get("branch_name") or ""),
+            str(row.get("sku_code") or ""),
+            str(row.get("sku_name") or ""),
+        )
+    )
+    return out
 
 
 def _aggregate_period_totals(rows: list[dict], metric_fields: list[str]) -> list[dict]:
@@ -588,11 +610,27 @@ async def build_report_tables(
     )
 
 
+async def build_report_dimensional_tables(
+    db: AsyncSession,
+    owner_user_id: int,
+    ctx: ReportingContext,
+    report_id: int | None = None,
+) -> tuple[list[dict], list[dict]]:
+    return await _build_report_tables_uncached(
+        db,
+        owner_user_id,
+        ctx,
+        report_id,
+        aggregate_periods=False,
+    )
+
+
 async def _build_report_tables_uncached(
     db: AsyncSession,
     owner_user_id: int,
     ctx: ReportingContext,
     report_id: int | None = None,
+    aggregate_periods: bool = True,
 ) -> tuple[list[dict], list[dict]]:
     source = await _load_owner_report_source(db, owner_user_id)
     product_map = source.product_map
@@ -730,6 +768,7 @@ async def _build_report_tables_uncached(
             "category": product.category,
             "sub_category": product.sub_category,
             "subline": product.sub_line,
+            "sku_code": sku_code,
             "sku_status": product.status,
             "sku_name": product.sku_name,
         }
@@ -811,6 +850,25 @@ async def _build_report_tables_uncached(
             "past_available_stock_invoice_amount_kzt",
         ],
     )
+    historical_metric_fields = [
+        "fact_quantity_in_mc",
+        "fact_gross_weight_kg",
+        "fact_net_weight_kg",
+        "fact_volume_cbm",
+        "fact_amount_kzt",
+        "fact_invoice_amount_kzt",
+        "target_quantity_in_mc",
+        "target_gross_weight_kg",
+        "target_net_weight_kg",
+        "target_volume_cbm",
+        "target_amount_kzt",
+        "target_invoice_amount_kzt",
+        "past_available_stock",
+        "past_available_stock_gross_weight_kg",
+        "past_available_stock_net_weight_kg",
+        "past_available_stock_amount_kzt",
+        "past_available_stock_invoice_amount_kzt",
+    ]
     for row in historical_table:
         period_key = str(row["period"])
         hub_stock = historical_hub_stock_by_period.get(period_key, {})
@@ -838,6 +896,14 @@ async def _build_report_tables_uncached(
     fc_rows = (
         await db.execute(fc_stmt)
     ).scalars().all()
+    placed_order_stmt = select(PlacedOrder).where(
+        PlacedOrder.owner_user_id == owner_user_id,
+        PlacedOrder.receival_date >= ctx.planning_month,
+        PlacedOrder.receival_date <= ctx.date_to,
+    )
+    if source_sku_codes is not None:
+        placed_order_stmt = placed_order_stmt.where(PlacedOrder.sku_code.in_(source_sku_codes))
+    placed_orders = (await db.execute(placed_order_stmt)).scalars().all()
 
     atomic_rows: list[dict] = []
     for r in fc_rows:
@@ -869,6 +935,7 @@ async def _build_report_tables_uncached(
                 "category": product.category,
                 "sub_category": product.sub_category,
                 "subline": product.sub_line,
+                "sku_code": sku_code,
                 "sku_status": product.status,
                 "sku_name": product.sku_name,
                 "_product_obj": product,
@@ -1020,6 +1087,7 @@ async def _build_report_tables_uncached(
     ]
 
     latest_hub_stock_by_hub_sku: dict[tuple[str, str], tuple[date, float]] = {}
+    hub_names_by_sku: dict[str, set[str]] = defaultdict(set)
     for row in all_hist_rows:
         if str(row.branch_id or "").strip():
             continue
@@ -1037,8 +1105,23 @@ async def _build_report_tables_uncached(
         if not _matches_filters(product, "", ctx.product_filter, []):
             continue
         key = (hub_name, sku_code)
+        hub_names_by_sku.setdefault(sku_code, set()).add(hub_name)
         if key not in latest_hub_stock_by_hub_sku or latest_hub_stock_by_hub_sku[key][0] <= row.date:
             latest_hub_stock_by_hub_sku[key] = (row.date, float(row.past_available_stock or 0.0))
+
+    incoming_orders_by_sku_month: dict[tuple[str, date], float] = defaultdict(float)
+    for order in placed_orders:
+        if normalize_order_status(order.status) != "в пути":
+            continue
+        sku_code = str(order.sku_code or order.sku_id or "").strip()
+        product = product_map.get(sku_code)
+        if product is None:
+            continue
+        if not _matches_filters(product, "", ctx.product_filter, []):
+            continue
+        incoming_orders_by_sku_month[(sku_code, _month_start(order.receival_date))] += float(
+            order.quantity_in_mc or 0.0
+        )
 
     future_hub_stock_by_period: dict[str, dict[str, float]] = {}
     forecast_periods = sorted({str(row["period"]) for row in filtered_atomic_rows})
@@ -1065,6 +1148,27 @@ async def _build_report_tables_uncached(
             bucket["future_hub_stock_net_weight_kg"] += stock_mc * float(product.master_carton_net_weight_kg or 0.0)
             bucket["future_hub_stock_amount_kzt"] += stock_mc * float(product.pieces_in_master_carton or 0.0) * dsp
             bucket["future_hub_stock_invoice_amount_kzt"] += stock_mc * float(product.pieces_in_master_carton or 0.0) * invoice_price
+        for (sku_code, order_month), incoming_mc in incoming_orders_by_sku_month.items():
+            if order_month > period_date:
+                continue
+            product = product_map.get(sku_code)
+            if product is None:
+                continue
+            eligible_hubs = hub_names_by_sku.get(sku_code) or {"KZ-HUB"}
+            if ctx.hub_filter:
+                selected_hubs = eligible_hubs.intersection(set(ctx.hub_filter))
+                if not selected_hubs:
+                    continue
+                visible_qty = incoming_mc * (len(selected_hubs) / max(len(eligible_hubs), 1))
+            else:
+                visible_qty = incoming_mc
+            dsp = _closest_dsp(sku_code, _month_start(period_date))
+            invoice_price = _closest_invoice_price(sku_code, _month_start(period_date))
+            bucket["future_hub_stock"] += visible_qty
+            bucket["future_hub_stock_gross_weight_kg"] += visible_qty * float(product.master_carton_gross_weight_kg or 0.0)
+            bucket["future_hub_stock_net_weight_kg"] += visible_qty * float(product.master_carton_net_weight_kg or 0.0)
+            bucket["future_hub_stock_amount_kzt"] += visible_qty * float(product.pieces_in_master_carton or 0.0) * dsp
+            bucket["future_hub_stock_invoice_amount_kzt"] += visible_qty * float(product.pieces_in_master_carton or 0.0) * invoice_price
 
     forecast_buckets: dict[tuple, dict] = {}
     for r in filtered_atomic_rows:
@@ -1077,6 +1181,7 @@ async def _build_report_tables_uncached(
                 "category": r["category"],
                 "sub_category": r["sub_category"],
                 "subline": r["subline"],
+                "sku_code": r["sku_code"],
                 "sku_name": r["sku_name"],
                 "baseline_forecast_quantity_in_mc": 0.0,
                 "baseline_forecast_gross_weight_kg": 0.0,
@@ -1118,27 +1223,34 @@ async def _build_report_tables_uncached(
         ]:
             b[metric] += float(r[metric] or 0.0)
 
+    forecast_metric_fields = [
+        "baseline_forecast_quantity_in_mc",
+        "baseline_forecast_gross_weight_kg",
+        "baseline_forecast_net_weight_kg",
+        "baseline_forecast_volume_cbm",
+        "baseline_forecast_amount_kzt",
+        "baseline_forecast_invoice_amount_kzt",
+        "adjusted_forecast_quantity_in_mc",
+        "adjusted_forecast_gross_weight_kg",
+        "adjusted_forecast_net_weight_kg",
+        "adjusted_forecast_volume_cbm",
+        "adjusted_forecast_amount_kzt",
+        "adjusted_forecast_invoice_amount_kzt",
+        "future_available_stock",
+        "future_available_stock_gross_weight_kg",
+        "future_available_stock_net_weight_kg",
+        "future_available_stock_amount_kzt",
+        "future_available_stock_invoice_amount_kzt",
+    ]
+    if not aggregate_periods:
+        return (
+            _round_metric_rows(list(hist_buckets.values()), historical_metric_fields),
+            _round_metric_rows(list(forecast_buckets.values()), forecast_metric_fields),
+        )
+
     forecast_table = _aggregate_period_totals(
         list(forecast_buckets.values()),
-        [
-            "baseline_forecast_quantity_in_mc",
-            "baseline_forecast_gross_weight_kg",
-            "baseline_forecast_net_weight_kg",
-            "baseline_forecast_volume_cbm",
-            "baseline_forecast_amount_kzt",
-            "baseline_forecast_invoice_amount_kzt",
-            "adjusted_forecast_quantity_in_mc",
-            "adjusted_forecast_gross_weight_kg",
-            "adjusted_forecast_net_weight_kg",
-            "adjusted_forecast_volume_cbm",
-            "adjusted_forecast_amount_kzt",
-            "adjusted_forecast_invoice_amount_kzt",
-            "future_available_stock",
-            "future_available_stock_gross_weight_kg",
-            "future_available_stock_net_weight_kg",
-            "future_available_stock_amount_kzt",
-            "future_available_stock_invoice_amount_kzt",
-        ],
+        forecast_metric_fields,
     )
     for row in forecast_table:
         period_key = str(row["period"])

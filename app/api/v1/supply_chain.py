@@ -13,8 +13,9 @@ from sqlalchemy import func, select, update
 from app.api.date_params import parse_query_date
 from app.api.deps import CurrentUser, DBSession, is_admin
 from app.core.source_normalization import normalize_source_value, source_matches
-from app.models.data_uploads import HistoricalSalesMonthly, PriceList, Product, ProductBranch
+from app.models.data_uploads import Branch, HistoricalSalesMonthly, PriceList, Product, ProductBranch
 from app.models.derived import ForecastOrders, ForecastSalesMonthly
+from app.services.report_override_utils import apply_latest_case_overrides_to_forecast_rows
 
 router = APIRouter(prefix="/supply-chain", tags=["supply-chain"])
 
@@ -348,6 +349,14 @@ def _effective_order_quantity(row: SupplyChainRow) -> int:
     )
 
 
+def _nonzero_recommended_rows(rows: list[SupplyChainRow]) -> list[SupplyChainRow]:
+    return [
+        row
+        for row in rows
+        if _qty_int(row.recommended_quantity_in_mc) != 0
+    ]
+
+
 async def _load_current_month_supply_rows(
     db: DBSession,
     user: CurrentUser,
@@ -384,16 +393,29 @@ async def _load_current_month_supply_rows(
     hs_stmt = select(HistoricalSalesMonthly)
     fs_stmt = select(ForecastSalesMonthly)
     pb_stmt = select(ProductBranch)
+    b_stmt = select(Branch)
     fo_stmt = select(ForecastOrders).where(ForecastOrders.date == current_month)
     if not is_admin(user):
         hs_stmt = hs_stmt.where(HistoricalSalesMonthly.owner_user_id == user.id)
         fs_stmt = fs_stmt.where(ForecastSalesMonthly.owner_user_id == user.id)
         pb_stmt = pb_stmt.where(ProductBranch.owner_user_id == user.id)
+        b_stmt = b_stmt.where(Branch.owner_user_id == user.id)
         fo_stmt = fo_stmt.where(ForecastOrders.owner_user_id == user.id)
     hist_rows = (await db.execute(hs_stmt)).scalars().all()
     forecast_rows = (await db.execute(fs_stmt)).scalars().all()
     product_branch_rows = (await db.execute(pb_stmt)).scalars().all()
+    branch_rows = (await db.execute(b_stmt)).scalars().all()
     order_adjustment_rows = (await db.execute(fo_stmt)).scalars().all()
+    branch_name_by_id = {str(row.branch_id).strip(): str(row.branch_name) for row in branch_rows}
+    latest_override_qty = {}
+    if not is_admin(user):
+        latest_override_qty = await apply_latest_case_overrides_to_forecast_rows(
+            db,
+            owner_user_id=int(user.id),
+            forecast_rows=forecast_rows,
+            product_by_sku=product_by_sku,
+            branch_name_by_id=branch_name_by_id,
+        )
 
     hist_qty_by_sku_month: dict[tuple[str, date], float] = defaultdict(float)
     for row in hist_rows:
@@ -410,7 +432,9 @@ async def _load_current_month_supply_rows(
         branch_id = str(row.branch_id or "").strip()
         month = _month_start(row.date)
         qty = (
-            float(row.adjusted_forecast_quantity_in_mc)
+            latest_override_qty.get((sku_code, branch_id, month))
+            if (sku_code, branch_id, month) in latest_override_qty
+            else float(row.adjusted_forecast_quantity_in_mc)
             if row.adjusted_forecast_quantity_in_mc is not None
             else float(row.baseline_forecast_quantity_in_mc or 0.0)
         )
@@ -700,6 +724,7 @@ async def get_supply_chain_view(
         rows,
         product_by_sku,
     ) = await _load_current_month_supply_rows(db, user, category=category, source=source)
+    rows = _nonzero_recommended_rows(rows)
     filter_options = SupplyChainFilterOptions(
         sku_code=sorted({str(r.sku_code).strip() for r in rows if str(r.sku_code).strip()}),
         sku_name=sorted({str(r.sku_name).strip() for r in rows if str(r.sku_name).strip()}),

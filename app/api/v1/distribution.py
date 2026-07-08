@@ -184,6 +184,7 @@ class _BranchSkuCalc(BaseModel):
     master_carton_volume_cbm: float
     master_carton_gross_weight_kg: float
     dsp: float
+    invoice_price: float
     avg_l3m: int
     avg_f3m: int
 
@@ -309,7 +310,17 @@ def _branch_matches_selected(branch_name: str, branch_filter: list[str] | None) 
     return normalize_branch_lookup(branch_name) in branch_name_values
 
 
-def _pick_dsp_for_sales_date(prices: list[PriceList], sales_date: date) -> float:
+def _normalize_distribution_view_type(view_type: str | None) -> str:
+    normalized = str(view_type or "DSP").strip().lower()
+    if normalized not in {"dsp", "invoice price", "cases"}:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Параметр view_type должен быть одним из: DSP, Invoice price или Cases",
+        )
+    return normalized
+
+
+def _pick_price_for_sales_date(prices: list[PriceList], sales_date: date, view_type: str = "dsp") -> float:
     if not prices:
         return 0.0
     sorted_prices = sorted(prices, key=lambda p: p.date)
@@ -320,7 +331,13 @@ def _pick_dsp_for_sales_date(prices: list[PriceList], sales_date: date) -> float
     if selected is None:
         # User-selected fallback: earliest price if there is no <= sales_date match.
         selected = sorted_prices[0]
+    if _normalize_distribution_view_type(view_type) == "invoice price":
+        return float(selected.invoice_price or 0.0)
     return float(selected.dsp or 0.0)
+
+
+def _pick_dsp_for_sales_date(prices: list[PriceList], sales_date: date) -> float:
+    return _pick_price_for_sales_date(prices, sales_date, "dsp")
 
 
 def _safe_readiness(numerator: float, denominator: float) -> int:
@@ -344,6 +361,25 @@ def _available_amount_dsp(row: _BranchSkuCalc) -> float:
 
 def _recommended_amount_dsp(row: _BranchSkuCalc) -> float:
     return float(row.recommended_qty) * row.pieces_in_master_carton * row.dsp
+
+
+def _distribution_display_value(row: _BranchSkuCalc, quantity: float, view_type: str) -> float:
+    if view_type == "cases":
+        return float(quantity)
+    price = row.invoice_price if view_type == "invoice price" else row.dsp
+    return float(quantity) * row.pieces_in_master_carton * price
+
+
+def _target_display_value(row: _BranchSkuCalc, view_type: str) -> float:
+    return _distribution_display_value(row, row.stock_norm_target_qty, view_type)
+
+
+def _available_display_value(row: _BranchSkuCalc, view_type: str) -> float:
+    return _distribution_display_value(row, row.available_qty, view_type)
+
+
+def _recommended_display_value(row: _BranchSkuCalc, view_type: str) -> float:
+    return _distribution_display_value(row, row.recommended_qty, view_type)
 
 
 def _potential_amount_dsp(row: _BranchSkuCalc) -> float:
@@ -382,6 +418,7 @@ def _build_aggregate_rows(
     calc_rows: list[_BranchSkuCalc],
     branch_adj_map: dict[tuple[int, str], float],
     detail_adj_map: dict[tuple[int, str, str], int],
+    view_type: str = "dsp",
 ) -> tuple[
     list[DistributionAggregateRow],
     dict[tuple[int, str, str, str], list[_BranchSkuCalc]],
@@ -400,21 +437,28 @@ def _build_aggregate_rows(
                 "potential_amount": 0.0,
             }
         bucket = buckets[key]
-        bucket["available_amount"] += _available_amount_dsp(row)
-        bucket["recommended_amount"] += _recommended_amount_dsp(row)
-        bucket["target_amount"] += _target_amount_dsp(row)
+        bucket["available_amount"] += _available_display_value(row, view_type)
+        bucket["recommended_amount"] += _recommended_display_value(row, view_type)
+        bucket["target_amount"] += _target_display_value(row, view_type)
         bucket["potential_amount"] += _potential_amount_dsp(row)
 
     out: list[DistributionAggregateRow] = []
     row_by_key: dict[tuple[int, str, str, str], DistributionAggregateRow] = {}
     for (owner_id, branch_id, branch_name_value, hub_name), vals in buckets.items():
-        target_amount = float(vals["target_amount"])
+        target_amount = sum(
+            _target_amount_dsp(row)
+            for row in rows_by_branch.get((owner_id, branch_id, branch_name_value, hub_name), [])
+        )
+        display_target_amount = float(vals["target_amount"])
         explicit_adjustment_key = (owner_id, branch_id)
         readiness_adjusted_amount = float(branch_adj_map.get(explicit_adjustment_key, 0.0))
         display_adjusted_amount = (
             readiness_adjusted_amount
             if explicit_adjustment_key in branch_adj_map
-            else float(vals["recommended_amount"])
+            else sum(
+                _recommended_amount_dsp(row)
+                for row in rows_by_branch.get((owner_id, branch_id, branch_name_value, hub_name), [])
+            )
         )
         readiness = _safe_readiness(
             numerator=float(vals["potential_amount"]),
@@ -427,7 +471,7 @@ def _build_aggregate_rows(
         aggregate_row = DistributionAggregateRow(
             hub_name=hub_name,
             branch_name=branch_name_value,
-            target_amount_dsp_per_branch=_qty_int(target_amount),
+            target_amount_dsp_per_branch=_qty_int(display_target_amount),
             available_amount_kzt_per_branch=_qty_int(vals["available_amount"]),
             recommended_amount_kzt_per_branch=round(float(vals["recommended_amount"]), 2),
             adjusted_amount_kzt_per_branch=round(display_adjusted_amount, 2),
@@ -620,9 +664,9 @@ def _latest_report_by_owner(report_rows: list[DPReport]) -> dict[int, DPReport]:
         if owner_id <= 0:
             continue
         current = latest.get(owner_id)
-        report_updated = report.updated_at or report.created_at or datetime.min
+        report_updated = report.created_at or report.updated_at or datetime.min
         current_updated = (
-            current.updated_at or current.created_at or datetime.min
+            current.created_at or current.updated_at or datetime.min
             if current is not None
             else datetime.min
         )
@@ -990,7 +1034,9 @@ async def _build_distribution_calc_uncached(
             continue
         hub_name = str(vals["hub_name"]).strip() or "KZ-HUB"
         row_date = vals["date"]
-        dsp = _pick_dsp_for_sales_date(prices_by_key.get((owner_id, sku_code), []), row_date)
+        sku_prices = prices_by_key.get((owner_id, sku_code), [])
+        dsp = _pick_price_for_sales_date(sku_prices, row_date, "dsp")
+        invoice_price = _pick_price_for_sales_date(sku_prices, row_date, "invoice price")
         avg_l3_vals = l3_by_key.get((owner_id, branch_id, sku_code), [])
         avg_f3_vals = f3_by_key.get((owner_id, branch_id, sku_code), [])
         calc_rows.append(
@@ -1017,6 +1063,7 @@ async def _build_distribution_calc_uncached(
                 master_carton_volume_cbm=float(product.master_carton_volume_cbm or 0.0),
                 master_carton_gross_weight_kg=float(product.master_carton_gross_weight_kg or 0.0),
                 dsp=float(dsp),
+                invoice_price=float(invoice_price),
                 avg_l3m=_qty_int((sum(avg_l3_vals) / len(avg_l3_vals)) if avg_l3_vals else 0.0),
                 avg_f3m=_qty_int((sum(avg_f3_vals) / len(avg_f3_vals)) if avg_f3_vals else 0.0),
             )
@@ -1030,6 +1077,7 @@ async def _build_distribution_calc_uncached(
 async def get_distribution_aggregated(
     db: DBSession,
     user: CurrentUser,
+    view_type: str = Query("DSP", description="DSP, Invoice price or Cases"),
     branch_name: list[str] | None = Query(default=None),
     sku_code: list[str] | None = Query(default=None),
     sku_name: list[str] | None = Query(default=None),
@@ -1041,6 +1089,7 @@ async def get_distribution_aggregated(
     page: int = Query(1, ge=1),
     page_size: str = Query("10"),
 ) -> DistributionAggregateResponse:
+    normalized_view_type = _normalize_distribution_view_type(view_type)
     planning_date, calc_rows, _, _ = await _build_distribution_calc(db, user)
     adj_stmt = select(DistributionBranchAmountAdjustment).where(
         DistributionBranchAmountAdjustment.planning_date == planning_date
@@ -1075,6 +1124,7 @@ async def get_distribution_aggregated(
         calc_rows=filtered_calc_rows,
         branch_adj_map=branch_adj_map,
         detail_adj_map=detail_adj_map,
+        view_type=normalized_view_type,
     )
     filtered_rows = rows
     if branch_name:
@@ -1439,6 +1489,7 @@ async def patch_distribution_detail_adjustments(
 async def download_distribution(
     db: DBSession,
     user: CurrentUser,
+    view_type: str = Query("DSP", description="DSP, Invoice price or Cases"),
     branch_name: str | None = Query(None),
     sku_code: list[str] | None = Query(default=None),
     sku_name: list[str] | None = Query(default=None),
@@ -1451,6 +1502,7 @@ async def download_distribution(
     response = await get_distribution_aggregated(
         db=db,
         user=user,
+        view_type=view_type,
         branch_name=[branch_name] if branch_name else None,
         sku_code=sku_code,
         sku_name=sku_name,

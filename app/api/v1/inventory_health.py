@@ -12,6 +12,7 @@ from app.core.ttl_cache import AsyncTTLCache
 from app.api.deps import CurrentUser, DBSession, is_admin
 from app.models.data_uploads import Branch, HistoricalSalesMonthly, PriceList, Product, ProductBranch
 from app.models.derived import ForecastSalesMonthly
+from app.services.report_override_utils import apply_latest_case_overrides_to_forecast_rows
 
 router = APIRouter(prefix="/inventory-health", tags=["inventory-health"])
 
@@ -482,6 +483,21 @@ async def _compute_inventory_metrics_uncached(
         for row in product_branch_rows
     }
     forecast_rows = (await db.execute(forecast_stmt)).scalars().all()
+    branch_stmt = select(Branch)
+    if not is_admin(user):
+        branch_stmt = branch_stmt.where(Branch.owner_user_id == user.id)
+    branch_rows = (await db.execute(branch_stmt)).scalars().all()
+    branch_name_by_id = {str(row.branch_id).strip(): str(row.branch_name) for row in branch_rows}
+    product_by_sku = {str(product.sku_code or "").strip(): product for product in products}
+    latest_override_qty = {}
+    if not is_admin(user):
+        latest_override_qty = await apply_latest_case_overrides_to_forecast_rows(
+            db,
+            owner_user_id=int(user.id),
+            forecast_rows=forecast_rows,
+            product_by_sku=product_by_sku,
+            branch_name_by_id=branch_name_by_id,
+        )
     forecast_qty_by_key: dict[tuple[int, str, str, date], float] = {}
     for row in forecast_rows:
         month = row.date.replace(day=1)
@@ -492,7 +508,9 @@ async def _compute_inventory_metrics_uncached(
             month,
         )
         qty = (
-            float(row.adjusted_forecast_quantity_in_mc)
+            latest_override_qty.get((str(row.sku_code or "").strip(), str(row.branch_id or "").strip(), month))
+            if (str(row.sku_code or "").strip(), str(row.branch_id or "").strip(), month) in latest_override_qty
+            else float(row.adjusted_forecast_quantity_in_mc)
             if row.adjusted_forecast_quantity_in_mc is not None
             else float(row.baseline_forecast_quantity_in_mc or 0.0)
         )
